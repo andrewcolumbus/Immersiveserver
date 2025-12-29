@@ -119,9 +119,9 @@ env_logger = "0.11"
   - User-configurable resolution (width × height)
   - Videos larger than environment spill over edges
   - Videos smaller than environment don't fill the canvas
-- [ ] Define `Layer` struct (source, transform, opacity, blend mode)
-- [ ] Implement layer render order (back-to-front with alpha blending)
-- [ ] Add transform pipeline: position, scale, rotation
+- [x] Define `Layer` struct (source, transform, opacity, blend mode)
+- [x] Implement layer render order (back-to-front with alpha blending)
+- [x] Add transform pipeline: position, scale, rotation
 - [ ] Implement blend modes: Normal, Additive, Multiply, Screen
 - [ ] Hot-reload shader system (development mode)
 - [ ] **Clip Grid System**

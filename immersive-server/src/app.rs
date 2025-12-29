@@ -9,15 +9,17 @@
 //! Video decoding runs on a background thread at the video's native frame rate; the
 //! main thread picks up decoded frames for GPU upload without blocking.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
-use crate::compositor::{Environment, Viewport};
+use crate::compositor::{Environment, LayerSource, Viewport};
+use crate::layer_runtime::LayerRuntime;
 use crate::settings::EnvironmentSettings;
 use crate::ui::MenuBar;
-use crate::video::{VideoParams, VideoPlayer, VideoRenderer, VideoTexture};
+use crate::video::{LayerParams, VideoParams, VideoPlayer, VideoRenderer, VideoTexture};
 
 /// Helper function to render egui pass
 fn render_egui_pass(
@@ -120,15 +122,12 @@ pub struct App {
     pub settings: EnvironmentSettings,
     pub current_file: Option<std::path::PathBuf>,
 
-    // Video playback (background-threaded)
-    /// Video renderer for displaying video frames
+    // Layer rendering
+    /// Video renderer for displaying video frames (shared across all layers)
     video_renderer: VideoRenderer,
-    /// Background-threaded video player
-    video_player: Option<VideoPlayer>,
-    /// GPU texture for video frames
-    video_texture: Option<VideoTexture>,
-    /// Bind group for video rendering
-    video_bind_group: Option<wgpu::BindGroup>,
+    /// Runtime state for each layer (GPU resources, video players)
+    /// Key is layer ID, matching Environment.layers[].id
+    layer_runtimes: HashMap<u32, LayerRuntime>,
 }
 
 impl App {
@@ -333,9 +332,7 @@ impl App {
             settings,
             current_file: None,
             video_renderer,
-            video_player: None,
-            video_texture: None,
-            video_bind_group: None,
+            layer_runtimes: HashMap::new(),
         }
     }
 
@@ -687,18 +684,9 @@ impl App {
             .write_buffer(&self.copy_params_buffer, 0, bytemuck::bytes_of(&params));
     }
 
-    fn update_video_params_for_environment(&mut self) {
-        let Some(player) = &self.video_player else {
-            return;
-        };
-
-        let params = VideoParams::native_size(
-            player.width(),
-            player.height(),
-            self.environment.width(),
-            self.environment.height(),
-        );
-        self.video_renderer.set_params(&self.queue, params);
+    fn update_layer_params_for_environment(&mut self) {
+        // When environment resizes, we need to update layer params
+        // This is handled per-layer during rendering now
     }
 
     fn sync_environment_from_settings(&mut self) {
@@ -723,7 +711,7 @@ impl App {
 
         self.update_present_params();
         self.update_checker_params();
-        self.update_video_params_for_environment();
+        self.update_layer_params_for_environment();
     }
 
     /// Render a frame with egui UI
@@ -790,10 +778,35 @@ impl App {
             render_pass.draw(0..3, 0..1);
         }
 
-        // 2. Render video on top (with alpha blending, no clear)
-        if let Some(bind_group) = &self.video_bind_group {
-            self.video_renderer
-                .render(&mut encoder, self.environment.texture_view(), bind_group, false);
+        // 2. Render layers back-to-front (index 0 = back, last = front)
+        for layer in self.environment.layers() {
+            // Skip invisible layers or fully transparent layers
+            if !layer.visible || layer.opacity <= 0.0 {
+                continue;
+            }
+
+            // Get runtime resources for this layer
+            if let Some(runtime) = self.layer_runtimes.get(&layer.id) {
+                if let Some(bind_group) = &runtime.bind_group {
+                    // Create LayerParams with full transform support
+                    let params = LayerParams::from_layer(
+                        layer,
+                        runtime.video_width,
+                        runtime.video_height,
+                        self.environment.width(),
+                        self.environment.height(),
+                    );
+                    self.video_renderer.set_layer_params(&self.queue, params);
+
+                    // Render this layer with alpha blending (no clear)
+                    self.video_renderer.render(
+                        &mut encoder,
+                        self.environment.texture_view(),
+                        bind_group,
+                        false,
+                    );
+                }
+            }
         }
 
         // Update egui textures
@@ -915,16 +928,41 @@ impl App {
         self.cursor_position
     }
 
-    // Video playback methods (background-threaded)
+    // Layer management methods
 
-    /// Load a video file for playback (starts background decode thread)
-    pub fn load_video(&mut self, path: &std::path::Path) -> Result<(), String> {
+    /// Add a new layer with a video source.
+    /// Returns the layer ID on success.
+    pub fn add_layer_with_video(
+        &mut self,
+        name: impl Into<String>,
+        path: &std::path::Path,
+    ) -> Result<u32, String> {
+        // Create the layer in the environment
+        let layer_id = self.environment.add_layer(name);
+
+        // Set the layer's source to the video path
+        if let Some(layer) = self.environment.get_layer_mut(layer_id) {
+            layer.source = LayerSource::Video {
+                path: path.to_path_buf(),
+            };
+        }
+
+        // Create runtime resources
+        self.load_layer_video(layer_id, path)?;
+
+        log::info!("Added layer {} with video: {:?}", layer_id, path);
+        Ok(layer_id)
+    }
+
+    /// Load a video for an existing layer
+    fn load_layer_video(&mut self, layer_id: u32, path: &std::path::Path) -> Result<(), String> {
         // Open video player (starts background decode thread)
-        let player = VideoPlayer::open(path)
-            .map_err(|e| format!("Failed to open video: {}", e))?;
+        let player =
+            VideoPlayer::open(path).map_err(|e| format!("Failed to open video: {}", e))?;
 
         log::info!(
-            "Loaded video: {}x{} @ {:.2}fps, duration: {:.2}s",
+            "Layer {}: Loaded video {}x{} @ {:.2}fps, duration: {:.2}s",
+            layer_id,
             player.width(),
             player.height(),
             player.frame_rate(),
@@ -934,68 +972,134 @@ impl App {
         // Create video texture
         let video_texture = VideoTexture::new(&self.device, player.width(), player.height());
 
-        // Set up native size params (videos spill over if larger than environment)
-        let params = VideoParams::native_size(
-            player.width(),
-            player.height(),
-            self.environment.width(),
-            self.environment.height(),
-        );
-        self.video_renderer.set_params(&self.queue, params);
-
         // Create bind group
-        let video_bind_group = self.video_renderer.create_bind_group(&self.device, &video_texture);
+        let bind_group = self
+            .video_renderer
+            .create_bind_group(&self.device, &video_texture);
 
-        // Store player and texture
-        self.video_player = Some(player);
-        self.video_texture = Some(video_texture);
-        self.video_bind_group = Some(video_bind_group);
+        // Store runtime
+        let runtime = LayerRuntime {
+            layer_id,
+            video_width: player.width(),
+            video_height: player.height(),
+            player: Some(player),
+            texture: Some(video_texture),
+            bind_group: Some(bind_group),
+        };
+
+        self.layer_runtimes.insert(layer_id, runtime);
 
         Ok(())
     }
 
-    /// Update video playback - pick up decoded frames (non-blocking)
-    pub fn update_video(&mut self) {
-        let Some(player) = &self.video_player else {
-            return;
-        };
-        let Some(texture) = &self.video_texture else {
-            return;
-        };
+    /// Remove a layer by ID
+    pub fn remove_layer(&mut self, layer_id: u32) -> bool {
+        // Remove from environment
+        let removed = self.environment.remove_layer(layer_id).is_some();
 
-        // Pick up any new frame from background thread (non-blocking)
-        if let Some(frame) = player.take_frame() {
-            texture.upload(&self.queue, &frame);
+        // Clean up runtime resources
+        self.layer_runtimes.remove(&layer_id);
+
+        if removed {
+            log::info!("Removed layer {}", layer_id);
+        }
+
+        removed
+    }
+
+    /// Update all layer videos - pick up decoded frames (non-blocking)
+    pub fn update_videos(&mut self) {
+        for runtime in self.layer_runtimes.values() {
+            runtime.update_texture(&self.queue);
         }
     }
 
-    /// Toggle video pause state
-    pub fn toggle_video_pause(&mut self) {
-        if let Some(player) = &self.video_player {
-            player.toggle_pause();
+    /// Toggle pause state for a specific layer
+    pub fn toggle_layer_pause(&self, layer_id: u32) {
+        if let Some(runtime) = self.layer_runtimes.get(&layer_id) {
+            runtime.toggle_pause();
         }
     }
 
-    /// Restart video from beginning
-    pub fn restart_video(&mut self) {
-        if let Some(player) = &self.video_player {
-            player.restart();
+    /// Restart video for a specific layer
+    pub fn restart_layer_video(&self, layer_id: u32) {
+        if let Some(runtime) = self.layer_runtimes.get(&layer_id) {
+            runtime.restart();
         }
     }
 
-    /// Check if video is currently loaded
+    /// Toggle pause for all layers
+    pub fn toggle_all_pause(&self) {
+        for runtime in self.layer_runtimes.values() {
+            runtime.toggle_pause();
+        }
+    }
+
+    /// Restart all layer videos
+    pub fn restart_all_videos(&self) {
+        for runtime in self.layer_runtimes.values() {
+            runtime.restart();
+        }
+    }
+
+    /// Check if any layer has video
     pub fn has_video(&self) -> bool {
-        self.video_player.is_some()
+        self.layer_runtimes.values().any(|r| r.has_video())
     }
 
-    /// Check if video is paused
-    pub fn is_video_paused(&self) -> bool {
-        self.video_player.as_ref().map(|p| p.is_paused()).unwrap_or(false)
+    /// Check if any video is paused (returns true if any layer is paused)
+    pub fn is_any_video_paused(&self) -> bool {
+        self.layer_runtimes.values().any(|r| r.is_paused())
     }
-    
-    /// Get the current video path if loaded
+
+    /// Get number of layers
+    pub fn layer_count(&self) -> usize {
+        self.environment.layer_count()
+    }
+
+    // Legacy compatibility methods (for single-video use case)
+
+    /// Load a video file for playback - creates a new layer
+    /// This is a convenience method for single-video playback
+    pub fn load_video(&mut self, path: &std::path::Path) -> Result<(), String> {
+        // For backward compatibility, we create a layer called "Video"
+        // Remove existing video layer if any
+        if let Some(layer) = self.environment.layers().first() {
+            let id = layer.id;
+            self.remove_layer(id);
+        }
+
+        self.add_layer_with_video("Video", path)?;
+        Ok(())
+    }
+
+    /// Update video playback - pick up decoded frames (non-blocking)
+    /// Legacy method that updates all layer videos
+    pub fn update_video(&mut self) {
+        self.update_videos();
+    }
+
+    /// Toggle video pause state (all layers)
+    pub fn toggle_video_pause(&self) {
+        self.toggle_all_pause();
+    }
+
+    /// Restart video from beginning (all layers)
+    pub fn restart_video(&self) {
+        self.restart_all_videos();
+    }
+
+    /// Check if video is paused (any layer)
+    pub fn is_video_paused(&self) -> bool {
+        self.is_any_video_paused()
+    }
+
+    /// Get the current video path if loaded (first layer)
     pub fn current_video_path(&self) -> Option<&std::path::Path> {
-        self.video_player.as_ref().map(|p| p.path())
+        self.layer_runtimes
+            .values()
+            .next()
+            .and_then(|r| r.player.as_ref().map(|p| p.path()))
     }
 
     // Viewport navigation methods

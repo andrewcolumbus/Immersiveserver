@@ -5,12 +5,14 @@
 
 pub mod app;
 pub mod compositor;
+pub mod layer_runtime;
 pub mod settings;
 pub mod ui;
 pub mod video;
 
 pub use app::App;
-pub use compositor::{Environment, Viewport};
+pub use compositor::{BlendMode, Environment, Layer, LayerSource, Transform2D, Viewport};
+pub use layer_runtime::LayerRuntime;
 pub use settings::{AppPreferences, EnvironmentSettings};
-pub use video::{DecodedFrame, VideoDecoder, VideoDecoderError, VideoInfo, VideoParams, VideoPlayer, VideoRenderer, VideoTexture};
+pub use video::{DecodedFrame, LayerParams, VideoDecoder, VideoDecoderError, VideoInfo, VideoParams, VideoPlayer, VideoRenderer, VideoTexture};
 

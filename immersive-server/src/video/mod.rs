@@ -13,6 +13,6 @@ mod texture;
 pub use decoder::{VideoDecoder, VideoDecoderError};
 pub use frame::DecodedFrame;
 pub use player::{VideoInfo, VideoPlayer};
-pub use renderer::{VideoParams, VideoRenderer};
+pub use renderer::{LayerParams, VideoParams, VideoRenderer};
 pub use texture::VideoTexture;
 

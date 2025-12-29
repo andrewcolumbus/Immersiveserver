@@ -4,8 +4,9 @@
 //! using the fullscreen quad shader.
 
 use super::VideoTexture;
+use crate::compositor::{Layer, Transform2D};
 
-/// Parameters for video display, matching the shader uniform
+/// Parameters for video display, matching the shader uniform (legacy)
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct VideoParams {
@@ -78,6 +79,119 @@ impl VideoParams {
     }
 }
 
+/// Parameters for layer rendering with full 2D transforms.
+///
+/// This struct matches the LayerParams uniform in fullscreen_quad.wgsl.
+/// It includes size scaling, position, rotation, and opacity.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct LayerParams {
+    /// Video/layer size relative to environment (video_size / env_size)
+    pub size_scale: [f32; 2],
+    /// Position in normalized coordinates (0-1, where 0.5,0.5 = center)
+    pub position: [f32; 2],
+    /// Scale factors for the transform (1.0 = 100%)
+    pub scale: [f32; 2],
+    /// Rotation in radians (clockwise)
+    pub rotation: f32,
+    /// Anchor point for rotation/scaling (0-1, where 0.5,0.5 = center)
+    pub anchor: [f32; 2],
+    /// Opacity (0.0 - 1.0)
+    pub opacity: f32,
+    /// Padding for 16-byte alignment (total: 12 floats = 48 bytes)
+    pub _padding: [f32; 2],
+}
+
+impl Default for LayerParams {
+    fn default() -> Self {
+        Self {
+            size_scale: [1.0, 1.0],
+            position: [0.0, 0.0],
+            scale: [1.0, 1.0],
+            rotation: 0.0,
+            anchor: [0.5, 0.5],
+            opacity: 1.0,
+            _padding: [0.0; 2],
+        }
+    }
+}
+
+impl LayerParams {
+    /// Create LayerParams from a Layer and video/environment dimensions.
+    ///
+    /// Converts pixel-based position to normalized coordinates and
+    /// copies transform parameters from the layer.
+    pub fn from_layer(
+        layer: &Layer,
+        video_width: u32,
+        video_height: u32,
+        env_width: u32,
+        env_height: u32,
+    ) -> Self {
+        // Size scale: how big is the video relative to the environment
+        let size_scale_x = video_width as f32 / env_width as f32;
+        let size_scale_y = video_height as f32 / env_height as f32;
+
+        // Convert pixel position to normalized coordinates (0-1)
+        // Position (0,0) means layer anchor is at environment top-left
+        // We need to account for the layer's size when positioning
+        let pos_norm_x = layer.transform.position.0 / env_width as f32;
+        let pos_norm_y = layer.transform.position.1 / env_height as f32;
+
+        Self {
+            size_scale: [size_scale_x, size_scale_y],
+            position: [pos_norm_x, pos_norm_y],
+            scale: [layer.transform.scale.0, layer.transform.scale.1],
+            rotation: layer.transform.rotation,
+            anchor: [layer.transform.anchor.0, layer.transform.anchor.1],
+            opacity: layer.opacity,
+            _padding: [0.0; 2],
+        }
+    }
+
+    /// Create LayerParams from a Transform2D and dimensions.
+    pub fn from_transform(
+        transform: &Transform2D,
+        opacity: f32,
+        video_width: u32,
+        video_height: u32,
+        env_width: u32,
+        env_height: u32,
+    ) -> Self {
+        let size_scale_x = video_width as f32 / env_width as f32;
+        let size_scale_y = video_height as f32 / env_height as f32;
+
+        let pos_norm_x = transform.position.0 / env_width as f32;
+        let pos_norm_y = transform.position.1 / env_height as f32;
+
+        Self {
+            size_scale: [size_scale_x, size_scale_y],
+            position: [pos_norm_x, pos_norm_y],
+            scale: [transform.scale.0, transform.scale.1],
+            rotation: transform.rotation,
+            anchor: [transform.anchor.0, transform.anchor.1],
+            opacity,
+            _padding: [0.0; 2],
+        }
+    }
+
+    /// Create a simple identity LayerParams (no transform, full opacity)
+    pub fn identity(video_width: u32, video_height: u32, env_width: u32, env_height: u32) -> Self {
+        Self {
+            size_scale: [
+                video_width as f32 / env_width as f32,
+                video_height as f32 / env_height as f32,
+            ],
+            position: [0.0, 0.0],
+            scale: [1.0, 1.0],
+            rotation: 0.0,
+            anchor: [0.5, 0.5],
+            opacity: 1.0,
+            _padding: [0.0; 2],
+        }
+    }
+}
+
 /// Video renderer that displays video textures using a fullscreen quad
 pub struct VideoRenderer {
     /// Render pipeline for video display
@@ -86,10 +200,10 @@ pub struct VideoRenderer {
     bind_group_layout: wgpu::BindGroupLayout,
     /// Sampler for video texture filtering
     sampler: wgpu::Sampler,
-    /// Uniform buffer for video parameters
+    /// Uniform buffer for layer parameters (sized for LayerParams)
     params_buffer: wgpu::Buffer,
-    /// Current video parameters
-    current_params: VideoParams,
+    /// Current layer parameters
+    current_layer_params: LayerParams,
 }
 
 impl VideoRenderer {
@@ -195,11 +309,11 @@ impl VideoRenderer {
             cache: None,
         });
 
-        // Create uniform buffer for params
-        let current_params = VideoParams::default();
+        // Create uniform buffer for params (sized for LayerParams which is larger)
+        let current_layer_params = LayerParams::default();
         let params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Video Params Buffer"),
-            size: std::mem::size_of::<VideoParams>() as u64,
+            label: Some("Layer Params Buffer"),
+            size: std::mem::size_of::<LayerParams>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -209,7 +323,7 @@ impl VideoRenderer {
             bind_group_layout,
             sampler,
             params_buffer,
-            current_params,
+            current_layer_params,
         }
     }
 
@@ -223,10 +337,25 @@ impl VideoRenderer {
         &self.sampler
     }
 
-    /// Update video display parameters
+    /// Update layer display parameters (full transform support)
+    pub fn set_layer_params(&mut self, queue: &wgpu::Queue, params: LayerParams) {
+        self.current_layer_params = params;
+        queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(&self.current_layer_params));
+    }
+
+    /// Update video display parameters (legacy - converts to LayerParams)
     pub fn set_params(&mut self, queue: &wgpu::Queue, params: VideoParams) {
-        self.current_params = params;
-        queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(&self.current_params));
+        // Convert VideoParams to LayerParams for backward compatibility
+        let layer_params = LayerParams {
+            size_scale: params.scale,
+            position: params.offset,
+            scale: [1.0, 1.0],
+            rotation: 0.0,
+            anchor: [0.5, 0.5],
+            opacity: params.opacity,
+            _padding: [0.0; 2],
+        };
+        self.set_layer_params(queue, layer_params);
     }
 
     /// Create a bind group for a video texture
