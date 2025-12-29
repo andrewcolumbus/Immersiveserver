@@ -1,0 +1,44 @@
+[package]
+name = "immersive-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Graphics
+wgpu = "24"
+winit = "0.30"
+
+# GUI
+egui = "0.31"
+egui-wgpu = "0.31"
+egui-winit = "0.31"
+
+# Video decoding
+ffmpeg-next = "7.1"
+
+# Async runtime
+pollster = "0.4"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+quick-xml = { version = "0.37", features = ["serialize"] }
+
+# Utilities
+bytemuck = { version = "1", features = ["derive"] }
+dirs = "6"
+
+[[example]]
+name = "decode_video"
+path = "examples/decode_video.rs"
+
+[[example]]
+name = "decode_to_texture"
+path = "examples/decode_to_texture.rs"
+
+[[example]]
+name = "play_video"
+path = "examples/play_video.rs"

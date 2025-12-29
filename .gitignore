@@ -1,0 +1,49 @@
+# Rust build artifacts
+target/
+Cargo.lock
+
+# Swift build artifacts
+.build/
+.swiftpm/
+*.xcodeproj/
+*.xcworkspace/
+DerivedData/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Debug files
+*.dSYM/
+*.pdb
+
+# Build artifacts
+*.o
+*.a
+*.dylib
+*.so
+*.dll
+
+# External libraries (large binary dependencies)
+external_libraries/
+
+# FFmpeg binaries
+assets/ffmpeg/
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+
+# Archives
+*.zip
+
+# Cursor project files
+.cursor/

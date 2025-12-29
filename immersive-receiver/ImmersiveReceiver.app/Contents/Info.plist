@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>Immersive Receiver</string>
+    <key>CFBundleDisplayName</key>
+    <string>Immersive Receiver</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.immersive.receiver</string>
+    <key>CFBundleVersion</key>
+    <string>1.0</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleExecutable</key>
+    <string>ImmersiveReceiverMac</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>Immersive Receiver needs network access to discover video sources and receive streams.</string>
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_omt._tcp</string>
+        <string>_omt-receiver._tcp</string>
+    </array>
+</dict>
+</plist>
+
+

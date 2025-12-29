@@ -1,0 +1,19 @@
+# Cargo configuration for immersive-server
+# FFmpeg 7 paths for macOS (Homebrew)
+
+[env]
+# Point to FFmpeg 7 installation (required for ffmpeg-next crate)
+PKG_CONFIG_PATH = { value = "/opt/homebrew/opt/ffmpeg@7/lib/pkgconfig", force = true }
+FFMPEG_DIR = "/opt/homebrew/opt/ffmpeg@7"
+
+[target.aarch64-apple-darwin]
+rustflags = [
+    "-L", "/opt/homebrew/opt/ffmpeg@7/lib",
+]
+
+[target.x86_64-apple-darwin]
+rustflags = [
+    "-L", "/opt/homebrew/opt/ffmpeg@7/lib",
+]
+
+

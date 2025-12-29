@@ -1,0 +1,81 @@
+[package]
+name = "immersive-player"
+version = "0.1.0"
+edition = "2021"
+description = "Cross-platform HAP video player with projection blending"
+authors = ["Immersive Player Team"]
+
+[dependencies]
+# GPU and Rendering
+wgpu = "0.19"
+pollster = "0.3"
+raw-window-handle = "0.6"
+bytemuck = { version = "1.14", features = ["derive"] }
+
+# UI Framework
+egui = "0.27"
+eframe = { version = "0.27", default-features = false, features = ["default_fonts", "wgpu"] }
+
+# Windowing
+winit = "0.29"
+
+# Video Processing
+# Note: ffmpeg-next requires ffmpeg libraries installed on the system
+# For HAP, we'll implement a custom decoder that works with the container format
+
+# Math and Utilities
+glam = { version = "0.25", features = ["serde"] }
+image = "0.25"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+ron = "0.8"
+
+# Byte buffers
+bytes = "1.5"
+
+# Async and Threading
+tokio = { version = "1.35", features = ["rt-multi-thread", "sync", "time", "fs", "macros"] }
+crossbeam-channel = "0.5"
+
+# REST API and WebSocket
+axum = { version = "0.7", features = ["ws"] }
+tower-http = { version = "0.5", features = ["cors"] }
+tokio-tungstenite = "0.21"
+futures-util = "0.3"
+
+# UUID for clip identification
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# File handling
+rfd = "0.14"  # Native file dialogs
+notify = "6.1"  # File watching
+which = "6.0"  # Find executables in PATH
+
+# Logging
+log = "0.4"
+env_logger = "0.10"
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Aqueduct streaming protocol (without screen-capture feature)
+aqueduct = { path = "../external_libraries/OpenMediaTransport.Binaries.Release.v1.0.0.13/Aqueduct (Rust OMT)", default-features = false }
+
+# Compression for HAP
+snap = "1.1"  # Snappy decompression (HAP uses snappy)
+lz4_flex = "0.11"  # LZ4 decompression (HAP can use LZ4)
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[example]]
+name = "dual_projector"
+path = "examples/dual_projector.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+
