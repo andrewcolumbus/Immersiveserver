@@ -3,8 +3,10 @@
 //! Provides a render pipeline and utilities for displaying video frames
 //! using the fullscreen quad shader.
 
+use std::collections::HashMap;
+
 use super::VideoTexture;
-use crate::compositor::{Layer, Transform2D};
+use crate::compositor::{BlendMode, Layer, Transform2D};
 
 /// Parameters for video display, matching the shader uniform (legacy)
 #[repr(C)]
@@ -83,24 +85,32 @@ impl VideoParams {
 ///
 /// This struct matches the LayerParams uniform in fullscreen_quad.wgsl.
 /// It includes size scaling, position, rotation, and opacity.
+///
+/// IMPORTANT: WGSL struct alignment rules require vec2<f32> to be 8-byte aligned.
+/// After `rotation: f32`, we must add 4 bytes of padding before `anchor: vec2<f32>`.
+/// Total size: 56 bytes (14 floats × 4 bytes).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct LayerParams {
     /// Video/layer size relative to environment (video_size / env_size)
-    pub size_scale: [f32; 2],
+    pub size_scale: [f32; 2],          // offset 0, size 8
     /// Position in normalized coordinates (0-1, where 0.5,0.5 = center)
-    pub position: [f32; 2],
+    pub position: [f32; 2],            // offset 8, size 8
     /// Scale factors for the transform (1.0 = 100%)
-    pub scale: [f32; 2],
+    pub scale: [f32; 2],               // offset 16, size 8
     /// Rotation in radians (clockwise)
-    pub rotation: f32,
+    pub rotation: f32,                 // offset 24, size 4
+    /// Padding for WGSL vec2 alignment (vec2 requires 8-byte alignment)
+    pub _pad_rotation: f32,            // offset 28, size 4
     /// Anchor point for rotation/scaling (0-1, where 0.5,0.5 = center)
-    pub anchor: [f32; 2],
+    pub anchor: [f32; 2],              // offset 32, size 8
     /// Opacity (0.0 - 1.0)
-    pub opacity: f32,
-    /// Padding for 16-byte alignment (total: 12 floats = 48 bytes)
-    pub _padding: [f32; 2],
-}
+    pub opacity: f32,                  // offset 40, size 4
+    /// Padding for WGSL vec2 alignment
+    pub _pad_opacity: f32,             // offset 44, size 4
+    /// Final padding for 16-byte struct alignment
+    pub _padding: [f32; 2],            // offset 48, size 8
+}                                      // Total: 56 bytes
 
 impl Default for LayerParams {
     fn default() -> Self {
@@ -109,8 +119,10 @@ impl Default for LayerParams {
             position: [0.0, 0.0],
             scale: [1.0, 1.0],
             rotation: 0.0,
+            _pad_rotation: 0.0,
             anchor: [0.5, 0.5],
             opacity: 1.0,
+            _pad_opacity: 0.0,
             _padding: [0.0; 2],
         }
     }
@@ -143,8 +155,10 @@ impl LayerParams {
             position: [pos_norm_x, pos_norm_y],
             scale: [layer.transform.scale.0, layer.transform.scale.1],
             rotation: layer.transform.rotation,
+            _pad_rotation: 0.0,
             anchor: [layer.transform.anchor.0, layer.transform.anchor.1],
             opacity: layer.opacity,
+            _pad_opacity: 0.0,
             _padding: [0.0; 2],
         }
     }
@@ -169,8 +183,10 @@ impl LayerParams {
             position: [pos_norm_x, pos_norm_y],
             scale: [transform.scale.0, transform.scale.1],
             rotation: transform.rotation,
+            _pad_rotation: 0.0,
             anchor: [transform.anchor.0, transform.anchor.1],
             opacity,
+            _pad_opacity: 0.0,
             _padding: [0.0; 2],
         }
     }
@@ -185,19 +201,31 @@ impl LayerParams {
             position: [0.0, 0.0],
             scale: [1.0, 1.0],
             rotation: 0.0,
+            _pad_rotation: 0.0,
             anchor: [0.5, 0.5],
             opacity: 1.0,
+            _pad_opacity: 0.0,
             _padding: [0.0; 2],
         }
     }
 }
 
-/// Video renderer that displays video textures using a fullscreen quad
+/// Video renderer that displays video textures using a fullscreen quad.
+///
+/// Supports multiple blend modes by maintaining separate render pipelines
+/// for each blend mode (Normal, Additive, Multiply, Screen).
+///
+/// With the `shader-hotreload` feature enabled, shaders can be reloaded
+/// at runtime without restarting the application.
 pub struct VideoRenderer {
-    /// Render pipeline for video display
-    pipeline: wgpu::RenderPipeline,
+    /// Render pipelines for each blend mode
+    pipelines: HashMap<BlendMode, wgpu::RenderPipeline>,
     /// Bind group layout for video texture + sampler + params
     bind_group_layout: wgpu::BindGroupLayout,
+    /// Pipeline layout (stored for hot-reload)
+    pipeline_layout: wgpu::PipelineLayout,
+    /// Output texture format (stored for hot-reload)
+    output_format: wgpu::TextureFormat,
     /// Sampler for video texture filtering
     sampler: wgpu::Sampler,
     /// Uniform buffer for layer parameters (sized for LayerParams)
@@ -213,10 +241,14 @@ impl VideoRenderer {
     /// * `device` - The wgpu device
     /// * `output_format` - The format of the render target (e.g., surface format)
     pub fn new(device: &wgpu::Device, output_format: wgpu::TextureFormat) -> Self {
-        // Create shader module from embedded WGSL
+        // Load shader source (from disk in dev mode, embedded in release)
+        let shader_source = crate::shaders::load_fullscreen_quad_shader()
+            .expect("Failed to load fullscreen quad shader");
+
+        // Create shader module
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Video Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/fullscreen_quad.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(shader_source.into()),
         });
 
         // Create sampler for video texture
@@ -274,22 +306,62 @@ impl VideoRenderer {
             push_constant_ranges: &[],
         });
 
-        // Create render pipeline
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Video Pipeline"),
-            layout: Some(&pipeline_layout),
+        // Create render pipelines for each blend mode
+        let mut pipelines = HashMap::new();
+        for blend_mode in BlendMode::all() {
+            let pipeline = Self::create_pipeline(
+                device,
+                &shader,
+                &pipeline_layout,
+                output_format,
+                *blend_mode,
+            );
+            pipelines.insert(*blend_mode, pipeline);
+        }
+
+        // Create uniform buffer for params (sized for LayerParams which is larger)
+        let current_layer_params = LayerParams::default();
+        let params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Layer Params Buffer"),
+            size: std::mem::size_of::<LayerParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        Self {
+            pipelines,
+            bind_group_layout,
+            pipeline_layout,
+            output_format,
+            sampler,
+            params_buffer,
+            current_layer_params,
+        }
+    }
+
+    /// Create a render pipeline with a specific blend mode
+    fn create_pipeline(
+        device: &wgpu::Device,
+        shader: &wgpu::ShaderModule,
+        pipeline_layout: &wgpu::PipelineLayout,
+        output_format: wgpu::TextureFormat,
+        blend_mode: BlendMode,
+    ) -> wgpu::RenderPipeline {
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(&format!("Video Pipeline ({})", blend_mode.name())),
+            layout: Some(pipeline_layout),
             vertex: wgpu::VertexState {
-                module: &shader,
+                module: shader,
                 entry_point: Some("vs_main"),
                 buffers: &[],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
-                module: &shader,
+                module: shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: output_format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    blend: Some(blend_mode.to_blend_state()),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
                 compilation_options: Default::default(),
@@ -307,24 +379,49 @@ impl VideoRenderer {
             multisample: wgpu::MultisampleState::default(),
             multiview: None,
             cache: None,
+        })
+    }
+
+    /// Rebuild all pipelines with new shader source (hot-reload)
+    ///
+    /// This method compiles the shader source and recreates all blend mode
+    /// pipelines. If compilation fails, an error is returned and the existing
+    /// pipelines remain unchanged.
+    ///
+    /// # Arguments
+    /// * `device` - The wgpu device
+    /// * `shader_source` - WGSL shader source code
+    ///
+    /// # Returns
+    /// * `Ok(())` if pipelines were rebuilt successfully
+    /// * `Err(String)` with error message if shader compilation failed
+    pub fn rebuild_pipelines(&mut self, device: &wgpu::Device, shader_source: &str) -> Result<(), String> {
+        // Try to compile the new shader
+        // Note: wgpu doesn't provide detailed error info on creation failure,
+        // but validation errors will cause a panic in debug or be logged
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Video Shader (hot-reload)"),
+            source: wgpu::ShaderSource::Wgsl(shader_source.into()),
         });
 
-        // Create uniform buffer for params (sized for LayerParams which is larger)
-        let current_layer_params = LayerParams::default();
-        let params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Layer Params Buffer"),
-            size: std::mem::size_of::<LayerParams>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        Self {
-            pipeline,
-            bind_group_layout,
-            sampler,
-            params_buffer,
-            current_layer_params,
+        // Rebuild all pipelines with the new shader
+        let mut new_pipelines = HashMap::new();
+        for blend_mode in BlendMode::all() {
+            let pipeline = Self::create_pipeline(
+                device,
+                &shader,
+                &self.pipeline_layout,
+                self.output_format,
+                *blend_mode,
+            );
+            new_pipelines.insert(*blend_mode, pipeline);
         }
+
+        // Replace old pipelines with new ones
+        self.pipelines = new_pipelines;
+        log::info!("✅ Shader hot-reload successful");
+
+        Ok(())
     }
 
     /// Get the bind group layout for creating video textures
@@ -351,8 +448,10 @@ impl VideoRenderer {
             position: params.offset,
             scale: [1.0, 1.0],
             rotation: 0.0,
+            _pad_rotation: 0.0,
             anchor: [0.5, 0.5],
             opacity: params.opacity,
+            _pad_opacity: 0.0,
             _padding: [0.0; 2],
         };
         self.set_layer_params(queue, layer_params);
@@ -381,17 +480,20 @@ impl VideoRenderer {
     }
 
     /// Render video to the output texture
+    /// Render video to the output texture with a specific blend mode
     ///
     /// # Arguments
     /// * `encoder` - Command encoder for recording render commands
     /// * `output_view` - The texture view to render to
     /// * `bind_group` - The bind group containing video texture and params
+    /// * `blend_mode` - The blend mode to use for compositing
     /// * `clear` - Whether to clear the output before rendering
-    pub fn render(
+    pub fn render_with_blend(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         output_view: &wgpu::TextureView,
         bind_group: &wgpu::BindGroup,
+        blend_mode: BlendMode,
         clear: bool,
     ) {
         let load_op = if clear {
@@ -415,10 +517,33 @@ impl VideoRenderer {
             occlusion_query_set: None,
         });
 
-        render_pass.set_pipeline(&self.pipeline);
+        // Select the pipeline for the requested blend mode
+        let pipeline = self
+            .pipelines
+            .get(&blend_mode)
+            .expect("Pipeline for blend mode should exist");
+
+        render_pass.set_pipeline(pipeline);
         render_pass.set_bind_group(0, bind_group, &[]);
         // Draw fullscreen triangle (3 vertices, 1 instance)
         render_pass.draw(0..3, 0..1);
+    }
+
+    /// Render video to the output texture with default Normal blend mode
+    ///
+    /// # Arguments
+    /// * `encoder` - Command encoder for recording render commands
+    /// * `output_view` - The texture view to render to
+    /// * `bind_group` - The bind group containing video texture and params
+    /// * `clear` - Whether to clear the output before rendering
+    pub fn render(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        output_view: &wgpu::TextureView,
+        bind_group: &wgpu::BindGroup,
+        clear: bool,
+    ) {
+        self.render_with_blend(encoder, output_view, bind_group, BlendMode::Normal, clear);
     }
 
     /// Convenience method to render a video texture directly

@@ -4,9 +4,24 @@
 
 use quick_xml::de::from_str;
 use quick_xml::se::to_string;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::fs;
 use std::path::PathBuf;
+
+use crate::compositor::Layer;
+
+/// Deserialize a usize from a string, treating empty strings as the default value
+fn deserialize_usize_or_default<'de, D>(deserializer: D) -> Result<usize, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s: String = Deserialize::deserialize(deserializer)?;
+    if s.is_empty() {
+        Ok(default_clip_columns())
+    } else {
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
 
 /// Environment settings stored in .immersive files
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,6 +54,19 @@ pub struct EnvironmentSettings {
     /// Window height
     #[serde(rename = "windowHeight")]
     pub window_height: u32,
+
+    /// Layers with their clip grids
+    #[serde(rename = "layers", default)]
+    pub layers: Vec<Layer>,
+
+    /// Global clip count (number of columns in the clip grid)
+    #[serde(rename = "clipColumns", default = "default_clip_columns", deserialize_with = "deserialize_usize_or_default")]
+    pub global_clip_count: usize,
+}
+
+/// Default number of clip columns
+fn default_clip_columns() -> usize {
+    8
 }
 
 impl Default for EnvironmentSettings {
@@ -50,6 +78,8 @@ impl Default for EnvironmentSettings {
             environment_height: 1080,
             window_width: 1920,
             window_height: 1080,
+            layers: Vec::new(),
+            global_clip_count: default_clip_columns(),
         }
     }
 }
@@ -85,31 +115,24 @@ impl EnvironmentSettings {
 
     /// Save settings to an .immersive XML file
     pub fn save_to_file(&self, path: &PathBuf) -> Result<(), SettingsError> {
-        // Validate that serialization works
-        let _xml = to_string(self).map_err(SettingsError::XmlWrite)?;
+        // Serialize to XML
+        let xml = to_string(self).map_err(SettingsError::XmlWrite)?;
 
-        // Add XML declaration and format nicely
-        let formatted = format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>
-<ImmersiveEnvironment>
-    <targetFps>{}</targetFps>
-    <showFps>{}</showFps>
-    <environmentWidth>{}</environmentWidth>
-    <environmentHeight>{}</environmentHeight>
-    <windowWidth>{}</windowWidth>
-    <windowHeight>{}</windowHeight>
-</ImmersiveEnvironment>
-"#,
-            self.target_fps,
-            self.show_fps,
-            self.environment_width,
-            self.environment_height,
-            self.window_width,
-            self.window_height
-        );
+        // Add XML declaration
+        let formatted = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{}", xml);
 
         fs::write(path, formatted).map_err(SettingsError::Io)?;
         Ok(())
+    }
+
+    /// Set layers from the current environment state
+    pub fn set_layers(&mut self, layers: &[Layer]) {
+        self.layers = layers.to_vec();
+    }
+
+    /// Get layers for restoring environment state
+    pub fn get_layers(&self) -> &[Layer] {
+        &self.layers
     }
 }
 
@@ -224,6 +247,7 @@ mod tests {
         assert!(settings.show_fps);
         assert_eq!(settings.environment_width, 1920);
         assert_eq!(settings.environment_height, 1080);
+        assert!(settings.layers.is_empty());
     }
 
     #[test]

@@ -1,11 +1,28 @@
 //! Layer types for the compositor
 //!
 //! A Layer represents a single compositing element within the Environment.
-//! Layers have a source (video, NDI, etc.), transform, opacity, and blend mode.
+//! Layers have a source (video, NDI, etc.), transform, opacity, blend mode,
+//! and clip slots for triggering video playback.
 
 use std::path::PathBuf;
 
+use serde::{Deserialize, Deserializer, Serialize};
+
+use crate::compositor::clip::{ClipCell, DEFAULT_CLIP_SLOTS};
 use crate::compositor::BlendMode;
+
+/// Deserialize Option<usize> from a string, treating empty strings as None
+fn deserialize_option_usize<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s: Option<String> = Option::deserialize(deserializer)?;
+    match s {
+        Some(s) if s.is_empty() => Ok(None),
+        Some(s) => s.parse().map(Some).map_err(serde::de::Error::custom),
+        None => Ok(None),
+    }
+}
 
 /// 2D transform for layer positioning within the environment.
 ///
@@ -14,7 +31,7 @@ use crate::compositor::BlendMode;
 /// 2. Scale
 /// 3. Rotate
 /// 4. Translate to final position
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Transform2D {
     /// Position in pixels relative to environment origin (top-left)
     pub position: (f32, f32),
@@ -69,20 +86,17 @@ impl Transform2D {
 ///
 /// Defines what content the layer displays. This is extensible
 /// for future source types (NDI, OMT, images, etc.)
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum LayerSource {
     /// No source - layer is empty/transparent
     None,
-    /// Video file source
-    Video {
-        /// Path to the video file
-        path: PathBuf,
-    },
+    /// Video file source (path to video file)
+    Video(PathBuf),
     // Future source types:
-    // Ndi { source_name: String },
-    // Omt { source_id: String },
-    // Image { path: PathBuf },
-    // SolidColor { color: [f32; 4] },
+    // Ndi(String),       // source_name
+    // Omt(String),       // source_id
+    // Image(PathBuf),    // path
+    // SolidColor([f32; 4]), // RGBA color
 }
 
 impl Default for LayerSource {
@@ -95,14 +109,15 @@ impl Default for LayerSource {
 ///
 /// Layers are rendered back-to-front based on their order in the
 /// Environment's layer list. Each layer has its own source, transform,
-/// opacity, and blend mode.
-#[derive(Debug, Clone)]
+/// opacity, blend mode, and clip slots for video triggering.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Layer {
     /// Unique identifier for this layer
     pub id: u32,
     /// Human-readable name for the layer
     pub name: String,
-    /// The content source for this layer
+    /// The content source for this layer (set automatically when clip is triggered)
     pub source: LayerSource,
     /// 2D transform (position, scale, rotation)
     pub transform: Transform2D,
@@ -112,6 +127,31 @@ pub struct Layer {
     pub blend_mode: BlendMode,
     /// Whether the layer is visible
     pub visible: bool,
+    /// Clip slots for this layer (1D array of clips)
+    pub clips: Vec<Option<ClipCell>>,
+    /// Currently active/playing clip slot index, if any
+    #[serde(default, deserialize_with = "deserialize_option_usize")]
+    pub active_clip: Option<usize>,
+    /// Transition mode for clips on this layer
+    #[serde(default)]
+    pub transition: crate::compositor::ClipTransition,
+}
+
+impl Default for Layer {
+    fn default() -> Self {
+        Self {
+            id: 0,
+            name: String::new(),
+            source: LayerSource::None,
+            transform: Transform2D::default(),
+            opacity: 1.0,
+            blend_mode: BlendMode::Normal,
+            visible: true,
+            clips: Vec::new(),
+            active_clip: None,
+            transition: crate::compositor::ClipTransition::Cut,
+        }
+    }
 }
 
 impl Layer {
@@ -125,6 +165,9 @@ impl Layer {
             opacity: 1.0,
             blend_mode: BlendMode::Normal,
             visible: true,
+            clips: vec![None; DEFAULT_CLIP_SLOTS],
+            active_clip: None,
+            transition: crate::compositor::ClipTransition::Cut,
         }
     }
 
@@ -133,12 +176,65 @@ impl Layer {
         Self {
             id,
             name: name.into(),
-            source: LayerSource::Video { path: path.into() },
+            source: LayerSource::Video(path.into()),
             transform: Transform2D::default(),
             opacity: 1.0,
             blend_mode: BlendMode::Normal,
             visible: true,
+            clips: vec![None; DEFAULT_CLIP_SLOTS],
+            active_clip: None,
+            transition: crate::compositor::ClipTransition::Cut,
         }
+    }
+
+    /// Get the number of clip slots
+    pub fn clip_count(&self) -> usize {
+        self.clips.len()
+    }
+
+    /// Get a clip at the given slot index (returns None for invalid/empty clips)
+    pub fn get_clip(&self, slot: usize) -> Option<&ClipCell> {
+        self.clips.get(slot).and_then(|c| c.as_ref()).filter(|c| c.is_valid())
+    }
+
+    /// Get a mutable reference to a clip at the given slot index
+    pub fn get_clip_mut(&mut self, slot: usize) -> Option<&mut ClipCell> {
+        self.clips.get_mut(slot).and_then(|c| c.as_mut())
+    }
+
+    /// Set a clip at the given slot index
+    pub fn set_clip(&mut self, slot: usize, cell: ClipCell) -> bool {
+        if slot < self.clips.len() {
+            self.clips[slot] = Some(cell);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Clear a clip at the given slot index
+    pub fn clear_clip(&mut self, slot: usize) -> bool {
+        if slot < self.clips.len() {
+            self.clips[slot] = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Check if this layer has an active clip
+    pub fn has_active_clip(&self) -> bool {
+        self.active_clip.is_some()
+    }
+
+    /// Get the active clip slot index, if any
+    pub fn active_clip_slot(&self) -> Option<usize> {
+        self.active_clip
+    }
+
+    /// Clear the active clip (stop playback indicator)
+    pub fn clear_active_clip(&mut self) {
+        self.active_clip = None;
     }
 
     /// Set the layer's source
@@ -195,6 +291,31 @@ impl Layer {
     pub fn toggle_visibility(&mut self) {
         self.visible = !self.visible;
     }
+
+    /// Resize the clips array, preserving existing clips
+    pub fn resize_clips(&mut self, new_count: usize) {
+        if new_count > self.clips.len() {
+            self.clips.resize(new_count, None);
+        } else if new_count < self.clips.len() {
+            self.clips.truncate(new_count);
+            // If active clip is now out of bounds, clear it
+            if let Some(active) = self.active_clip {
+                if active >= new_count {
+                    self.active_clip = None;
+                }
+            }
+        }
+    }
+
+    /// Iterate over all clip slots
+    pub fn iter_clips(&self) -> impl Iterator<Item = (usize, Option<&ClipCell>)> {
+        self.clips.iter().enumerate().map(|(i, c)| (i, c.as_ref()))
+    }
+
+    /// Count non-empty clip slots
+    pub fn filled_clip_count(&self) -> usize {
+        self.clips.iter().filter(|c| c.is_some()).count()
+    }
 }
 
 #[cfg(test)]
@@ -225,14 +346,15 @@ mod tests {
         assert_eq!(layer.source, LayerSource::None);
         assert_eq!(layer.opacity, 1.0);
         assert!(layer.visible);
+        assert_eq!(layer.clip_count(), DEFAULT_CLIP_SLOTS);
     }
 
     #[test]
     fn test_layer_with_video() {
         let layer = Layer::with_video(1, "Video Layer", "/path/to/video.mp4");
-        assert_eq!(layer.source, LayerSource::Video {
-            path: PathBuf::from("/path/to/video.mp4")
-        });
+        assert_eq!(layer.source, LayerSource::Video(
+            PathBuf::from("/path/to/video.mp4")
+        ));
     }
 
     #[test]
@@ -270,5 +392,39 @@ mod tests {
         layer.set_rotation_degrees(90.0);
         assert!((layer.transform.rotation - std::f32::consts::FRAC_PI_2).abs() < 0.001);
     }
-}
 
+    #[test]
+    fn test_layer_clips() {
+        let mut layer = Layer::new(1, "Test");
+        assert_eq!(layer.clip_count(), DEFAULT_CLIP_SLOTS);
+        assert!(layer.get_clip(0).is_none());
+
+        // Set a clip
+        let cell = ClipCell::new("/path/to/video.mp4");
+        assert!(layer.set_clip(0, cell));
+        assert!(layer.get_clip(0).is_some());
+        assert_eq!(layer.filled_clip_count(), 1);
+
+        // Clear the clip
+        assert!(layer.clear_clip(0));
+        assert!(layer.get_clip(0).is_none());
+        assert_eq!(layer.filled_clip_count(), 0);
+    }
+
+    #[test]
+    fn test_layer_resize_clips() {
+        let mut layer = Layer::new(1, "Test");
+        layer.set_clip(3, ClipCell::new("/path.mp4"));
+        layer.active_clip = Some(3);
+
+        // Resize smaller (clip and active should be lost)
+        layer.resize_clips(2);
+        assert_eq!(layer.clip_count(), 2);
+        assert!(layer.get_clip(3).is_none()); // Out of bounds
+        assert!(layer.active_clip.is_none()); // Cleared
+
+        // Resize larger
+        layer.resize_clips(10);
+        assert_eq!(layer.clip_count(), 10);
+    }
+}

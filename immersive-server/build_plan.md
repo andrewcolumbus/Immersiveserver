@@ -122,9 +122,9 @@ env_logger = "0.11"
 - [x] Define `Layer` struct (source, transform, opacity, blend mode)
 - [x] Implement layer render order (back-to-front with alpha blending)
 - [x] Add transform pipeline: position, scale, rotation
-- [ ] Implement blend modes: Normal, Additive, Multiply, Screen
-- [ ] Hot-reload shader system (development mode)
-- [ ] **Clip Grid System**
+- [x] Implement blend modes: Normal, Additive, Multiply, Screen
+- [x] Hot-reload shader system (development mode)
+- [x] **Clip Grid System**
   - Grid of clips (rows × columns) per layer
   - Each cell contains a video/source reference
   - Click cell to trigger playback on that layer

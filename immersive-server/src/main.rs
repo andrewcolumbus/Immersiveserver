@@ -5,6 +5,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use immersive_server::settings::{AppPreferences, EnvironmentSettings};
@@ -17,6 +18,186 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
 const WINDOW_TITLE: &str = "Immersive Server";
+
+/// Types of file dialogs we can spawn
+#[derive(Debug, Clone, Copy)]
+enum FileDialogType {
+    OpenEnvironment,
+    SaveEnvironment,
+    OpenVideo,
+}
+
+/// Result from an async file dialog
+struct FileDialogResult {
+    dialog_type: FileDialogType,
+    path: Option<PathBuf>,
+}
+
+/// Manages async file dialogs that run on background threads
+struct AsyncFileDialogs {
+    /// Receiver for completed dialogs
+    receiver: Receiver<FileDialogResult>,
+    /// Sender to pass to spawned threads
+    sender: Sender<FileDialogResult>,
+    /// Whether a dialog is currently open
+    dialog_open: bool,
+}
+
+impl AsyncFileDialogs {
+    fn new() -> Self {
+        let (sender, receiver) = mpsc::channel();
+        Self {
+            receiver,
+            sender,
+            dialog_open: false,
+        }
+    }
+
+    /// Spawn an open environment dialog on a background thread
+    fn spawn_open_environment(&mut self) {
+        if self.dialog_open {
+            return;
+        }
+        self.dialog_open = true;
+        let sender = self.sender.clone();
+        std::thread::spawn(move || {
+            let path = Self::run_open_environment_dialog();
+            let _ = sender.send(FileDialogResult {
+                dialog_type: FileDialogType::OpenEnvironment,
+                path,
+            });
+        });
+    }
+
+    /// Spawn a save environment dialog on a background thread
+    fn spawn_save_environment(&mut self) {
+        if self.dialog_open {
+            return;
+        }
+        self.dialog_open = true;
+        let sender = self.sender.clone();
+        std::thread::spawn(move || {
+            let path = Self::run_save_environment_dialog();
+            let _ = sender.send(FileDialogResult {
+                dialog_type: FileDialogType::SaveEnvironment,
+                path,
+            });
+        });
+    }
+
+    /// Spawn an open video dialog on a background thread
+    fn spawn_open_video(&mut self) {
+        if self.dialog_open {
+            return;
+        }
+        self.dialog_open = true;
+        let sender = self.sender.clone();
+        std::thread::spawn(move || {
+            let path = Self::run_open_video_dialog();
+            let _ = sender.send(FileDialogResult {
+                dialog_type: FileDialogType::OpenVideo,
+                path,
+            });
+        });
+    }
+
+    /// Poll for completed dialogs (non-blocking)
+    fn poll(&mut self) -> Option<FileDialogResult> {
+        match self.receiver.try_recv() {
+            Ok(result) => {
+                self.dialog_open = false;
+                Some(result)
+            }
+            Err(_) => None,
+        }
+    }
+
+    /// Check if a dialog is currently open
+    fn is_dialog_open(&self) -> bool {
+        self.dialog_open
+    }
+
+    #[cfg(target_os = "macos")]
+    fn run_open_environment_dialog() -> Option<PathBuf> {
+        use std::process::Command;
+        let output = Command::new("osascript")
+            .args([
+                "-e",
+                r#"POSIX path of (choose file of type {"immersive", "public.xml"} with prompt "Open Immersive Environment")"#,
+            ])
+            .output();
+
+        if let Ok(output) = output {
+            if output.status.success() {
+                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !path.is_empty() {
+                    return Some(PathBuf::from(path));
+                }
+            }
+        }
+        None
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn run_open_environment_dialog() -> Option<PathBuf> {
+        None
+    }
+
+    #[cfg(target_os = "macos")]
+    fn run_save_environment_dialog() -> Option<PathBuf> {
+        use std::process::Command;
+        let output = Command::new("osascript")
+            .args([
+                "-e",
+                r#"POSIX path of (choose file name with prompt "Save Immersive Environment" default name "environment.immersive")"#,
+            ])
+            .output();
+
+        if let Ok(output) = output {
+            if output.status.success() {
+                let mut path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !path.ends_with(".immersive") {
+                    path.push_str(".immersive");
+                }
+                if !path.is_empty() {
+                    return Some(PathBuf::from(path));
+                }
+            }
+        }
+        None
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn run_save_environment_dialog() -> Option<PathBuf> {
+        None
+    }
+
+    #[cfg(target_os = "macos")]
+    fn run_open_video_dialog() -> Option<PathBuf> {
+        use std::process::Command;
+        let output = Command::new("osascript")
+            .args([
+                "-e",
+                r#"POSIX path of (choose file of type {"public.movie", "public.mpeg-4", "com.apple.quicktime-movie", "public.avi"} with prompt "Open Video File")"#,
+            ])
+            .output();
+
+        if let Ok(output) = output {
+            if output.status.success() {
+                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !path.is_empty() {
+                    return Some(PathBuf::from(path));
+                }
+            }
+        }
+        None
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn run_open_video_dialog() -> Option<PathBuf> {
+        None
+    }
+}
 
 /// Application state machine
 enum AppState {
@@ -33,6 +214,8 @@ enum AppState {
         app: App,
         /// Application preferences
         preferences: AppPreferences,
+        /// Async file dialogs manager
+        file_dialogs: AsyncFileDialogs,
     },
 }
 
@@ -57,7 +240,10 @@ impl ImmersiveApp {
     }
 
     /// Handle file save action
-    fn save_settings(app: &App, path: &PathBuf) -> bool {
+    fn save_settings(app: &mut App, path: &PathBuf) -> bool {
+        // Sync layers from environment to settings before saving
+        app.sync_layers_to_settings();
+        
         match app.settings.save_to_file(path) {
             Ok(_) => {
                 log::info!("Saved settings to: {}", path.display());
@@ -70,99 +256,6 @@ impl ImmersiveApp {
         }
     }
 
-    /// Show a native file dialog for opening .immersive files
-    fn show_open_dialog() -> Option<PathBuf> {
-        // Use rfd for file dialogs if available, otherwise use a simple approach
-        // For now, we'll use a hardcoded test path or environment variable
-        if let Ok(path) = std::env::var("IMMERSIVE_OPEN_FILE") {
-            return Some(PathBuf::from(path));
-        }
-
-        // Try to use native dialog via command line on macOS
-        #[cfg(target_os = "macos")]
-        {
-            use std::process::Command;
-            let output = Command::new("osascript")
-                .args([
-                    "-e",
-                    r#"POSIX path of (choose file of type {"immersive", "public.xml"} with prompt "Open Immersive Environment")"#,
-                ])
-                .output();
-
-            if let Ok(output) = output {
-                if output.status.success() {
-                    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                    if !path.is_empty() {
-                        return Some(PathBuf::from(path));
-                    }
-                }
-            }
-        }
-
-        None
-    }
-
-    /// Show a native file dialog for saving .immersive files
-    fn show_save_dialog() -> Option<PathBuf> {
-        if let Ok(path) = std::env::var("IMMERSIVE_SAVE_FILE") {
-            return Some(PathBuf::from(path));
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            use std::process::Command;
-            let output = Command::new("osascript")
-                .args([
-                    "-e",
-                    r#"POSIX path of (choose file name with prompt "Save Immersive Environment" default name "environment.immersive")"#,
-                ])
-                .output();
-
-            if let Ok(output) = output {
-                if output.status.success() {
-                    let mut path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                    // Ensure .immersive extension
-                    if !path.ends_with(".immersive") {
-                        path.push_str(".immersive");
-                    }
-                    if !path.is_empty() {
-                        return Some(PathBuf::from(path));
-                    }
-                }
-            }
-        }
-
-        None
-    }
-
-    /// Show a native file dialog for opening video files
-    fn show_open_video_dialog() -> Option<PathBuf> {
-        if let Ok(path) = std::env::var("IMMERSIVE_OPEN_VIDEO") {
-            return Some(PathBuf::from(path));
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            use std::process::Command;
-            let output = Command::new("osascript")
-                .args([
-                    "-e",
-                    r#"POSIX path of (choose file of type {"public.movie", "public.mpeg-4", "com.apple.quicktime-movie", "public.avi"} with prompt "Open Video File")"#,
-                ])
-                .output();
-
-            if let Ok(output) = output {
-                if output.status.success() {
-                    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                    if !path.is_empty() {
-                        return Some(PathBuf::from(path));
-                    }
-                }
-            }
-        }
-
-        None
-    }
 }
 
 impl ApplicationHandler for ImmersiveApp {
@@ -206,6 +299,11 @@ impl ApplicationHandler for ImmersiveApp {
             // Set current file if we loaded from one
             app.current_file = file;
 
+            // Restore layers from settings (if any were saved)
+            if !app.settings.layers.is_empty() {
+                app.restore_layers_from_settings();
+            }
+
             let preferences = AppPreferences::load();
 
             log::info!("Immersive Server ready!");
@@ -215,6 +313,7 @@ impl ApplicationHandler for ImmersiveApp {
                 window,
                 app,
                 preferences,
+                file_dialogs: AsyncFileDialogs::new(),
             };
         }
     }
@@ -230,6 +329,7 @@ impl ApplicationHandler for ImmersiveApp {
             window,
             app,
             preferences,
+            file_dialogs,
         } = &mut self.state
         else {
             return;
@@ -341,17 +441,54 @@ impl ApplicationHandler for ImmersiveApp {
 
             // Handle redraw request
             WindowEvent::RedrawRequested => {
-                // Check for pending file actions
+                // Check for pending file actions - spawn async dialogs
                 if let Some(action) = app.menu_bar.take_pending_action() {
                     use immersive_server::ui::menu_bar::FileAction;
                     match action {
                         FileAction::Open => {
-                            if let Some(path) = Self::show_open_dialog() {
+                            if !file_dialogs.is_dialog_open() {
+                                file_dialogs.spawn_open_environment();
+                            }
+                        }
+                        FileAction::Save => {
+                            if let Some(path) = &app.current_file.clone() {
+                                // Save directly to existing file (no dialog needed)
+                                if Self::save_settings(app, path) {
+                                    app.menu_bar.set_status("Saved");
+                                } else {
+                                    app.menu_bar.set_status("Failed to save");
+                                }
+                            } else {
+                                // No current file, show Save As dialog
+                                if !file_dialogs.is_dialog_open() {
+                                    file_dialogs.spawn_save_environment();
+                                }
+                            }
+                        }
+                        FileAction::SaveAs => {
+                            if !file_dialogs.is_dialog_open() {
+                                file_dialogs.spawn_save_environment();
+                            }
+                        }
+                        FileAction::OpenVideo => {
+                            if !file_dialogs.is_dialog_open() {
+                                file_dialogs.spawn_open_video();
+                            }
+                        }
+                    }
+                }
+
+                // Poll for completed async file dialogs
+                if let Some(result) = file_dialogs.poll() {
+                    match result.dialog_type {
+                        FileDialogType::OpenEnvironment => {
+                            if let Some(path) = result.path {
                                 match EnvironmentSettings::load_from_file(&path) {
                                     Ok(settings) => {
                                         app.settings = settings;
                                         app.current_file = Some(path.clone());
                                         app.menu_bar.sync_from_settings(&app.settings);
+                                        app.restore_layers_from_settings();
                                         preferences.set_last_opened(&path);
                                         app.menu_bar.set_status(format!(
                                             "Opened: {}",
@@ -368,33 +505,8 @@ impl ApplicationHandler for ImmersiveApp {
                                 }
                             }
                         }
-                        FileAction::Save => {
-                            if let Some(path) = &app.current_file.clone() {
-                                if Self::save_settings(app, path) {
-                                    app.menu_bar.set_status("Saved");
-                                } else {
-                                    app.menu_bar.set_status("Failed to save");
-                                }
-                            } else {
-                                // No current file, show Save As dialog
-                                if let Some(path) = Self::show_save_dialog() {
-                                    if Self::save_settings(app, &path) {
-                                        app.current_file = Some(path.clone());
-                                        preferences.set_last_opened(&path);
-                                        app.menu_bar.set_status(format!(
-                                            "Saved: {}",
-                                            path.file_name()
-                                                .map(|s| s.to_string_lossy().to_string())
-                                                .unwrap_or_default()
-                                        ));
-                                    } else {
-                                        app.menu_bar.set_status("Failed to save");
-                                    }
-                                }
-                            }
-                        }
-                        FileAction::SaveAs => {
-                            if let Some(path) = Self::show_save_dialog() {
+                        FileDialogType::SaveEnvironment => {
+                            if let Some(path) = result.path {
                                 if Self::save_settings(app, &path) {
                                     app.current_file = Some(path.clone());
                                     preferences.set_last_opened(&path);
@@ -409,23 +521,12 @@ impl ApplicationHandler for ImmersiveApp {
                                 }
                             }
                         }
-                        FileAction::OpenVideo => {
-                            if let Some(path) = Self::show_open_video_dialog() {
-                                match app.load_video(&path) {
-                                    Ok(_) => {
-                                        app.menu_bar.set_status(format!(
-                                            "Loaded: {}",
-                                            path.file_name()
-                                                .map(|s| s.to_string_lossy().to_string())
-                                                .unwrap_or_default()
-                                        ));
-                                        log::info!("Loaded video: {}", path.display());
-                                    }
-                                    Err(e) => {
-                                        log::error!("Failed to load video: {}", e);
-                                        app.menu_bar.set_status("Failed to open video");
-                                    }
-                                }
+                        FileDialogType::OpenVideo => {
+                            if let Some(path) = result.path {
+                                app.complete_clip_assignment(path);
+                            } else {
+                                // User cancelled - clear any pending assignment
+                                app.clip_grid_panel.pending_clip_assignment = None;
                             }
                         }
                     }

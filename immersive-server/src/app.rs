@@ -117,6 +117,8 @@ pub struct App {
 
     // UI state
     pub menu_bar: MenuBar,
+    /// Clip grid panel for triggering clips
+    pub clip_grid_panel: crate::ui::ClipGridPanel,
 
     // Settings
     pub settings: EnvironmentSettings,
@@ -128,6 +130,15 @@ pub struct App {
     /// Runtime state for each layer (GPU resources, video players)
     /// Key is layer ID, matching Environment.layers[].id
     layer_runtimes: HashMap<u32, LayerRuntime>,
+    /// Pending runtimes being loaded (waiting for first frame before swap)
+    /// When a new clip is loaded, it goes here until has_frame=true, then swaps in
+    pending_runtimes: HashMap<u32, LayerRuntime>,
+    /// Pending transitions for layers (stored when clip is triggered, applied when ready)
+    pending_transition: HashMap<u32, crate::compositor::ClipTransition>,
+
+    // Shader hot-reload
+    /// Watches shader files for changes and triggers recompilation
+    shader_watcher: Option<crate::shaders::ShaderWatcher>,
 }
 
 impl App {
@@ -211,7 +222,18 @@ impl App {
         // Create Environment (fixed-resolution composition canvas)
         let env_width = settings.environment_width.max(1);
         let env_height = settings.environment_height.max(1);
-        let environment = Environment::new(&device, env_width, env_height, surface_format);
+        let mut environment = Environment::new(&device, env_width, env_height, surface_format);
+
+        // Add default layers if none exist (so clip grid is immediately usable)
+        if environment.layer_count() == 0 {
+            let clip_count = settings.global_clip_count;
+            for i in 1..=4 {
+                let mut layer = crate::compositor::Layer::new(i, format!("Layer {}", i));
+                layer.clips = vec![None; clip_count];
+                environment.add_existing_layer(layer);
+            }
+            log::info!("Created 4 default layers with {} clip slots each", clip_count);
+        }
 
         // Create checkerboard background pipeline
         let (checker_pipeline, checker_params_buffer, checker_bind_group) =
@@ -299,6 +321,15 @@ impl App {
         // Initialize video renderer
         let video_renderer = VideoRenderer::new(&device, surface_format);
 
+        // Initialize shader hot-reload watcher
+        let shader_watcher = match crate::shaders::ShaderWatcher::new() {
+            Ok(watcher) => Some(watcher),
+            Err(e) => {
+                log::warn!("Failed to initialize shader watcher: {:?}", e);
+                None
+            }
+        };
+
         let now = Instant::now();
         let initial_target_fps = settings.target_fps as f64;
 
@@ -329,10 +360,14 @@ impl App {
             egui_state,
             egui_renderer,
             menu_bar,
+            clip_grid_panel: crate::ui::ClipGridPanel::new(),
             settings,
             current_file: None,
             video_renderer,
             layer_runtimes: HashMap::new(),
+            pending_runtimes: HashMap::new(),
+            pending_transition: HashMap::new(),
+            shader_watcher,
         }
     }
 
@@ -714,8 +749,72 @@ impl App {
         self.update_layer_params_for_environment();
     }
 
+    /// Sync layers from environment to settings (for saving)
+    pub fn sync_layers_to_settings(&mut self) {
+        let layers: Vec<_> = self.environment.layers().to_vec();
+        self.settings.set_layers(&layers);
+    }
+
+    /// Restore layers from settings (after loading)
+    pub fn restore_layers_from_settings(&mut self) {
+        // Clear existing layers
+        self.environment.clear_layers();
+        self.layer_runtimes.clear();
+
+        // Add layers from settings
+        for mut layer in self.settings.layers.clone() {
+            let layer_id = layer.id;
+            let active_clip = layer.active_clip;
+
+            // Clean up invalid clips (empty paths from deserialization)
+            for clip_slot in layer.clips.iter_mut() {
+                if let Some(cell) = clip_slot {
+                    if !cell.is_valid() {
+                        *clip_slot = None;
+                    }
+                }
+            }
+
+            // Get valid clips for checking active clip
+            let clips = layer.clips.clone();
+
+            // Add the layer to the environment
+            self.environment.add_existing_layer(layer);
+
+            // If the layer has an active clip, try to load it (only if valid)
+            if let Some(slot) = active_clip {
+                if let Some(Some(cell)) = clips.get(slot) {
+                    if cell.is_valid() {
+                        let path = cell.source_path.clone();
+                        
+                        // Try to load the video (errors are logged but don't stop restore)
+                        if let Err(e) = self.load_layer_video(layer_id, &path) {
+                            log::warn!("Failed to restore clip for layer {}: {}", layer_id, e);
+                        }
+                    }
+                }
+            }
+        }
+
+        // If no layers were restored, create 4 default layers
+        if self.environment.layer_count() == 0 {
+            let clip_count = self.settings.global_clip_count;
+            for i in 1..=4 {
+                let mut layer = crate::compositor::Layer::new(i, format!("Layer {}", i));
+                layer.clips = vec![None; clip_count];
+                self.environment.add_existing_layer(layer);
+            }
+            log::info!("No saved layers, created 4 default layers with {} clip slots each", clip_count);
+        } else {
+            log::info!("Restored {} layers from settings", self.environment.layer_count());
+        }
+    }
+
     /// Render a frame with egui UI
     pub fn render(&mut self) -> Result<bool, wgpu::SurfaceError> {
+        // Poll for shader hot-reload (no-op in release builds)
+        self.poll_shader_reload();
+
         // Begin egui frame
         let raw_input = self.egui_state.take_egui_input(&self.window);
         self.egui_ctx.begin_pass(raw_input);
@@ -737,10 +836,19 @@ impl App {
             display_frame_time_ms,
         );
 
+        // Render clip grid panel and collect actions
+        let layers: Vec<_> = self.environment.layers().to_vec();
+        let clip_actions = self.clip_grid_panel.render(&self.egui_ctx, &layers);
+
         // Apply environment resolution changes (if any) before rendering.
         self.sync_environment_from_settings();
 
         let full_output = self.egui_ctx.end_pass();
+
+        // Process clip grid actions (after egui pass ends)
+        for action in clip_actions {
+            self.handle_clip_action(action);
+        }
 
         self.egui_state
             .handle_platform_output(&self.window, full_output.platform_output);
@@ -787,24 +895,66 @@ impl App {
 
             // Get runtime resources for this layer
             if let Some(runtime) = self.layer_runtimes.get(&layer.id) {
-                if let Some(bind_group) = &runtime.bind_group {
-                    // Create LayerParams with full transform support
-                    let params = LayerParams::from_layer(
-                        layer,
-                        runtime.video_width,
-                        runtime.video_height,
-                        self.environment.width(),
-                        self.environment.height(),
-                    );
-                    self.video_renderer.set_layer_params(&self.queue, params);
+                // Check if we're in a transition
+                let transition_progress = runtime.transition_progress();
+                let in_transition = runtime.transition_active && transition_progress < 1.0;
+                
+                // For crossfade: render old content first at (1 - progress) opacity
+                if in_transition && runtime.transition_type.needs_old_content() {
+                    if let Some(old_bind_group) = &runtime.old_bind_group {
+                        let old_opacity = layer.opacity * (1.0 - transition_progress);
+                        if old_opacity > 0.0 {
+                            let mut params = LayerParams::from_layer(
+                                layer,
+                                runtime.old_video_width,
+                                runtime.old_video_height,
+                                self.environment.width(),
+                                self.environment.height(),
+                            );
+                            params.opacity = old_opacity;
+                            self.video_renderer.set_layer_params(&self.queue, params);
+                            
+                            self.video_renderer.render_with_blend(
+                                &mut encoder,
+                                self.environment.texture_view(),
+                                old_bind_group,
+                                layer.blend_mode,
+                                false,
+                            );
+                        }
+                    }
+                }
 
-                    // Render this layer with alpha blending (no clear)
-                    self.video_renderer.render(
-                        &mut encoder,
-                        self.environment.texture_view(),
-                        bind_group,
-                        false,
-                    );
+                // Only render if we have a bind_group AND at least one frame has been uploaded
+                if let Some(bind_group) = &runtime.bind_group {
+                    if runtime.has_frame {
+                        // Calculate opacity with transition
+                        let effective_opacity = if in_transition {
+                            layer.opacity * transition_progress
+                        } else {
+                            layer.opacity
+                        };
+
+                        // Create LayerParams with full transform support
+                        let mut params = LayerParams::from_layer(
+                            layer,
+                            runtime.video_width,
+                            runtime.video_height,
+                            self.environment.width(),
+                            self.environment.height(),
+                        );
+                        params.opacity = effective_opacity;
+                        self.video_renderer.set_layer_params(&self.queue, params);
+
+                        // Render this layer with its blend mode (no clear)
+                        self.video_renderer.render_with_blend(
+                            &mut encoder,
+                            self.environment.texture_view(),
+                            bind_group,
+                            layer.blend_mode,
+                            false,
+                        );
+                    }
                 }
             }
         }
@@ -942,9 +1092,7 @@ impl App {
 
         // Set the layer's source to the video path
         if let Some(layer) = self.environment.get_layer_mut(layer_id) {
-            layer.source = LayerSource::Video {
-                path: path.to_path_buf(),
-            };
+            layer.source = LayerSource::Video(path.to_path_buf());
         }
 
         // Create runtime resources
@@ -956,6 +1104,8 @@ impl App {
 
     /// Load a video for an existing layer
     fn load_layer_video(&mut self, layer_id: u32, path: &std::path::Path) -> Result<(), String> {
+        let old_runtime_exists = self.layer_runtimes.contains_key(&layer_id);
+
         // Open video player (starts background decode thread)
         let player =
             VideoPlayer::open(path).map_err(|e| format!("Failed to open video: {}", e))?;
@@ -985,9 +1135,24 @@ impl App {
             player: Some(player),
             texture: Some(video_texture),
             bind_group: Some(bind_group),
+            has_frame: false, // Will be set to true when first frame is uploaded
+            // Transition state (initialized empty)
+            transition_active: false,
+            transition_start: None,
+            transition_duration: std::time::Duration::ZERO,
+            transition_type: crate::compositor::ClipTransition::Cut,
+            old_bind_group: None,
+            old_video_width: 0,
+            old_video_height: 0,
         };
 
-        self.layer_runtimes.insert(layer_id, runtime);
+        if old_runtime_exists {
+            // Put in pending - old runtime continues to render until new one has a frame
+            self.pending_runtimes.insert(layer_id, runtime);
+        } else {
+            // No old runtime - insert directly
+            self.layer_runtimes.insert(layer_id, runtime);
+        }
 
         Ok(())
     }
@@ -999,6 +1164,7 @@ impl App {
 
         // Clean up runtime resources
         self.layer_runtimes.remove(&layer_id);
+        self.pending_runtimes.remove(&layer_id);
 
         if removed {
             log::info!("Removed layer {}", layer_id);
@@ -1007,10 +1173,166 @@ impl App {
         removed
     }
 
+    /// Add a new layer to the environment
+    pub fn add_layer(&mut self) {
+        // Find the next available layer ID
+        let next_id = self.environment.layers()
+            .iter()
+            .map(|l| l.id)
+            .max()
+            .map(|id| id + 1)
+            .unwrap_or(1);
+
+        // Create a new layer with the current global clip count
+        let clip_count = self.settings.global_clip_count;
+        let mut layer = crate::compositor::Layer::new(next_id, format!("Layer {}", next_id));
+        layer.clips = vec![None; clip_count];
+
+        self.environment.add_existing_layer(layer);
+        log::info!("Added layer {} with {} clip slots", next_id, clip_count);
+        self.menu_bar.set_status(format!("Added Layer {}", next_id));
+    }
+
+    /// Delete a layer by ID
+    pub fn delete_layer(&mut self, layer_id: u32) {
+        // Don't allow deleting the last layer
+        if self.environment.layer_count() <= 1 {
+            log::warn!("Cannot delete the last layer");
+            self.menu_bar.set_status("Cannot delete the last layer".to_string());
+            return;
+        }
+
+        if self.remove_layer(layer_id) {
+            self.menu_bar.set_status(format!("Deleted layer {}", layer_id));
+        }
+    }
+
+    /// Add a new column (clip slot) to all layers
+    pub fn add_column(&mut self) {
+        self.settings.global_clip_count += 1;
+        let new_count = self.settings.global_clip_count;
+
+        // Add a None slot to each layer
+        for layer in self.environment.layers_mut() {
+            layer.clips.push(None);
+        }
+
+        log::info!("Added column - now {} clip slots", new_count);
+        self.menu_bar.set_status(format!("Added column {}", new_count));
+    }
+
+    /// Delete a column (clip slot) from all layers
+    pub fn delete_column(&mut self, column_index: usize) {
+        // Don't allow deleting the last column
+        if self.settings.global_clip_count <= 1 {
+            log::warn!("Cannot delete the last column");
+            self.menu_bar.set_status("Cannot delete the last column".to_string());
+            return;
+        }
+
+        // Check if the column index is valid
+        if column_index >= self.settings.global_clip_count {
+            log::warn!("Invalid column index: {}", column_index);
+            return;
+        }
+
+        // Collect layer IDs that have clips playing in this column
+        let layers_to_stop: Vec<u32> = self.environment.layers()
+            .iter()
+            .filter(|layer| layer.active_clip == Some(column_index))
+            .map(|layer| layer.id)
+            .collect();
+
+        // Stop any clips playing in this column
+        for layer_id in layers_to_stop {
+            self.stop_clip(layer_id);
+        }
+
+        // Remove the slot from each layer
+        for layer in self.environment.layers_mut() {
+            if column_index < layer.clips.len() {
+                layer.clips.remove(column_index);
+                // Adjust active_clip if needed
+                if let Some(active) = layer.active_clip {
+                    if active > column_index {
+                        layer.active_clip = Some(active - 1);
+                    }
+                }
+            }
+        }
+
+        self.settings.global_clip_count -= 1;
+        log::info!("Deleted column {} - now {} clip slots", column_index + 1, self.settings.global_clip_count);
+        self.menu_bar.set_status(format!("Deleted column {}", column_index + 1));
+    }
+
     /// Update all layer videos - pick up decoded frames (non-blocking)
     pub fn update_videos(&mut self) {
-        for runtime in self.layer_runtimes.values() {
+        // Update active runtimes
+        for runtime in self.layer_runtimes.values_mut() {
             runtime.update_texture(&self.queue);
+            
+            // Check if transition is complete
+            if runtime.transition_active && runtime.is_transition_complete() {
+                runtime.end_transition();
+            }
+        }
+        
+        // Update pending runtimes (loading in background)
+        for runtime in self.pending_runtimes.values_mut() {
+            runtime.update_texture(&self.queue);
+        }
+        
+        // Swap pending runtimes into active once they have a frame
+        let ready_layers: Vec<u32> = self.pending_runtimes
+            .iter()
+            .filter(|(_, runtime)| runtime.has_frame)
+            .map(|(id, _)| *id)
+            .collect();
+        
+        for layer_id in ready_layers {
+            if let Some(mut new_runtime) = self.pending_runtimes.remove(&layer_id) {
+                // Get the pending transition for this layer
+                let transition = self.pending_transition.remove(&layer_id)
+                    .unwrap_or(crate::compositor::ClipTransition::Cut);
+                
+                // For crossfade, transfer the old_bind_group from the old runtime
+                if transition.needs_old_content() {
+                    if let Some(old_runtime) = self.layer_runtimes.get_mut(&layer_id) {
+                        // Move old bind group to new runtime
+                        new_runtime.old_bind_group = old_runtime.bind_group.take();
+                        new_runtime.old_video_width = old_runtime.video_width;
+                        new_runtime.old_video_height = old_runtime.video_height;
+                    }
+                }
+                
+                // Start the transition
+                if transition.duration_ms() > 0 {
+                    new_runtime.start_transition(transition);
+                }
+                
+                // Replace old runtime with new one that has a frame ready
+                self.layer_runtimes.insert(layer_id, new_runtime);
+            }
+        }
+    }
+
+    /// Poll for shader changes and hot-reload if needed
+    pub fn poll_shader_reload(&mut self) {
+        if let Some(ref mut watcher) = self.shader_watcher {
+            if watcher.poll().is_some() {
+                // A shader file changed, reload it
+                match crate::shaders::load_fullscreen_quad_shader() {
+                    Ok(source) => {
+                        if let Err(e) = self.video_renderer.rebuild_pipelines(&self.device, &source) {
+                            log::error!("❌ Shader reload failed: {}", e);
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("❌ Failed to read shader file: {}", e);
+                    }
+                }
+            }
         }
     }
 
@@ -1055,6 +1377,237 @@ impl App {
     /// Get number of layers
     pub fn layer_count(&self) -> usize {
         self.environment.layer_count()
+    }
+
+    // =========================================================================
+    // Clip Grid Methods
+    // =========================================================================
+
+    /// Trigger a clip on a layer at the specified slot
+    ///
+    /// Loads and plays the video from the clip cell. Stops any currently
+    /// playing clip on this layer first.
+    ///
+    /// Returns `Ok(())` if successful, or an error message if the clip
+    /// couldn't be loaded.
+    pub fn trigger_clip(&mut self, layer_id: u32, slot: usize) -> Result<(), String> {
+        // Get the clip path and layer transition
+        let (clip_path, transition) = {
+            let layer = self.environment.get_layer(layer_id)
+                .ok_or_else(|| format!("Layer {} not found", layer_id))?;
+            
+            let cell = layer.get_clip(slot)
+                .ok_or_else(|| format!("No clip at slot {}", slot))?;
+            
+            (cell.source_path.clone(), layer.transition)
+        };
+
+        // Check if this is a replay of the same clip (same path)
+        let is_same_clip = if let Some(runtime) = self.layer_runtimes.get(&layer_id) {
+            if let Some(player) = &runtime.player {
+                player.path() == clip_path.as_path()
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if is_same_clip {
+            // Same clip - just restart playback (no flash!)
+            log::info!("🔄 Restarting clip {} on layer {}", slot, layer_id);
+            self.restart_layer_video(layer_id);
+        } else {
+            // Different clip - need to load it
+            log::info!("🎬 Loading clip {} on layer {} with {:?} transition: {:?}", 
+                slot, layer_id, transition.name(), clip_path);
+            
+            // For crossfade, store the old bind_group before loading new clip
+            if transition.needs_old_content() {
+                if let Some(runtime) = self.layer_runtimes.get_mut(&layer_id) {
+                    runtime.store_old_for_crossfade();
+                }
+            }
+            
+            // Store the transition type for when the new clip is ready
+            self.pending_transition.insert(layer_id, transition);
+            
+            self.load_layer_video(layer_id, &clip_path)?;
+        }
+
+        // Update the active clip slot in the layer
+        if let Some(layer) = self.environment.get_layer_mut(layer_id) {
+            layer.active_clip = Some(slot);
+            layer.source = crate::compositor::LayerSource::Video(clip_path);
+        }
+
+        Ok(())
+    }
+
+    /// Stop the currently playing clip on a layer
+    ///
+    /// Clears the video player and resets the active clip indicator.
+    pub fn stop_clip(&mut self, layer_id: u32) {
+        // Clear the runtime video resources
+        if let Some(runtime) = self.layer_runtimes.get_mut(&layer_id) {
+            runtime.clear();
+        }
+
+        // Clear the active clip in the layer
+        if let Some(layer) = self.environment.get_layer_mut(layer_id) {
+            layer.active_clip = None;
+            layer.source = crate::compositor::LayerSource::None;
+        }
+
+        log::info!("⏹️ Stopped clip on layer {}", layer_id);
+    }
+
+    /// Set a clip in a layer's clip slots
+    ///
+    /// Assigns a video path to a slot in the layer's clips.
+    pub fn set_layer_clip(
+        &mut self,
+        layer_id: u32,
+        slot: usize,
+        path: std::path::PathBuf,
+        label: Option<String>,
+    ) -> bool {
+        if let Some(layer) = self.environment.get_layer_mut(layer_id) {
+            let cell = if let Some(lbl) = label {
+                crate::compositor::ClipCell::with_label(path, lbl)
+            } else {
+                crate::compositor::ClipCell::new(path)
+            };
+            layer.set_clip(slot, cell)
+        } else {
+            false
+        }
+    }
+
+    /// Clear a clip from a layer's clips
+    pub fn clear_layer_clip(&mut self, layer_id: u32, slot: usize) -> bool {
+        if let Some(layer) = self.environment.get_layer_mut(layer_id) {
+            // If this is the active clip, stop it first
+            if layer.active_clip == Some(slot) {
+                self.stop_clip(layer_id);
+            }
+            if let Some(layer) = self.environment.get_layer_mut(layer_id) {
+                return layer.clear_clip(slot);
+            }
+        }
+        false
+    }
+
+    /// Set the transition mode for a layer
+    pub fn set_layer_transition(
+        &mut self,
+        layer_id: u32,
+        transition: crate::compositor::ClipTransition,
+    ) {
+        if let Some(layer) = self.environment.get_layer_mut(layer_id) {
+            layer.transition = transition;
+            log::info!(
+                "Set transition for layer {} to {:?}",
+                layer_id,
+                transition.name()
+            );
+        }
+    }
+
+    /// Check if a clip is active on a layer at the given slot
+    pub fn is_clip_active(&self, layer_id: u32, slot: usize) -> bool {
+        self.environment
+            .get_layer(layer_id)
+            .map(|l| l.active_clip == Some(slot))
+            .unwrap_or(false)
+    }
+
+    /// Get the active clip slot for a layer, if any
+    pub fn active_clip_slot(&self, layer_id: u32) -> Option<usize> {
+        self.environment
+            .get_layer(layer_id)
+            .and_then(|l| l.active_clip)
+    }
+
+    /// Handle a clip grid action from the UI
+    fn handle_clip_action(&mut self, action: crate::ui::ClipGridAction) {
+        use crate::ui::ClipGridAction;
+
+        match action {
+            ClipGridAction::TriggerClip { layer_id, slot } => {
+                if let Err(e) = self.trigger_clip(layer_id, slot) {
+                    log::error!("Failed to trigger clip: {}", e);
+                    self.menu_bar.set_status(format!("Failed to trigger clip: {}", e));
+                }
+            }
+            ClipGridAction::StopClip { layer_id } => {
+                self.stop_clip(layer_id);
+            }
+            ClipGridAction::AssignClip { layer_id, slot } => {
+                // Mark that we're waiting for a file to be assigned
+                self.clip_grid_panel.set_pending_assignment(layer_id, slot);
+                // Request file picker via menu_bar
+                self.menu_bar.pending_action = Some(crate::ui::menu_bar::FileAction::OpenVideo);
+            }
+            ClipGridAction::AssignClipWithPath { layer_id, slot, path } => {
+                // Direct assignment from drag-drop
+                let label = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_string());
+                if self.set_layer_clip(layer_id, slot, path, label) {
+                    log::info!("Assigned clip to layer {} at slot {} via drag-drop", layer_id, slot);
+                    self.menu_bar.set_status(format!("Assigned clip to slot {}", slot + 1));
+                }
+            }
+            ClipGridAction::ClearClip { layer_id, slot } => {
+                self.clear_layer_clip(layer_id, slot);
+            }
+            ClipGridAction::SetLayerTransition { layer_id, transition } => {
+                self.set_layer_transition(layer_id, transition);
+            }
+            ClipGridAction::AddLayer => {
+                self.add_layer();
+            }
+            ClipGridAction::DeleteLayer { layer_id } => {
+                self.delete_layer(layer_id);
+            }
+            ClipGridAction::AddColumn => {
+                self.add_column();
+            }
+            ClipGridAction::DeleteColumn { column_index } => {
+                self.delete_column(column_index);
+            }
+        }
+    }
+
+    /// Complete a pending clip assignment with a video path
+    pub fn complete_clip_assignment(&mut self, path: std::path::PathBuf) {
+        if let Some((layer_id, slot)) = self.clip_grid_panel.take_pending_assignment() {
+            // Extract filename for label
+            let label = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_string());
+            
+            if self.set_layer_clip(layer_id, slot, path.clone(), label) {
+                log::info!("Assigned clip to layer {} at slot {}", layer_id, slot);
+                self.menu_bar.set_status(format!("Assigned clip to slot {}", slot + 1));
+            } else {
+                log::error!("Failed to assign clip to layer {} at slot {}", layer_id, slot);
+            }
+        } else {
+            // No pending assignment - this is a regular video load (legacy)
+            if let Err(e) = self.load_video(&path) {
+                log::error!("Failed to load video: {}", e);
+                self.menu_bar.set_status(format!("Failed: {}", e));
+            }
+        }
+    }
+
+    /// Check if there's a pending clip assignment
+    pub fn has_pending_clip_assignment(&self) -> bool {
+        self.clip_grid_panel.pending_clip_assignment.is_some()
     }
 
     // Legacy compatibility methods (for single-video use case)

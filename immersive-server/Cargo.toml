@@ -31,6 +31,9 @@ quick-xml = { version = "0.37", features = ["serialize"] }
 bytemuck = { version = "1", features = ["derive"] }
 dirs = "6"
 
+# File watching (for shader hot-reload)
+notify = "7"
+
 [[example]]
 name = "decode_video"
 path = "examples/decode_video.rs"

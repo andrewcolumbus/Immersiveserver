@@ -47,3 +47,7 @@ assets/ffmpeg/
 
 # Cursor project files
 .cursor/
+
+# egui toy for testing
+
+custom_egui/

@@ -3,11 +3,13 @@
 //! Defines the available blend modes for layer compositing and provides
 //! conversion to wgpu BlendState for GPU rendering.
 
+use serde::{Deserialize, Serialize};
+
 /// Blend modes for layer compositing.
 ///
 /// These modes determine how a layer's pixels are combined with the
 /// pixels of layers below it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum BlendMode {
     /// Standard alpha blending (Porter-Duff source-over)
     /// Result = Source × SourceAlpha + Dest × (1 - SourceAlpha)
@@ -149,4 +151,6 @@ mod tests {
         let _ = BlendMode::Screen.to_blend_state();
     }
 }
+
+
 
