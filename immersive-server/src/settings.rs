@@ -20,6 +20,18 @@ pub struct EnvironmentSettings {
     #[serde(rename = "showFps")]
     pub show_fps: bool,
 
+    /// Environment (composition canvas) width.
+    ///
+    /// If missing in older `.immersive` files, this will default to `window_width`.
+    #[serde(rename = "environmentWidth", default)]
+    pub environment_width: u32,
+
+    /// Environment (composition canvas) height.
+    ///
+    /// If missing in older `.immersive` files, this will default to `window_height`.
+    #[serde(rename = "environmentHeight", default)]
+    pub environment_height: u32,
+
     /// Window width
     #[serde(rename = "windowWidth")]
     pub window_width: u32,
@@ -34,6 +46,8 @@ impl Default for EnvironmentSettings {
         Self {
             target_fps: 60,
             show_fps: true,
+            environment_width: 1920,
+            environment_height: 1080,
             window_width: 1920,
             window_height: 1080,
         }
@@ -51,6 +65,21 @@ impl EnvironmentSettings {
         let contents = fs::read_to_string(path).map_err(SettingsError::Io)?;
         let mut settings: Self = from_str(&contents).map_err(SettingsError::XmlParse)?;
         settings.clamp_fps();
+
+        // Backwards compatibility: older files won't include environment resolution.
+        if settings.environment_width == 0 {
+            settings.environment_width = settings.window_width;
+        }
+        if settings.environment_height == 0 {
+            settings.environment_height = settings.window_height;
+        }
+
+        // Ensure sane minimums.
+        settings.window_width = settings.window_width.max(1);
+        settings.window_height = settings.window_height.max(1);
+        settings.environment_width = settings.environment_width.max(1);
+        settings.environment_height = settings.environment_height.max(1);
+
         Ok(settings)
     }
 
@@ -65,11 +94,18 @@ impl EnvironmentSettings {
 <ImmersiveEnvironment>
     <targetFps>{}</targetFps>
     <showFps>{}</showFps>
+    <environmentWidth>{}</environmentWidth>
+    <environmentHeight>{}</environmentHeight>
     <windowWidth>{}</windowWidth>
     <windowHeight>{}</windowHeight>
 </ImmersiveEnvironment>
 "#,
-            self.target_fps, self.show_fps, self.window_width, self.window_height
+            self.target_fps,
+            self.show_fps,
+            self.environment_width,
+            self.environment_height,
+            self.window_width,
+            self.window_height
         );
 
         fs::write(path, formatted).map_err(SettingsError::Io)?;
@@ -186,6 +222,8 @@ mod tests {
         let settings = EnvironmentSettings::default();
         assert_eq!(settings.target_fps, 60);
         assert!(settings.show_fps);
+        assert_eq!(settings.environment_width, 1920);
+        assert_eq!(settings.environment_height, 1080);
     }
 
     #[test]

@@ -14,6 +14,7 @@ use std::time::Instant;
 use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
+use crate::compositor::{Environment, Viewport};
 use crate::settings::EnvironmentSettings;
 use crate::ui::MenuBar;
 use crate::video::{VideoParams, VideoPlayer, VideoRenderer, VideoTexture};
@@ -67,19 +68,35 @@ pub struct App {
     /// Current window size in physical pixels
     size: PhysicalSize<u32>,
 
-    // Offscreen rendering (for display-independent frame rate)
-    /// Offscreen render texture
-    offscreen_texture: wgpu::Texture,
-    /// View of the offscreen texture
-    offscreen_view: wgpu::TextureView,
-    /// Bind group layout for copying texture to screen
+    // Environment (fixed-resolution composition canvas)
+    environment: Environment,
+    
+    // Viewport navigation (pan/zoom)
+    viewport: Viewport,
+    /// Current mouse position in window pixels
+    cursor_position: (f32, f32),
+    /// Last frame time for viewport animation
+    last_frame_time: Instant,
+
+    // Checkerboard background pipeline
+    /// Render pipeline for checkerboard background
+    checker_pipeline: wgpu::RenderPipeline,
+    /// Uniform buffer for checker params (environment size)
+    checker_params_buffer: wgpu::Buffer,
+    /// Bind group for checker params
+    checker_bind_group: wgpu::BindGroup,
+
+    // Present pass (Environment -> WindowSurface)
+    /// Bind group layout for presenting the environment to the window
     copy_bind_group_layout: wgpu::BindGroupLayout,
-    /// Bind group for copying texture to screen
+    /// Bind group for presenting the environment to the window
     copy_bind_group: wgpu::BindGroup,
-    /// Render pipeline for copying to screen
+    /// Render pipeline for presenting the environment to the window
     copy_pipeline: wgpu::RenderPipeline,
-    /// Sampler for texture copy
+    /// Sampler for presenting the environment texture
     sampler: wgpu::Sampler,
+    /// Uniform buffer for present params (scale/offset)
+    copy_params_buffer: wgpu::Buffer,
 
     // Frame timing
     /// UI frame count (for stats only)
@@ -192,11 +209,16 @@ impl App {
 
         surface.configure(&device, &config);
 
-        // Create offscreen render texture
-        let (offscreen_texture, offscreen_view) =
-            Self::create_offscreen_texture(&device, surface_format, size.width, size.height);
+        // Create Environment (fixed-resolution composition canvas)
+        let env_width = settings.environment_width.max(1);
+        let env_height = settings.environment_height.max(1);
+        let environment = Environment::new(&device, env_width, env_height, surface_format);
 
-        // Create texture copy pipeline
+        // Create checkerboard background pipeline
+        let (checker_pipeline, checker_params_buffer, checker_bind_group) =
+            Self::create_checker_pipeline(&device, &queue, surface_format, env_width, env_height);
+
+        // Create present pipeline (Environment -> WindowSurface)
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("Copy Sampler"),
             mag_filter: wgpu::FilterMode::Linear,
@@ -224,14 +246,34 @@ impl App {
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                         count: None,
                     },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
                 ],
             });
+
+        let copy_params = VideoParams::fit_aspect_ratio(env_width, env_height, size.width, size.height);
+        let copy_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Copy Params Buffer"),
+            size: std::mem::size_of::<VideoParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&copy_params_buffer, 0, bytemuck::bytes_of(&copy_params));
 
         let copy_bind_group = Self::create_copy_bind_group(
             &device,
             &copy_bind_group_layout,
-            &offscreen_view,
+            environment.texture_view(),
             &sampler,
+            &copy_params_buffer,
         );
 
         let copy_pipeline =
@@ -268,12 +310,18 @@ impl App {
             queue,
             config,
             size,
-            offscreen_texture,
-            offscreen_view,
+            environment,
+            viewport: Viewport::new(),
+            cursor_position: (0.0, 0.0),
+            last_frame_time: now,
+            checker_pipeline,
+            checker_params_buffer,
+            checker_bind_group,
             copy_bind_group_layout,
             copy_bind_group,
             copy_pipeline,
             sampler,
+            copy_params_buffer,
             ui_frame_count: 0,
             last_ui_fps_update: now,
             ui_frames_since_update: 0,
@@ -291,35 +339,12 @@ impl App {
         }
     }
 
-    fn create_offscreen_texture(
-        device: &wgpu::Device,
-        format: wgpu::TextureFormat,
-        width: u32,
-        height: u32,
-    ) -> (wgpu::Texture, wgpu::TextureView) {
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Offscreen Texture"),
-            size: wgpu::Extent3d {
-                width: width.max(1),
-                height: height.max(1),
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        (texture, view)
-    }
-
     fn create_copy_bind_group(
         device: &wgpu::Device,
         layout: &wgpu::BindGroupLayout,
         texture_view: &wgpu::TextureView,
         sampler: &wgpu::Sampler,
+        params_buffer: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Copy Bind Group"),
@@ -332,6 +357,10 @@ impl App {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: wgpu::BindingResource::Sampler(sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: params_buffer.as_entire_binding(),
                 },
             ],
         })
@@ -351,6 +380,15 @@ impl App {
                     @location(0) uv: vec2<f32>,
                 }
 
+                struct PresentParams {
+                    scale: vec2<f32>,
+                    offset: vec2<f32>,
+                    opacity: f32,
+                    _pad1: f32,
+                    _pad2: f32,
+                    _pad3: f32,
+                }
+
                 @vertex
                 fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
                     var out: VertexOutput;
@@ -364,10 +402,19 @@ impl App {
 
                 @group(0) @binding(0) var t_texture: texture_2d<f32>;
                 @group(0) @binding(1) var s_sampler: sampler;
+                @group(0) @binding(2) var<uniform> params: PresentParams;
 
                 @fragment
                 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-                    return textureSample(t_texture, s_sampler, in.uv);
+                    // Preserve environment aspect ratio when scaling into the window.
+                    let adjusted_uv = (in.uv - 0.5) / params.scale + 0.5 + params.offset;
+
+                    if (adjusted_uv.x < 0.0 || adjusted_uv.x > 1.0 || adjusted_uv.y < 0.0 || adjusted_uv.y > 1.0) {
+                        return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+                    }
+
+                    let color = textureSample(t_texture, s_sampler, adjusted_uv);
+                    return vec4<f32>(color.rgb, 1.0);
                 }
                 "#
                 .into(),
@@ -410,6 +457,168 @@ impl App {
         })
     }
 
+    /// Create checkerboard background pipeline
+    fn create_checker_pipeline(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        format: wgpu::TextureFormat,
+        env_width: u32,
+        env_height: u32,
+    ) -> (wgpu::RenderPipeline, wgpu::Buffer, wgpu::BindGroup) {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Checker Shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                r#"
+                struct VertexOutput {
+                    @builtin(position) position: vec4<f32>,
+                    @location(0) uv: vec2<f32>,
+                }
+
+                struct CheckerParams {
+                    env_size: vec2<f32>,
+                    checker_size: f32,
+                    _pad: f32,
+                }
+
+                @group(0) @binding(0) var<uniform> params: CheckerParams;
+
+                @vertex
+                fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
+                    var out: VertexOutput;
+                    let x = f32(i32(vertex_index & 1u) * 4 - 1);
+                    let y = f32(i32(vertex_index >> 1u) * 4 - 1);
+                    out.position = vec4<f32>(x, y, 0.0, 1.0);
+                    out.uv = vec2<f32>((x + 1.0) * 0.5, (1.0 - y) * 0.5);
+                    return out;
+                }
+
+                @fragment
+                fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+                    // Convert UV to pixel coordinates
+                    let pixel = in.uv * params.env_size;
+                    
+                    // Calculate checker pattern
+                    let checker_x = floor(pixel.x / params.checker_size);
+                    let checker_y = floor(pixel.y / params.checker_size);
+                    let is_light = (i32(checker_x) + i32(checker_y)) % 2 == 0;
+                    
+                    // Use subtle gray tones like Photoshop
+                    let light_gray = vec3<f32>(0.35, 0.35, 0.35);
+                    let dark_gray = vec3<f32>(0.25, 0.25, 0.25);
+                    
+                    let color = select(dark_gray, light_gray, is_light);
+                    return vec4<f32>(color, 1.0);
+                }
+                "#
+                .into(),
+            ),
+        });
+
+        // Checker params: env_size (vec2), checker_size (f32), padding (f32)
+        #[repr(C)]
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+        struct CheckerParams {
+            env_size: [f32; 2],
+            checker_size: f32,
+            _pad: f32,
+        }
+
+        let params = CheckerParams {
+            env_size: [env_width as f32, env_height as f32],
+            checker_size: 16.0, // 16 pixel checkers
+            _pad: 0.0,
+        };
+
+        let params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Checker Params Buffer"),
+            size: std::mem::size_of::<CheckerParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        queue.write_buffer(&params_buffer, 0, bytemuck::bytes_of(&params));
+
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Checker Bind Group Layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Checker Bind Group"),
+            layout: &bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: params_buffer.as_entire_binding(),
+            }],
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Checker Pipeline Layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Checker Pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        (pipeline, params_buffer, bind_group)
+    }
+
+    /// Update checkerboard params when environment size changes
+    fn update_checker_params(&self) {
+        #[repr(C)]
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+        struct CheckerParams {
+            env_size: [f32; 2],
+            checker_size: f32,
+            _pad: f32,
+        }
+
+        let params = CheckerParams {
+            env_size: [self.environment.width() as f32, self.environment.height() as f32],
+            checker_size: 16.0,
+            _pad: 0.0,
+        };
+
+        self.queue
+            .write_buffer(&self.checker_params_buffer, 0, bytemuck::bytes_of(&params));
+    }
+
     /// Handle window resize events
     pub fn resize(&mut self, new_size: PhysicalSize<u32>) {
         if new_size.width > 0 && new_size.height > 0 {
@@ -418,34 +627,15 @@ impl App {
             self.config.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
 
-            // Recreate offscreen texture
-            let (texture, view) = Self::create_offscreen_texture(
-                &self.device,
-                self.config.format,
+            // Update present params (Environment -> WindowSurface)
+            let params = VideoParams::fit_aspect_ratio(
+                self.environment.width(),
+                self.environment.height(),
                 new_size.width,
                 new_size.height,
             );
-            self.offscreen_texture = texture;
-            self.offscreen_view = view;
-
-            // Recreate bind group with new texture view
-            self.copy_bind_group = Self::create_copy_bind_group(
-                &self.device,
-                &self.copy_bind_group_layout,
-                &self.offscreen_view,
-                &self.sampler,
-            );
-
-            // Update video aspect ratio if video is loaded
-            if let Some(player) = &self.video_player {
-                let params = VideoParams::fit_aspect_ratio(
-                    player.width(),
-                    player.height(),
-                    new_size.width,
-                    new_size.height,
-                );
-                self.video_renderer.set_params(&self.queue, params);
-            }
+            self.queue
+                .write_buffer(&self.copy_params_buffer, 0, bytemuck::bytes_of(&params));
 
             log::debug!("Resized to {}x{}", new_size.width, new_size.height);
         }
@@ -481,6 +671,61 @@ impl App {
         response.consumed
     }
 
+    fn update_present_params(&mut self) {
+        let window_size = (self.size.width as f32, self.size.height as f32);
+        let env_size = (self.environment.width() as f32, self.environment.height() as f32);
+        
+        let (scale_x, scale_y, offset_x, offset_y) = self.viewport.get_shader_params(window_size, env_size);
+        
+        let params = VideoParams {
+            scale: [scale_x, scale_y],
+            offset: [offset_x, offset_y],
+            opacity: 1.0,
+            _padding: [0.0; 3],
+        };
+        self.queue
+            .write_buffer(&self.copy_params_buffer, 0, bytemuck::bytes_of(&params));
+    }
+
+    fn update_video_params_for_environment(&mut self) {
+        let Some(player) = &self.video_player else {
+            return;
+        };
+
+        let params = VideoParams::native_size(
+            player.width(),
+            player.height(),
+            self.environment.width(),
+            self.environment.height(),
+        );
+        self.video_renderer.set_params(&self.queue, params);
+    }
+
+    fn sync_environment_from_settings(&mut self) {
+        let desired_width = self.settings.environment_width.max(1);
+        let desired_height = self.settings.environment_height.max(1);
+
+        if desired_width == self.environment.width() && desired_height == self.environment.height() {
+            return;
+        }
+
+        self.environment
+            .resize(&self.device, desired_width, desired_height);
+
+        // Environment texture view changed, so recreate present bind group.
+        self.copy_bind_group = Self::create_copy_bind_group(
+            &self.device,
+            &self.copy_bind_group_layout,
+            self.environment.texture_view(),
+            &self.sampler,
+            &self.copy_params_buffer,
+        );
+
+        self.update_present_params();
+        self.update_checker_params();
+        self.update_video_params_for_environment();
+    }
+
     /// Render a frame with egui UI
     pub fn render(&mut self) -> Result<bool, wgpu::SurfaceError> {
         // Begin egui frame
@@ -504,6 +749,9 @@ impl App {
             display_frame_time_ms,
         );
 
+        // Apply environment resolution changes (if any) before rendering.
+        self.sync_environment_from_settings();
+
         let full_output = self.egui_ctx.end_pass();
 
         self.egui_state
@@ -520,25 +768,16 @@ impl App {
                 label: Some("Render Encoder"),
             });
 
-        // Render to OFFSCREEN texture (not surface) - this is key for decoupling
-        // First, render video if loaded, otherwise clear
-        if let Some(bind_group) = &self.video_bind_group {
-            // Render video fullscreen
-            self.video_renderer.render(&mut encoder, &self.offscreen_view, bind_group, true);
-        } else {
-            // No video, just clear
-            let _render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Clear Pass"),
+        // Render to Environment texture (fixed-resolution canvas)
+        // 1. Always render checkerboard background first
+        {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Checker Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.offscreen_view,
+                    view: self.environment.texture_view(),
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.02,
-                            g: 0.02,
-                            b: 0.04,
-                            a: 1.0,
-                        }),
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -546,6 +785,15 @@ impl App {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
+            render_pass.set_pipeline(&self.checker_pipeline);
+            render_pass.set_bind_group(0, &self.checker_bind_group, &[]);
+            render_pass.draw(0..3, 0..1);
+        }
+
+        // 2. Render video on top (with alpha blending, no clear)
+        if let Some(bind_group) = &self.video_bind_group {
+            self.video_renderer
+                .render(&mut encoder, self.environment.texture_view(), bind_group, false);
         }
 
         // Update egui textures
@@ -567,21 +815,7 @@ impl App {
             &screen_descriptor,
         );
 
-        // Render egui to offscreen texture
-        render_egui_pass(
-            &self.egui_renderer,
-            &mut encoder,
-            &self.offscreen_view,
-            &paint_jobs,
-            &screen_descriptor,
-        );
-
-        // Free egui textures
-        for id in &full_output.textures_delta.free {
-            self.egui_renderer.free_texture(id);
-        }
-
-        // Now copy offscreen texture to screen
+        // Present Environment to the window surface
         let output = self.surface.get_current_texture()?;
         let surface_view = output
             .texture
@@ -589,7 +823,7 @@ impl App {
 
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Copy to Screen Pass"),
+                label: Some("Present Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &surface_view,
                     resolve_target: None,
@@ -606,6 +840,20 @@ impl App {
             render_pass.set_pipeline(&self.copy_pipeline);
             render_pass.set_bind_group(0, &self.copy_bind_group, &[]);
             render_pass.draw(0..3, 0..1);
+        }
+
+        // Render egui on top of the surface
+        render_egui_pass(
+            &self.egui_renderer,
+            &mut encoder,
+            &surface_view,
+            &paint_jobs,
+            &screen_descriptor,
+        );
+
+        // Free egui textures
+        for id in &full_output.textures_delta.free {
+            self.egui_renderer.free_texture(id);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -663,6 +911,10 @@ impl App {
         self.settings.target_fps
     }
 
+    pub fn cursor_position(&self) -> (f32, f32) {
+        self.cursor_position
+    }
+
     // Video playback methods (background-threaded)
 
     /// Load a video file for playback (starts background decode thread)
@@ -682,12 +934,12 @@ impl App {
         // Create video texture
         let video_texture = VideoTexture::new(&self.device, player.width(), player.height());
 
-        // Set up aspect ratio preserving params
-        let params = VideoParams::fit_aspect_ratio(
+        // Set up native size params (videos spill over if larger than environment)
+        let params = VideoParams::native_size(
             player.width(),
             player.height(),
-            self.size.width,
-            self.size.height,
+            self.environment.width(),
+            self.environment.height(),
         );
         self.video_renderer.set_params(&self.queue, params);
 
@@ -744,5 +996,72 @@ impl App {
     /// Get the current video path if loaded
     pub fn current_video_path(&self) -> Option<&std::path::Path> {
         self.video_player.as_ref().map(|p| p.path())
+    }
+
+    // Viewport navigation methods
+
+    /// Handle right mouse button press for panning
+    /// Returns true if viewport was reset (double-click)
+    pub fn on_right_mouse_down(&mut self, x: f32, y: f32) -> bool {
+        let reset = self.viewport.on_right_mouse_down((x, y));
+        if reset {
+            self.update_present_params();
+        }
+        reset
+    }
+
+    /// Handle right mouse button release
+    pub fn on_right_mouse_up(&mut self) {
+        self.viewport.on_right_mouse_up();
+    }
+
+    /// Handle mouse movement
+    pub fn on_mouse_move(&mut self, x: f32, y: f32) {
+        self.cursor_position = (x, y);
+        let window_size = (self.size.width as f32, self.size.height as f32);
+        let env_size = (self.environment.width() as f32, self.environment.height() as f32);
+        self.viewport.on_mouse_move((x, y), window_size, env_size);
+        self.update_present_params();
+    }
+
+    /// Handle scroll wheel for zooming
+    pub fn on_scroll(&mut self, delta: f32) {
+        let window_size = (self.size.width as f32, self.size.height as f32);
+        let env_size = (self.environment.width() as f32, self.environment.height() as f32);
+        self.viewport.on_scroll(delta, self.cursor_position, window_size, env_size);
+        self.update_present_params();
+    }
+
+    /// Handle keyboard zoom (+/- keys)
+    pub fn on_keyboard_zoom(&mut self, zoom_in: bool) {
+        let window_size = (self.size.width as f32, self.size.height as f32);
+        let env_size = (self.environment.width() as f32, self.environment.height() as f32);
+        self.viewport.on_keyboard_zoom(zoom_in, window_size, env_size);
+        self.update_present_params();
+    }
+
+    /// Reset viewport to fit-to-window
+    pub fn reset_viewport(&mut self) {
+        self.viewport.reset();
+        self.update_present_params();
+    }
+
+    /// Update viewport animation (rubber-band snap-back)
+    pub fn update_viewport(&mut self) {
+        let now = Instant::now();
+        let dt = now.duration_since(self.last_frame_time).as_secs_f32();
+        self.last_frame_time = now;
+
+        if self.viewport.needs_update() {
+            let window_size = (self.size.width as f32, self.size.height as f32);
+            let env_size = (self.environment.width() as f32, self.environment.height() as f32);
+            self.viewport.update(dt, window_size, env_size);
+            self.update_present_params();
+        }
+    }
+
+    /// Get current zoom level (for UI display)
+    pub fn viewport_zoom(&self) -> f32 {
+        self.viewport.zoom()
     }
 }

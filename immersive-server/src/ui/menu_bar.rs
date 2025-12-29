@@ -16,6 +16,12 @@ pub struct MenuBar {
     /// Temporary FPS value while editing (for slider)
     pub temp_fps: u32,
 
+    /// Temporary environment width while editing
+    pub temp_environment_width: u32,
+
+    /// Temporary environment height while editing
+    pub temp_environment_height: u32,
+
     /// Status message to display
     pub status_message: Option<(String, std::time::Instant)>,
 }
@@ -39,6 +45,8 @@ impl Default for MenuBar {
             environment_panel_open: false,
             pending_action: None,
             temp_fps: 60,
+            temp_environment_width: 1920,
+            temp_environment_height: 1080,
             status_message: None,
         }
     }
@@ -49,6 +57,8 @@ impl MenuBar {
     pub fn new(settings: &EnvironmentSettings) -> Self {
         Self {
             temp_fps: settings.target_fps,
+            temp_environment_width: settings.environment_width,
+            temp_environment_height: settings.environment_height,
             ..Default::default()
         }
     }
@@ -56,6 +66,8 @@ impl MenuBar {
     /// Sync temp values from settings
     pub fn sync_from_settings(&mut self, settings: &EnvironmentSettings) {
         self.temp_fps = settings.target_fps;
+        self.temp_environment_width = settings.environment_width;
+        self.temp_environment_height = settings.environment_height;
     }
 
     /// Set a status message that will display for a few seconds
@@ -174,7 +186,31 @@ impl MenuBar {
                 .resizable(false)
                 .default_width(350.0)
                 .show(ctx, |ui| {
-                    ui.heading("Display Settings");
+                    ui.heading("Environment Settings");
+                    ui.separator();
+
+                    // Environment resolution (composition canvas)
+                    ui.horizontal(|ui| {
+                        ui.label("Environment:");
+                        ui.add(
+                            egui::DragValue::new(&mut self.temp_environment_width)
+                                .range(1..=16384)
+                                .suffix(" px"),
+                        );
+                        ui.label("×");
+                        ui.add(
+                            egui::DragValue::new(&mut self.temp_environment_height)
+                                .range(1..=16384)
+                                .suffix(" px"),
+                        );
+                    });
+
+                    ui.label(
+                        egui::RichText::new("The window previews the environment scaled to fit.")
+                            .small()
+                            .weak(),
+                    );
+
                     ui.separator();
 
                     // FPS slider
@@ -228,10 +264,30 @@ impl MenuBar {
                     // Apply / Cancel buttons
                     ui.horizontal(|ui| {
                         if ui.button("Apply").clicked() {
+                            let mut any_changes = false;
+
+                            if self.temp_environment_width != settings.environment_width
+                                || self.temp_environment_height != settings.environment_height
+                            {
+                                settings.environment_width = self.temp_environment_width;
+                                settings.environment_height = self.temp_environment_height;
+                                settings_changed = true;
+                                any_changes = true;
+                                self.set_status(format!(
+                                    "Environment set to {}x{}",
+                                    self.temp_environment_width, self.temp_environment_height
+                                ));
+                            }
+
                             if self.temp_fps != settings.target_fps {
                                 settings.target_fps = self.temp_fps;
                                 settings_changed = true;
+                                any_changes = true;
                                 self.set_status(format!("Target FPS set to {}", self.temp_fps));
+                            }
+
+                            if !any_changes {
+                                self.set_status("No changes");
                             }
                         }
 

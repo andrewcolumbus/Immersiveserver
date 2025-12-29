@@ -11,7 +11,7 @@ use immersive_server::settings::{AppPreferences, EnvironmentSettings};
 use immersive_server::App;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, KeyEvent, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId};
@@ -286,6 +286,18 @@ impl ApplicationHandler for ImmersiveApp {
                             app.restart_video();
                         }
                     }
+                    // + or = to zoom in
+                    KeyCode::Equal | KeyCode::NumpadAdd => {
+                        app.on_keyboard_zoom(true);
+                    }
+                    // - to zoom out
+                    KeyCode::Minus | KeyCode::NumpadSubtract => {
+                        app.on_keyboard_zoom(false);
+                    }
+                    // 0 or Home to reset viewport
+                    KeyCode::Digit0 | KeyCode::Home => {
+                        app.reset_viewport();
+                    }
                     _ => {}
                 }
             }
@@ -293,6 +305,38 @@ impl ApplicationHandler for ImmersiveApp {
             // Handle window resize
             WindowEvent::Resized(physical_size) => {
                 app.resize(physical_size);
+            }
+
+            // Handle mouse button events (for viewport panning)
+            WindowEvent::MouseInput { state, button, .. } if !egui_consumed => {
+                if button == MouseButton::Right {
+                    match state {
+                        ElementState::Pressed => {
+                            // Use the tracked cursor position
+                            let (cx, cy) = app.cursor_position();
+                            app.on_right_mouse_down(cx, cy);
+                        }
+                        ElementState::Released => {
+                            app.on_right_mouse_up();
+                        }
+                    }
+                }
+            }
+
+            // Handle cursor movement (for viewport panning and zoom target)
+            WindowEvent::CursorMoved { position, .. } => {
+                app.on_mouse_move(position.x as f32, position.y as f32);
+            }
+
+            // Handle scroll wheel (for viewport zooming)
+            WindowEvent::MouseWheel { delta, .. } if !egui_consumed => {
+                let scroll_amount = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y,
+                    MouseScrollDelta::PixelDelta(pos) => (pos.y / 50.0) as f32,
+                };
+                if scroll_amount.abs() > 0.001 {
+                    app.on_scroll(scroll_amount);
+                }
             }
 
             // Handle redraw request
@@ -389,6 +433,9 @@ impl ApplicationHandler for ImmersiveApp {
 
                 // Begin frame timing
                 app.begin_frame();
+
+                // Update viewport animation (rubber-band snap-back)
+                app.update_viewport();
 
                 // Update video playback (decode next frame if needed)
                 app.update_video();

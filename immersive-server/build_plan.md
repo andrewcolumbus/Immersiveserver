@@ -74,6 +74,8 @@ Designed for professional projection mapping, NDI/OMT streaming, and real-time w
 
 ## 3. Development Phases
 
+> **⚠️ Testing Requirement:** Before checking off any checkbox, you MUST complete the associated verification steps. Each feature should have passing tests and manual verification before being marked complete.
+
 ### Phase 1: Foundation (Weeks 1–3)
 
 **Goal:** Minimal rendering loop with wgpu, single video file playback.
@@ -84,7 +86,17 @@ Designed for professional projection mapping, NDI/OMT streaming, and real-time w
 - [x] Integrate `ffmpeg-next` for software video decoding
 - [x] Upload decoded frames to GPU texture
 - [x] Basic fullscreen quad shader to display video
-- [ ] Test on macOS (Metal) and Windows (DX12)
+- [x] Test on macOS (Metal) and Windows (DX12)
+
+**✅ Verification Checklist (Phase 1):**
+- [x] `cargo test` passes with no failures
+- [x] `cargo clippy` reports no warnings
+- [x] App launches and displays a window on macOS
+- [x] App launches and displays a window on Windows
+- [x] Video file (MP4/MOV) plays smoothly at correct speed
+- [x] FPS counter shows stable ~60fps
+- [x] No memory leaks after 5 minutes of playback (check Activity Monitor / Task Manager)
+- [x] App closes cleanly without crashes
 
 **Crates:**
 ```toml
@@ -103,7 +115,7 @@ env_logger = "0.11"
 
 **Goal:** Environment container with configurable resolution, layer system with opacity and blending.
 
-- [ ] Add `Environment` struct to hold all layers
+- [x] Add `Environment` struct to hold all layers
   - User-configurable resolution (width × height)
   - Videos larger than environment spill over edges
   - Videos smaller than environment don't fill the canvas
@@ -112,6 +124,14 @@ env_logger = "0.11"
 - [ ] Add transform pipeline: position, scale, rotation
 - [ ] Implement blend modes: Normal, Additive, Multiply, Screen
 - [ ] Hot-reload shader system (development mode)
+- [ ] **Clip Grid System**
+  - Grid of clips (rows × columns) per layer
+  - Each cell contains a video/source reference
+  - Click cell to trigger playback on that layer
+  - Only one clip active per layer at a time
+  - Configurable grid dimensions (e.g., 4×4, 8×8)
+  - Visual feedback: playing clip highlighted
+  - Clip transition modes: cut, fade, crossfade
 
 **Data Model:**
 ```rust
@@ -120,12 +140,66 @@ struct Environment {
     height: u32,
     layers: Vec<Layer>,
 }
+
+struct Layer {
+    id: u32,
+    name: String,
+    clip_grid: ClipGrid,
+    active_clip: Option<(usize, usize)>,  // (row, col) of playing clip
+    transform: Transform2D,
+    opacity: f32,
+    blend_mode: BlendMode,
+    visible: bool,
+}
+
+struct ClipGrid {
+    rows: usize,
+    columns: usize,
+    cells: Vec<Vec<Option<ClipCell>>>,  // [row][col]
+}
+
+struct ClipCell {
+    source_path: String,           // File path, NDI source, etc.
+    thumbnail: Option<TextureId>,  // Preview thumbnail
+    label: Option<String>,         // User-defined label
+    transition: ClipTransition,    // How to transition to this clip
+}
+
+enum ClipTransition {
+    Cut,                           // Instant switch
+    Fade { duration_ms: u32 },     // Fade out old, fade in new
+    Crossfade { duration_ms: u32 }, // Overlap crossfade
+}
 ```
 
 **Shaders (WGSL):**
 - `fullscreen_quad.wgsl` — basic texture sampling
 - `blend_composite.wgsl` — multi-layer blending pass
 - `transform.wgsl` — 2D affine transforms
+
+**✅ Verification Checklist (Phase 2):**
+- [ ] `cargo test` passes — include unit tests for `Environment` and `Layer` structs
+- [ ] Environment can be created with custom resolution (test 1920×1080, 4096×2160, 800×600)
+- [ ] Video larger than environment correctly spills over edges (visually verify)
+- [ ] Video smaller than environment shows empty space around it (visually verify)
+- [ ] 4+ layers render in correct order (back-to-front)
+- [ ] Layer opacity slider works (0% = invisible, 100% = fully opaque)
+- [ ] Each blend mode produces visually correct output (compare to reference images)
+- [ ] Transform controls work: position, scale, rotation
+- [ ] Shader hot-reload works in dev mode (modify .wgsl file, see changes without restart)
+- [ ] Performance: 4 layers at 1080p maintains 60fps
+- [ ] **Clip Grid:**
+  - [ ] Layer displays clip grid with configurable dimensions (test 4×4, 8×8)
+  - [ ] Clicking grid cell triggers that clip on the layer
+  - [ ] Only one clip plays per layer at a time (previous stops)
+  - [ ] Active clip cell is visually highlighted
+  - [ ] Empty cells are clickable but do nothing (no crash)
+  - [ ] Clip thumbnails display correctly in grid
+  - [ ] Cut transition: instant switch, no visual glitch
+  - [ ] Fade transition: old clip fades out, new fades in
+  - [ ] Crossfade transition: smooth overlap between clips
+  - [ ] Transition duration is respected (test 500ms, 1000ms)
+  - [ ] Grid state persists across app restart
 
 ---
 
@@ -146,6 +220,19 @@ struct Environment {
   - Absolute pixel positioning within environment
   - Anchor points (center, corners, edges)
   - Drag-and-drop support in UI
+
+**✅ Verification Checklist (Phase 2.5):**
+- [ ] Clone same video to 3+ layers — verify single decode, multiple renders
+- [ ] Cloned layers can have independent transforms (position/scale/rotation)
+- [ ] Multiplex single source to multiple regions — verify GPU memory usage is shared
+- [ ] Resize video up (2× scale) — verify quality/interpolation
+- [ ] Resize video down (0.5× scale) — verify no aliasing artifacts
+- [ ] "Maintain aspect ratio" option works correctly
+- [ ] "Ignore aspect ratio" option allows stretching
+- [ ] Position video at exact pixel coordinates (test: place at 100,100)
+- [ ] Anchor points work: center places video center at position, top-left places corner
+- [ ] Drag-and-drop in UI updates position values correctly
+- [ ] Performance: 8 cloned layers maintains 60fps (shared decode)
 
 ---
 
@@ -181,6 +268,24 @@ struct OutputConfig {
 }
 ```
 
+**✅ Verification Checklist (Phase 3):**
+- [ ] Mesh warp: 4×4 grid deforms image correctly
+- [ ] Mesh warp: 8×8 grid provides finer control
+- [ ] Bezier interpolation produces smooth curves between control points
+- [ ] Mesh configuration saves/loads correctly from file
+- [ ] Edge blend: left/right blend creates smooth gradient overlap
+- [ ] Edge blend: top/bottom blend works correctly
+- [ ] Edge blend: gamma correction produces linear visual falloff
+- [ ] Two overlapping outputs blend seamlessly (no visible seam)
+- [ ] Bezier mask correctly hides portions of output
+- [ ] Mask feathering produces soft edges (test 0px, 10px, 50px feather)
+- [ ] Mask invert works correctly
+- [ ] Multiple masks combine correctly (union/intersection)
+- [ ] Color correction: brightness adjustment (-100% to +100%)
+- [ ] Color correction: contrast adjustment works
+- [ ] Color correction: gamma curve applies correctly
+- [ ] All settings persist across app restart
+
 ---
 
 ### Phase 4: Hardware Video Decoding (Weeks 11–12)
@@ -193,6 +298,19 @@ struct OutputConfig {
   - Direct GPU texture upload (DXT/BC compression)
   - Use Hap library from `external_libraries/hap`
 - [ ] Benchmark: target 4× 4K @ 60fps decode headroom
+
+**✅ Verification Checklist (Phase 4):**
+- [ ] macOS: VideoToolbox hwaccel enabled (check logs for "hwaccel: videotoolbox")
+- [ ] macOS: CPU usage drops significantly vs software decode (measure with Activity Monitor)
+- [ ] Windows: D3D11VA or NVDEC enabled (check logs)
+- [ ] Windows: GPU decode visible in Task Manager GPU stats
+- [ ] 4K H.264 video plays smoothly at 60fps
+- [ ] 4K H.265/HEVC video plays smoothly at 60fps
+- [ ] Hap codec: DXT texture uploads directly (no CPU conversion)
+- [ ] Hap Alpha codec works correctly
+- [ ] Benchmark test: decode 4× 4K streams simultaneously, verify <50% CPU usage
+- [ ] Graceful fallback to software decode if hwaccel unavailable
+- [ ] No visual artifacts or color space issues with hwaccel
 
 ---
 
@@ -214,6 +332,20 @@ struct OutputConfig {
 
 **Crate:** Create `ndi-rs` wrapper or use existing community bindings.
 
+**✅ Verification Checklist (Phase 5):**
+- [ ] NDI sources on local network are discovered and listed
+- [ ] NDI source discovery updates dynamically (new sources appear)
+- [ ] Receive NDI stream and display as layer (test with NDI Test Patterns)
+- [ ] Receive multiple NDI streams simultaneously (test 4 streams)
+- [ ] NDI receiver handles source disconnect gracefully (no crash, shows placeholder)
+- [ ] NDI receiver auto-reconnects when source comes back
+- [ ] Send compositor output as NDI stream
+- [ ] NDI output visible in NDI Studio Monitor
+- [ ] NDI output maintains quality (compare to direct output)
+- [ ] Multiple NDI outputs work simultaneously
+- [ ] Latency measurement: NDI round-trip < 3 frames
+- [ ] Memory stable after 1 hour of NDI streaming (no leaks)
+
 ---
 
 ### Phase 6: OMT Input/Output (Weeks 16–17)
@@ -225,6 +357,17 @@ struct OutputConfig {
 - [ ] OMT Receiver: QUIC-based frame reception
 - [ ] OMT Sender: output compositor to OMT stream
 - [ ] Fallback to provided `libOMT.dylib` / `.dll` if needed
+
+**✅ Verification Checklist (Phase 6):**
+- [ ] OMT sources are discovered on network
+- [ ] OMT receiver connects and displays stream
+- [ ] OMT latency is measurably lower than NDI (< 1 frame target)
+- [ ] OMT sender outputs compositor to OMT stream
+- [ ] OMT output receivable by other OMT clients
+- [ ] QUIC transport handles packet loss gracefully
+- [ ] Fallback to libOMT works when Aqueduct unavailable
+- [ ] OMT and NDI can run simultaneously without conflicts
+- [ ] OMT reconnects automatically on network interruption
 
 ---
 
@@ -238,6 +381,10 @@ struct OutputConfig {
   - `PUT /api/environment` — update environment resolution
   - `POST /api/environment/layers` — add/modify layers
   - `DELETE /api/environment/layers/:id`
+  - `GET /api/layers/:id/clips` — get clip grid for layer
+  - `PUT /api/layers/:id/clips/:row/:col` — set clip at grid position
+  - `POST /api/layers/:id/clips/:row/:col/trigger` — trigger clip playback
+  - `DELETE /api/layers/:id/clips/:row/:col` — remove clip from grid
   - `GET /api/outputs` — list displays/projectors
   - `PUT /api/outputs/:id` — update mapping config
 - [ ] **WebSocket (real-time)**
@@ -258,6 +405,29 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ```
 
+**✅ Verification Checklist (Phase 7):**
+- [ ] Server starts on configurable port (default 8080)
+- [ ] `GET /api/sources` returns JSON list of available inputs
+- [ ] `GET /api/environment` returns current environment state
+- [ ] `PUT /api/environment` updates resolution (verify with GET)
+- [ ] `POST /api/environment/layers` adds a new layer
+- [ ] `DELETE /api/environment/layers/:id` removes layer
+- [ ] `GET /api/layers/:id/clips` returns clip grid state
+- [ ] `PUT /api/layers/:id/clips/:row/:col` assigns clip to grid cell
+- [ ] `POST /api/layers/:id/clips/:row/:col/trigger` triggers clip playback
+- [ ] `DELETE /api/layers/:id/clips/:row/:col` removes clip from cell
+- [ ] `GET /api/outputs` lists connected displays
+- [ ] `PUT /api/outputs/:id` updates output config
+- [ ] WebSocket connection establishes successfully
+- [ ] WebSocket receives real-time state updates when layers change
+- [ ] WebSocket receives FPS/performance metrics
+- [ ] WebSocket commands (play/pause/etc) execute correctly
+- [ ] Static files served from `/` (test with simple HTML file)
+- [ ] API responds in < 5ms for control commands (measure with curl)
+- [ ] Token auth blocks unauthorized requests (401 response)
+- [ ] Valid token allows access
+- [ ] API handles malformed JSON gracefully (400 response, not crash)
+
 ---
 
 ### Phase 8: Web Dashboard (Weeks 21–24)
@@ -268,6 +438,7 @@ serde_json = "1"
 - [ ] **Core Views:**
   - Source Browser (files, NDI, OMT)
   - Layer Timeline / Stack
+  - **Clip Grid Launcher** (per-layer grid of triggerable clips)
   - Output Configuration (displays, mapping)
   - Live Preview (WebRTC or MJPEG)
 - [ ] **Mapping Editor:**
@@ -275,6 +446,32 @@ serde_json = "1"
   - Edge blend sliders
   - Mask drawing tools
 - [ ] **Responsive Design:** Tablet-friendly for on-site operation
+
+**✅ Verification Checklist (Phase 8):**
+- [ ] Dashboard loads in Chrome, Firefox, Safari, Edge
+- [ ] Source browser lists files, NDI sources, and OMT sources
+- [ ] Can add source to environment by clicking/dragging
+- [ ] Layer stack shows all layers in correct order
+- [ ] Layer reordering via drag-and-drop works
+- [ ] Layer properties (opacity, blend, transform) editable
+- [ ] **Clip Grid UI:**
+  - [ ] Clip grid displays for each layer
+  - [ ] Grid shows thumbnails for assigned clips
+  - [ ] Clicking cell triggers clip playback
+  - [ ] Active clip visually highlighted in grid
+  - [ ] Drag source from browser to grid cell to assign
+  - [ ] Right-click cell to remove clip
+  - [ ] Grid dimensions configurable per layer
+- [ ] Output configuration shows all connected displays
+- [ ] Live preview displays current compositor output
+- [ ] Preview updates in real-time (< 200ms latency)
+- [ ] Mesh point editor: can drag control points
+- [ ] Mesh changes apply to output in real-time
+- [ ] Edge blend sliders update output immediately
+- [ ] Mask drawing tool creates valid mask shapes
+- [ ] Dashboard works on iPad (test Safari, touch interactions)
+- [ ] All controls accessible without horizontal scrolling on tablet
+- [ ] Dashboard reconnects automatically if server restarts
 
 ---
 
@@ -303,6 +500,25 @@ serde_json = "1"
   - Windows: MSI or NSIS installer
   - Code signing for both platforms
 
+**✅ Verification Checklist (Phase 9):**
+- [ ] GPU profiling data collected and reviewed (identify bottlenecks)
+- [ ] CPU profiling completed — no functions taking >10% of frame time
+- [ ] Memory leak test: run 24 hours, memory usage stable (±10%)
+- [ ] GPU tiling: create 16384×16384 environment (exceeds typical 8K limit)
+- [ ] GPU tiling: verify no visible seams at tile boundaries
+- [ ] GPU tiling: panning/scrolling across tiles is smooth
+- [ ] Tile allocation updates dynamically when viewport moves
+- [ ] App logs GPU max texture size at startup
+- [ ] Source disconnect shows user-friendly message (not crash)
+- [ ] NDI/OMT auto-reconnect works within 5 seconds
+- [ ] All errors logged with `tracing` (verify structured JSON output)
+- [ ] Log levels configurable (debug/info/warn/error)
+- [ ] macOS installer: `.dmg` mounts and app drags to Applications
+- [ ] macOS installer: app launches without Gatekeeper warnings (signed)
+- [ ] Windows installer: MSI installs without admin elevation (if possible)
+- [ ] Windows installer: app runs without "Unknown publisher" warning (signed)
+- [ ] Uninstall cleans up all files on both platforms
+
 ---
 
 ### Phase 10: REST API Feature Planning (Weeks 29–30)
@@ -325,6 +541,22 @@ serde_json = "1"
   - *TODO: Add endpoints based on user feedback*
   - *Ask: What functions should be exposed via API?*
 
+**✅ Verification Checklist (Phase 10):**
+- [ ] Complete list of app functions documented
+- [ ] User survey sent and responses collected
+- [ ] API endpoints prioritized based on user feedback
+- [ ] All core endpoints implemented and tested:
+  - [ ] Environment CRUD operations work via API
+  - [ ] Layer manipulation works via API
+  - [ ] Video control (load/play/pause/seek) works via API
+  - [ ] Output configuration works via API
+- [ ] OpenAPI/Swagger spec generated and valid
+- [ ] API explorer accessible at `/api/docs`
+- [ ] API explorer allows testing endpoints interactively
+- [ ] User-requested features implemented (list specific ones as added)
+- [ ] API versioning strategy documented (e.g., `/api/v1/`)
+- [ ] Breaking changes documented in changelog
+
 ---
 
 ## 4. File Structure
@@ -342,7 +574,8 @@ immersive-server/
 │   │   ├── mod.rs
 │   │   ├── layer.rs            # Layer definition
 │   │   ├── environment.rs      # Environment (holds all layers)
-│   │   └── blend.rs            # Blend modes
+│   │   ├── blend.rs            # Blend modes
+│   │   └── clip_grid.rs        # Clip grid/launcher system
 │   ├── render/
 │   │   ├── mod.rs
 │   │   ├── pipeline.rs         # wgpu pipeline setup

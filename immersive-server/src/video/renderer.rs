@@ -56,6 +56,26 @@ impl VideoParams {
     pub fn stretch() -> Self {
         Self::default()
     }
+
+    /// Create params for native pixel size rendering (allows spill-over for large videos)
+    /// Videos larger than environment will spill over edges.
+    /// Videos smaller than environment won't fill the canvas.
+    pub fn native_size(video_width: u32, video_height: u32, env_width: u32, env_height: u32) -> Self {
+        // Calculate scale such that the video renders at its native pixel size
+        // relative to the environment.
+        // scale = video_size / env_size
+        // A video twice as wide as env will have scale_x = 2.0 (spills over)
+        // A video half as wide as env will have scale_x = 0.5 (doesn't fill)
+        let scale_x = video_width as f32 / env_width as f32;
+        let scale_y = video_height as f32 / env_height as f32;
+
+        Self {
+            scale: [scale_x, scale_y],
+            offset: [0.0, 0.0],
+            opacity: 1.0,
+            _padding: [0.0; 3],
+        }
+    }
 }
 
 /// Video renderer that displays video textures using a fullscreen quad
