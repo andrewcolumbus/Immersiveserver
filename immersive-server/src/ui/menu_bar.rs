@@ -97,11 +97,6 @@ impl MenuBar {
                         ui.close_menu();
                     }
 
-                    if ui.button("Open Video...").clicked() {
-                        self.pending_action = Some(FileAction::OpenVideo);
-                        ui.close_menu();
-                    }
-
                     ui.separator();
 
                     if ui.button("Save").clicked() {

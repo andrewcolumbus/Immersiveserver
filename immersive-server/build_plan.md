@@ -178,28 +178,27 @@ enum ClipTransition {
 - `transform.wgsl` — 2D affine transforms
 
 **✅ Verification Checklist (Phase 2):**
-- [ ] `cargo test` passes — include unit tests for `Environment` and `Layer` structs
-- [ ] Environment can be created with custom resolution (test 1920×1080, 4096×2160, 800×600)
-- [ ] Video larger than environment correctly spills over edges (visually verify)
-- [ ] Video smaller than environment shows empty space around it (visually verify)
-- [ ] 4+ layers render in correct order (back-to-front)
+- [x] `cargo test` passes — include unit tests for `Environment` and `Layer` structs
+- [x] Environment can be created with custom resolution (test 1920×1080, 4096×2160, 800×600)
+- [x] Video larger than environment correctly spills over edges (visually verify)
+- [x] Video smaller than environment shows empty space around it (visually verify)
+- [x] 4+ layers render in correct order (back-to-front)
 - [ ] Layer opacity slider works (0% = invisible, 100% = fully opaque)
-- [ ] Each blend mode produces visually correct output (compare to reference images)
+- [x] Each blend mode produces visually correct output (compare to reference images)
 - [ ] Transform controls work: position, scale, rotation
-- [ ] Shader hot-reload works in dev mode (modify .wgsl file, see changes without restart)
-- [ ] Performance: 4 layers at 1080p maintains 60fps
+- [x] Shader hot-reload works in dev mode (modify .wgsl file, see changes without restart)
+- [x] Performance: 4 layers at 1080p maintains 60fps
 - [ ] **Clip Grid:**
-  - [ ] Layer displays clip grid with configurable dimensions (test 4×4, 8×8)
-  - [ ] Clicking grid cell triggers that clip on the layer
-  - [ ] Only one clip plays per layer at a time (previous stops)
-  - [ ] Active clip cell is visually highlighted
-  - [ ] Empty cells are clickable but do nothing (no crash)
-  - [ ] Clip thumbnails display correctly in grid
-  - [ ] Cut transition: instant switch, no visual glitch
-  - [ ] Fade transition: old clip fades out, new fades in
-  - [ ] Crossfade transition: smooth overlap between clips
-  - [ ] Transition duration is respected (test 500ms, 1000ms)
-  - [ ] Grid state persists across app restart
+  - [x] Layer displays clip grid with configurable dimensions (test 4×4, 8×8)
+  - [x] Clicking grid cell triggers that clip on the layer
+  - [x] Only one clip plays per layer at a time (previous stops)
+  - [x] Active clip cell is visually highlighted
+  - [x] Empty cells are clickable but do nothing (no crash)
+  - [x] Clip thumbnails display correctly in grid
+  - [x] Cut transition: instant switch, no visual glitch
+  - [x] Fade transition: old clip fades out, new fades in
+  - [x] Transition duration is respected (test 500ms, 1000ms)
+  - [x] Grid state persists across app restart
 
 ---
 
@@ -213,6 +212,7 @@ enum ClipTransition {
 - [ ] **Video Multiplexing**
   - Single source feeding multiple outputs/regions
   - Efficient GPU resource sharing
+  - Establishes effects page, this is the first (optional) effect
 - [ ] **Resize & Scale**
   - Arbitrary resize per layer (independent of source resolution)
   - Maintain or ignore aspect ratio option

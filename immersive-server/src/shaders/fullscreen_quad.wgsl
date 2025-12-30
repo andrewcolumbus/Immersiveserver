@@ -19,12 +19,16 @@ struct LayerParams {
     scale: vec2<f32>,
     // Rotation in radians (clockwise)
     rotation: f32,
+    // Environment aspect ratio (width / height) for correct rotation
+    env_aspect: f32,
     // Anchor point for rotation/scaling (0-1, where 0.5,0.5 = center)
     anchor: vec2<f32>,
     // Opacity (0.0 - 1.0)
     opacity: f32,
-    // Padding for 16-byte alignment
-    _pad: vec2<f32>,
+    // Padding for alignment
+    _pad: f32,
+    // Tiling factors (1.0 = no repeat, 2.0 = 2x2 grid, etc.)
+    tile: vec2<f32>,
 }
 
 @group(0) @binding(0) var t_video: texture_2d<f32>;
@@ -55,56 +59,67 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
 // Fragment shader - samples video texture with full 2D transform
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    // We need to apply the INVERSE transform to the UV coordinates.
-    // The layer transform moves the layer in screen space, so we need
-    // to do the opposite to the sampling coordinates.
-    //
-    // Transform order (visual, what the layer does):
-    // 1. Start at origin
-    // 2. Scale around anchor
-    // 3. Rotate around anchor  
-    // 4. Translate to position
-    //
-    // Inverse transform order (what we do to UVs):
-    // 1. Subtract position (undo translation)
-    // 2. Subtract anchor (move to anchor-relative coords)
-    // 3. Rotate by -angle (undo rotation)
-    // 4. Divide by scale (undo scale)
-    // 5. Add anchor (restore anchor offset)
-    // 6. Apply size_scale for video-to-environment mapping
-    
+    // MULTIPLEX: Tile the layer across the environment
+    // tile = (1, 1) means single layer, (2, 2) means 2x2 grid of layer copies
     var uv = in.uv;
+    
+    // If tiling > 1, divide environment into grid cells and work in local cell space
+    let tile_count = max(params.tile, vec2<f32>(1.0, 1.0));
+    let grid_uv = uv * tile_count;
+    let local_uv = fract(grid_uv);  // Position within current cell (0-1)
+    
+    // Now work in local cell space - each cell renders a complete layer
+    uv = local_uv;
+    
+    // Adjust size_scale for tiled cells:
+    // Each cell is smaller than the full environment, so the layer must be scaled
+    // to fit within the cell. Multiply size_scale by tile_count.
+    let adjusted_size_scale = params.size_scale * tile_count;
+    
+    // Adjust aspect ratio for cells:
+    // Cell aspect = (env_width/tile_x) / (env_height/tile_y) = env_aspect * tile_y / tile_x
+    let cell_aspect = params.env_aspect * tile_count.y / max(tile_count.x, 0.0001);
+    
+    // INVERSE TRANSFORM: Transform UV coordinates to sample the texture correctly
+    // The layer transform moves the layer visually, so we apply the inverse to UVs.
     
     // Step 1: Undo position translation
     uv = uv - params.position;
     
-    // Calculate the layer's center in UV space (accounting for size)
-    // The anchor point is relative to the layer's own size
-    let layer_center = params.anchor * params.size_scale;
+    // Calculate the layer's center in UV space (accounting for adjusted size)
+    let layer_center = params.anchor * adjusted_size_scale;
     
     // Step 2: Move to anchor-relative coordinates
     uv = uv - layer_center;
     
     // Step 3: Undo rotation (rotate by negative angle)
+    // Use CELL aspect ratio for proper rotation without distortion
+    let safe_cell_aspect = max(cell_aspect, 0.0001);
+    
+    // Convert to aspect-corrected coordinates (square space)
+    var rotated_uv = uv;
+    rotated_uv.x = rotated_uv.x * safe_cell_aspect;
+    
     let cos_r = cos(-params.rotation);
     let sin_r = sin(-params.rotation);
-    let rotated_uv = vec2<f32>(
-        uv.x * cos_r - uv.y * sin_r,
-        uv.x * sin_r + uv.y * cos_r
+    rotated_uv = vec2<f32>(
+        rotated_uv.x * cos_r - rotated_uv.y * sin_r,
+        rotated_uv.x * sin_r + rotated_uv.y * cos_r
     );
+    
+    // Convert back from square space
+    rotated_uv.x = rotated_uv.x / safe_cell_aspect;
     uv = rotated_uv;
     
     // Step 4: Undo scale (divide by scale factors)
-    // Protect against division by zero
     let safe_scale = max(params.scale, vec2<f32>(0.0001, 0.0001));
     uv = uv / safe_scale;
     
     // Step 5: Restore anchor offset
     uv = uv + layer_center;
     
-    // Step 6: Apply size_scale for video-to-environment mapping
-    // Convert from environment UV space to video UV space
-    uv = (uv - 0.5) / params.size_scale + 0.5;
+    // Step 6: Apply adjusted size_scale for video-to-cell mapping
+    uv = (uv - 0.5) / adjusted_size_scale + 0.5;
     
     // Bounds check - if UV is outside [0,1], return transparent
     if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {

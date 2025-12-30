@@ -49,6 +49,20 @@ pub struct LayerRuntime {
     /// Old video dimensions for crossfade rendering
     pub old_video_width: u32,
     pub old_video_height: u32,
+    /// Old params buffer for crossfade (kept during transition)
+    pub old_params_buffer: Option<wgpu::Buffer>,
+
+    /// Per-layer params buffer for GPU uniforms.
+    /// Each layer needs its own buffer to avoid overwriting during multi-layer rendering.
+    pub params_buffer: Option<wgpu::Buffer>,
+
+    // Fade-out state (for stopping clips with transition)
+    /// Whether a fade-out is currently active (clip is being stopped)
+    pub fade_out_active: bool,
+    /// When the fade-out started
+    pub fade_out_start: Option<Instant>,
+    /// Duration of the fade-out
+    pub fade_out_duration: Duration,
 }
 
 impl LayerRuntime {
@@ -70,6 +84,12 @@ impl LayerRuntime {
             old_bind_group: None,
             old_video_width: 0,
             old_video_height: 0,
+            old_params_buffer: None,
+            params_buffer: None,
+            // Fade-out state
+            fade_out_active: false,
+            fade_out_start: None,
+            fade_out_duration: Duration::ZERO,
         }
     }
 
@@ -99,13 +119,21 @@ impl LayerRuntime {
 
     /// Take the latest decoded frame (if any) and upload to texture
     pub fn update_texture(&mut self, queue: &wgpu::Queue) {
-        let Some(player) = &self.player else { return };
-        let Some(texture) = &self.texture else { return };
+        self.try_update_texture(queue);
+    }
+
+    /// Take the latest decoded frame (if any) and upload to texture.
+    /// Returns true if a frame was uploaded, false if no new frame was available.
+    pub fn try_update_texture(&mut self, queue: &wgpu::Queue) -> bool {
+        let Some(player) = &self.player else { return false };
+        let Some(texture) = &self.texture else { return false };
 
         if let Some(frame) = player.take_frame() {
             texture.upload(queue, &frame);
             self.has_frame = true;
+            return true;
         }
+        false
     }
 
     /// Clear all resources
@@ -124,6 +152,12 @@ impl LayerRuntime {
         self.old_bind_group = None;
         self.old_video_width = 0;
         self.old_video_height = 0;
+        self.old_params_buffer = None;
+        self.params_buffer = None;
+        // Clear fade-out state
+        self.fade_out_active = false;
+        self.fade_out_start = None;
+        self.fade_out_duration = Duration::ZERO;
     }
 
     /// Start a transition
@@ -168,13 +202,38 @@ impl LayerRuntime {
         self.old_bind_group = None;
         self.old_video_width = 0;
         self.old_video_height = 0;
+        self.old_params_buffer = None;
     }
 
-    /// Store old bind group for crossfade
-    pub fn store_old_for_crossfade(&mut self) {
-        self.old_bind_group = self.bind_group.take();
-        self.old_video_width = self.video_width;
-        self.old_video_height = self.video_height;
+    /// Start a fade-out (for stopping clips with transition)
+    pub fn start_fade_out(&mut self, duration: Duration) {
+        self.fade_out_active = true;
+        self.fade_out_start = Some(Instant::now());
+        self.fade_out_duration = duration;
+    }
+
+    /// Get the current fade-out progress (0.0 = just started, 1.0 = complete)
+    pub fn fade_out_progress(&self) -> f32 {
+        if !self.fade_out_active {
+            return 1.0;
+        }
+
+        let Some(start) = self.fade_out_start else {
+            return 1.0;
+        };
+
+        if self.fade_out_duration.is_zero() {
+            return 1.0;
+        }
+
+        let elapsed = start.elapsed();
+        let progress = elapsed.as_secs_f32() / self.fade_out_duration.as_secs_f32();
+        progress.clamp(0.0, 1.0)
+    }
+
+    /// Check if the fade-out is complete
+    pub fn is_fade_out_complete(&self) -> bool {
+        self.fade_out_active && self.fade_out_progress() >= 1.0
     }
 }
 

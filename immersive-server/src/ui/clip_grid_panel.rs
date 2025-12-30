@@ -15,6 +15,8 @@ const CELL_SIZE: f32 = 50.0;
 const CELL_SPACING: f32 = 3.0;
 /// Width of the layer name column
 const LAYER_NAME_WIDTH: f32 = 80.0;
+/// Width of the opacity slider column
+const OPACITY_SLIDER_WIDTH: f32 = 50.0;
 /// Padding inside the panel
 const PANEL_PADDING: f32 = 8.0;
 
@@ -63,6 +65,29 @@ pub enum ClipGridAction {
     DeleteColumn {
         column_index: usize,
     },
+    /// User changed a layer's opacity
+    SetLayerOpacity {
+        layer_id: u32,
+        opacity: f32,
+    },
+    /// Copy a clip to the clipboard
+    CopyClip {
+        layer_id: u32,
+        slot: usize,
+    },
+    /// Paste clipboard clip to a slot
+    PasteClip {
+        layer_id: u32,
+        slot: usize,
+    },
+    /// Clone (duplicate) an entire layer
+    CloneLayer {
+        layer_id: u32,
+    },
+    /// Select a layer (show in properties panel)
+    SelectLayer {
+        layer_id: u32,
+    },
 }
 
 /// State for the clip grid panel
@@ -74,6 +99,8 @@ pub struct ClipGridPanel {
     pub pending_clip_assignment: Option<(u32, usize)>, // (layer_id, slot)
     /// Cell currently being hovered during drag-drop (layer_id, slot)
     drag_hover_cell: Option<(u32, usize)>,
+    /// Clipboard for copy/paste operations
+    clipboard: Option<ClipCell>,
 }
 
 impl ClipGridPanel {
@@ -83,10 +110,31 @@ impl ClipGridPanel {
             open: true, // Start open by default
             pending_clip_assignment: None,
             drag_hover_cell: None,
+            clipboard: None,
         }
     }
 
-    /// Render the clip grid panel
+    /// Copy a clip to the clipboard
+    pub fn copy_clip(&mut self, clip: ClipCell) {
+        self.clipboard = Some(clip);
+    }
+
+    /// Check if clipboard has a clip
+    pub fn has_clipboard(&self) -> bool {
+        self.clipboard.is_some()
+    }
+
+    /// Get the clipboard clip (for pasting)
+    pub fn get_clipboard(&self) -> Option<&ClipCell> {
+        self.clipboard.as_ref()
+    }
+
+    /// Take the clipboard clip (consumes it)
+    pub fn take_clipboard(&mut self) -> Option<ClipCell> {
+        self.clipboard.take()
+    }
+
+    /// Render the clip grid panel in its own side panel (default behavior).
     ///
     /// Returns a list of actions to be processed by the app.
     pub fn render(
@@ -94,15 +142,44 @@ impl ClipGridPanel {
         ctx: &egui::Context,
         layers: &[Layer],
     ) -> Vec<ClipGridAction> {
-        let mut actions = Vec::new();
-
         if !self.open {
-            return actions;
+            return Vec::new();
         }
 
+        // Calculate the number of clip columns (use max from all layers)
+        let max_clips = layers.iter().map(|l| l.clip_count()).max().unwrap_or(8);
+        let grid_width = LAYER_NAME_WIDTH + OPACITY_SLIDER_WIDTH + CELL_SPACING + max_clips as f32 * (CELL_SIZE + CELL_SPACING) + PANEL_PADDING * 2.0;
+
+        let mut actions = Vec::new();
+        egui::SidePanel::right("clip_grid_panel")
+            .default_width(grid_width.min(500.0))
+            .min_width(300.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                // Header with controls
+                ui.horizontal(|ui| {
+                    ui.heading("Clip Grid");
+                });
+                ui.separator();
+                actions = self.render_contents(ui, layers);
+            });
+
+        actions
+    }
+
+    /// Render the clip grid contents (used by dock system or embedded in a window).
+    ///
+    /// Returns a list of actions to be processed by the app.
+    pub fn render_contents(
+        &mut self,
+        ui: &mut egui::Ui,
+        layers: &[Layer],
+    ) -> Vec<ClipGridAction> {
+        let mut actions = Vec::new();
+
         // Check for drag-drop events
-        let is_dragging = ctx.input(|i| !i.raw.hovered_files.is_empty());
-        let dropped_files: Vec<PathBuf> = ctx.input(|i| {
+        let is_dragging = ui.ctx().input(|i| !i.raw.hovered_files.is_empty());
+        let dropped_files: Vec<PathBuf> = ui.ctx().input(|i| {
             i.raw.dropped_files.iter()
                 .filter_map(|f| f.path.clone())
                 .filter(|p| Self::is_video_file(p))
@@ -127,84 +204,78 @@ impl ClipGridPanel {
 
         // Calculate the number of clip columns (use max from all layers)
         let max_clips = layers.iter().map(|l| l.clip_count()).max().unwrap_or(8);
-        let grid_width = LAYER_NAME_WIDTH + max_clips as f32 * (CELL_SIZE + CELL_SPACING) + PANEL_PADDING * 2.0;
 
-        egui::SidePanel::right("clip_grid_panel")
-            .default_width(grid_width.min(500.0))
-            .min_width(300.0)
-            .resizable(true)
-            .show(ctx, |ui| {
-                // Header with controls
-                ui.horizontal(|ui| {
-                    ui.heading("Clip Grid");
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // Add column button
-                        if ui.small_button("+ Col").on_hover_text("Add a new column").clicked() {
-                            actions.push(ClipGridAction::AddColumn);
-                        }
-                        // Add layer button
-                        if ui.small_button("+ Layer").on_hover_text("Add a new layer").clicked() {
-                            actions.push(ClipGridAction::AddLayer);
-                        }
-                        ui.separator();
-                        if ui.small_button("⏹ Stop All").clicked() {
-                            for layer in layers {
-                                if layer.has_active_clip() {
-                                    actions.push(ClipGridAction::StopClip { layer_id: layer.id });
-                                }
-                            }
-                        }
-                    });
-                });
-                ui.separator();
-
-                if layers.is_empty() {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(20.0);
-                        ui.label("No layers yet.");
-                        ui.add_space(10.0);
-                        if ui.button("+ Add Layer").clicked() {
-                            actions.push(ClipGridAction::AddLayer);
-                        }
-                    });
-                    return;
+        // Header with controls
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // Add column button
+                if ui.small_button("+ Col").on_hover_text("Add a new column").clicked() {
+                    actions.push(ClipGridAction::AddColumn);
                 }
+                // Add layer button
+                if ui.small_button("+ Layer").on_hover_text("Add a new layer").clicked() {
+                    actions.push(ClipGridAction::AddLayer);
+                }
+                ui.separator();
+                if ui.small_button("⏹ Stop All").clicked() {
+                    for layer in layers {
+                        if layer.has_active_clip() {
+                            actions.push(ClipGridAction::StopClip { layer_id: layer.id });
+                        }
+                    }
+                }
+            });
+        });
+        ui.separator();
 
-                // Column headers (clip slot numbers) - right-click to delete
-                ui.horizontal(|ui| {
-                    // Empty space for layer name column
-                    ui.allocate_space(egui::vec2(LAYER_NAME_WIDTH, 20.0));
-                    
-                    for slot in 0..max_clips {
-                        let label = format!("{}", slot + 1);
-                        let response = ui.allocate_ui(egui::vec2(CELL_SIZE + CELL_SPACING, 20.0), |ui| {
-                            ui.centered_and_justified(|ui| {
-                                ui.label(egui::RichText::new(label).size(11.0).color(egui::Color32::GRAY))
-                            }).inner
-                        }).inner;
-                        
-                        // Right-click context menu on column header
-                        response.context_menu(|ui| {
-                            if ui.button("🗑 Delete Column").clicked() {
-                                actions.push(ClipGridAction::DeleteColumn { column_index: slot });
-                                ui.close_menu();
-                            }
-                        });
+        if layers.is_empty() {
+            ui.vertical_centered(|ui| {
+                ui.add_space(20.0);
+                ui.label("No layers yet.");
+                ui.add_space(10.0);
+                if ui.button("+ Add Layer").clicked() {
+                    actions.push(ClipGridAction::AddLayer);
+                }
+            });
+            return actions;
+        }
+
+        // Column headers (clip slot numbers) - right-click to delete
+        ui.horizontal(|ui| {
+            // Empty space for layer name column
+            ui.allocate_space(egui::vec2(LAYER_NAME_WIDTH, 20.0));
+            // Empty space for opacity slider column
+            ui.allocate_space(egui::vec2(OPACITY_SLIDER_WIDTH + CELL_SPACING, 20.0));
+            
+            for slot in 0..max_clips {
+                let label = format!("{}", slot + 1);
+                let response = ui.allocate_ui(egui::vec2(CELL_SIZE + CELL_SPACING, 20.0), |ui| {
+                    ui.centered_and_justified(|ui| {
+                        ui.label(egui::RichText::new(label).size(11.0).color(egui::Color32::GRAY))
+                    }).inner
+                }).inner;
+                
+                // Right-click context menu on column header
+                response.context_menu(|ui| {
+                    if ui.button("🗑 Delete Column").clicked() {
+                        actions.push(ClipGridAction::DeleteColumn { column_index: slot });
+                        ui.close_menu();
                     }
                 });
+            }
+        });
 
-                ui.add_space(2.0);
+        ui.add_space(2.0);
 
-                // Grid content
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        // Iterate in REVERSE order so top layer (rendered last) appears at top of UI
-                        for layer in layers.iter().rev() {
-                            let row_actions = self.render_layer_row(ui, layer, max_clips, is_dragging);
-                            actions.extend(row_actions);
-                        }
-                    });
+        // Grid content
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                // Iterate in REVERSE order so top layer (rendered last) appears at top of UI
+                for layer in layers.iter().rev() {
+                    let row_actions = self.render_layer_row(ui, layer, max_clips, is_dragging);
+                    actions.extend(row_actions);
+                }
             });
 
         actions
@@ -221,11 +292,11 @@ impl ClipGridPanel {
         let mut actions = Vec::new();
 
         ui.horizontal(|ui| {
-            // Layer name (clickable to stop, right-click for context menu)
+            // Layer name (clickable to select layer, right-click for context menu)
             let has_active = layer.has_active_clip();
             let layer_id = layer.id;
             
-            let label_response = ui.allocate_ui(egui::vec2(LAYER_NAME_WIDTH, CELL_SIZE), |ui| {
+            let label_response = ui.allocate_ui(egui::vec2(LAYER_NAME_WIDTH - 20.0, CELL_SIZE), |ui| {
                 let name_color = if has_active {
                     egui::Color32::from_rgb(100, 200, 100) // Green when playing
                 } else {
@@ -239,9 +310,9 @@ impl ClipGridPanel {
                         .color(name_color);
                     let response = ui.selectable_label(false, label);
                     
-                    // Handle left-click to stop
-                    if response.clicked() && has_active {
-                        actions.push(ClipGridAction::StopClip { layer_id });
+                    // Handle left-click to select layer (show in properties panel)
+                    if response.clicked() {
+                        actions.push(ClipGridAction::SelectLayer { layer_id });
                     }
                     
                     // Right-click context menu directly on the label
@@ -254,6 +325,13 @@ impl ClipGridPanel {
                             }
                             ui.separator();
                         }
+                        
+                        if ui.button("📋 Clone Layer").clicked() {
+                            actions.push(ClipGridAction::CloneLayer { layer_id });
+                            ui.close_menu();
+                        }
+                        
+                        ui.separator();
                         
                         // Transition submenu
                         ui.menu_button(format!("Transition: {}", current_transition.name()), |ui| {
@@ -276,15 +354,6 @@ impl ClipGridPanel {
                                 });
                                 ui.close_menu();
                             }
-                            
-                            let is_crossfade = matches!(current_transition, ClipTransition::Crossfade(_));
-                            if ui.selectable_label(is_crossfade, "Crossfade (0.5s)").clicked() {
-                                actions.push(ClipGridAction::SetLayerTransition {
-                                    layer_id,
-                                    transition: ClipTransition::crossfade(),
-                                });
-                                ui.close_menu();
-                            }
                         });
                         
                         ui.separator();
@@ -299,12 +368,47 @@ impl ClipGridPanel {
             });
 
             // Show tooltip on layer name area
-            let tooltip = if has_active {
-                "Click to stop • Right-click for options"
+            label_response.response.on_hover_text("Click to select • Right-click for options");
+            
+            // Stop button (X) - only show when layer has active clip
+            if has_active {
+                if ui.add(egui::Button::new(
+                    egui::RichText::new("✕").size(10.0).color(egui::Color32::from_rgb(255, 100, 100))
+                ).min_size(egui::vec2(18.0, 18.0))).on_hover_text("Stop clip").clicked() {
+                    actions.push(ClipGridAction::StopClip { layer_id });
+                }
             } else {
-                "Right-click for options"
-            };
-            label_response.response.on_hover_text(tooltip);
+                // Add spacer to keep alignment consistent
+                ui.allocate_space(egui::vec2(18.0, 18.0));
+            }
+
+            // Opacity slider
+            let mut opacity = layer.opacity;
+            let slider_response = ui.allocate_ui(egui::vec2(OPACITY_SLIDER_WIDTH, CELL_SIZE), |ui| {
+                ui.vertical_centered(|ui| {
+                    // Show percentage label
+                    let opacity_pct = (opacity * 100.0).round() as u32;
+                    ui.label(
+                        egui::RichText::new(format!("{}%", opacity_pct))
+                            .size(9.0)
+                            .color(egui::Color32::GRAY)
+                    );
+                    
+                    // Compact slider (no labels, just the slider control)
+                    let slider = egui::Slider::new(&mut opacity, 0.0..=1.0)
+                        .show_value(false)
+                        .clamping(egui::SliderClamping::Always);
+                    ui.add(slider)
+                }).inner
+            });
+            
+            // Emit action if opacity changed
+            if slider_response.inner.changed() {
+                actions.push(ClipGridAction::SetLayerOpacity { layer_id, opacity });
+            }
+            
+            // Tooltip for the slider
+            slider_response.response.on_hover_text("Layer opacity (0% = invisible, 100% = opaque)");
 
             // Clip cells
             let layer_has_active_clip = layer.has_active_clip();
@@ -404,25 +508,43 @@ impl ClipGridPanel {
         }
 
         // Handle right-click: context menu
+        let has_clipboard = self.clipboard.is_some();
         response.context_menu(|ui| {
             if cell.is_some() {
                 if ui.button("▶ Play").clicked() {
                     actions.push(ClipGridAction::TriggerClip { layer_id, slot });
                     ui.close_menu();
                 }
-                if ui.button("🗑 Clear").clicked() {
-                    actions.push(ClipGridAction::ClearClip { layer_id, slot });
+                ui.separator();
+                if ui.button("📋 Copy").clicked() {
+                    actions.push(ClipGridAction::CopyClip { layer_id, slot });
                     ui.close_menu();
+                }
+                if has_clipboard {
+                    if ui.button("📋 Paste").clicked() {
+                        actions.push(ClipGridAction::PasteClip { layer_id, slot });
+                        ui.close_menu();
+                    }
                 }
                 ui.separator();
                 if ui.button("📁 Replace...").clicked() {
                     actions.push(ClipGridAction::AssignClip { layer_id, slot });
                     ui.close_menu();
                 }
+                if ui.button("🗑 Clear").clicked() {
+                    actions.push(ClipGridAction::ClearClip { layer_id, slot });
+                    ui.close_menu();
+                }
             } else {
                 if ui.button("📁 Assign Video...").clicked() {
                     actions.push(ClipGridAction::AssignClip { layer_id, slot });
                     ui.close_menu();
+                }
+                if has_clipboard {
+                    if ui.button("📋 Paste").clicked() {
+                        actions.push(ClipGridAction::PasteClip { layer_id, slot });
+                        ui.close_menu();
+                    }
                 }
             }
         });

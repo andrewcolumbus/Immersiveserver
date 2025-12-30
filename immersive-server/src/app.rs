@@ -119,6 +119,10 @@ pub struct App {
     pub menu_bar: MenuBar,
     /// Clip grid panel for triggering clips
     pub clip_grid_panel: crate::ui::ClipGridPanel,
+    /// Docking manager for detachable/resizable panels
+    pub dock_manager: crate::ui::DockManager,
+    /// Properties panel (Environment/Layer/Clip tabs)
+    pub properties_panel: crate::ui::PropertiesPanel,
 
     // Settings
     pub settings: EnvironmentSettings,
@@ -135,6 +139,8 @@ pub struct App {
     pending_runtimes: HashMap<u32, LayerRuntime>,
     /// Pending transitions for layers (stored when clip is triggered, applied when ready)
     pending_transition: HashMap<u32, crate::compositor::ClipTransition>,
+    /// Last layer ID that had a texture uploaded (for round-robin rate limiting)
+    last_upload_layer: u32,
 
     // Shader hot-reload
     /// Watches shader files for changes and triggers recompilation
@@ -361,12 +367,29 @@ impl App {
             egui_renderer,
             menu_bar,
             clip_grid_panel: crate::ui::ClipGridPanel::new(),
+            dock_manager: {
+                let mut dm = crate::ui::DockManager::new();
+                // Register the standard panels with their default dock zones
+                dm.register_panel(crate::ui::DockablePanel::new(
+                    crate::ui::dock::panel_ids::CLIP_GRID,
+                    "Clip Grid",
+                    crate::ui::DockZone::Right,
+                ));
+                dm.register_panel(crate::ui::DockablePanel::new(
+                    crate::ui::dock::panel_ids::PROPERTIES,
+                    "Properties",
+                    crate::ui::DockZone::Left,
+                ));
+                dm
+            },
+            properties_panel: crate::ui::PropertiesPanel::new(),
             settings,
             current_file: None,
             video_renderer,
             layer_runtimes: HashMap::new(),
             pending_runtimes: HashMap::new(),
             pending_transition: HashMap::new(),
+            last_upload_layer: 0,
             shader_watcher,
         }
     }
@@ -836,9 +859,211 @@ impl App {
             display_frame_time_ms,
         );
 
-        // Render clip grid panel and collect actions
+        // Render dock zones overlay during drag operations
+        self.dock_manager.render_dock_zones(&self.egui_ctx);
+        
+        // Get layer list for property panels
         let layers: Vec<_> = self.environment.layers().to_vec();
-        let clip_actions = self.clip_grid_panel.render(&self.egui_ctx, &layers);
+        
+        // Render properties panel (left panel or floating)
+        let prop_actions = if let Some(panel) = self.dock_manager.get_panel(crate::ui::dock::panel_ids::PROPERTIES) {
+            if panel.open {
+                let zone = panel.zone;
+                let floating_pos = panel.floating_pos;
+                let floating_size = panel.floating_size;
+                let dock_width = panel.dock_width;
+                
+                match zone {
+                    crate::ui::DockZone::Left => {
+                        let mut actions = Vec::new();
+                        egui::SidePanel::left("properties_panel")
+                            .default_width(dock_width)
+                            .resizable(true)
+                            .show(&self.egui_ctx, |ui| {
+                                // Panel header with undock button
+                                ui.horizontal(|ui| {
+                                    ui.heading("Properties");
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui.button("⊞").on_hover_text("Undock panel").clicked() {
+                                            if let Some(p) = self.dock_manager.get_panel_mut(crate::ui::dock::panel_ids::PROPERTIES) {
+                                                p.zone = crate::ui::DockZone::Floating;
+                                                p.floating_pos = Some((100.0, 100.0));
+                                                p.floating_size = Some((300.0, 400.0));
+                                            }
+                                        }
+                                    });
+                                });
+                                ui.separator();
+                                actions = self.properties_panel.render(ui, &self.environment, &layers);
+                            });
+                        actions
+                    }
+                    crate::ui::DockZone::Floating => {
+                        let mut actions = Vec::new();
+                        let pos = floating_pos.unwrap_or((100.0, 100.0));
+                        let size = floating_size.unwrap_or((300.0, 400.0));
+                        let mut open = true;
+                        
+                        let window_response = egui::Window::new("Properties")
+                            .id(egui::Id::new("properties_window"))
+                            .default_pos(egui::pos2(pos.0, pos.1))
+                            .default_size(egui::vec2(size.0, size.1))
+                            .resizable(true)
+                            .collapsible(true)
+                            .open(&mut open)
+                            .show(&self.egui_ctx, |ui| {
+                                // Dock button in header
+                                ui.horizontal(|ui| {
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui.small_button("⊟").on_hover_text("Dock to left").clicked() {
+                                            if let Some(p) = self.dock_manager.get_panel_mut(crate::ui::dock::panel_ids::PROPERTIES) {
+                                                p.zone = crate::ui::DockZone::Left;
+                                            }
+                                        }
+                                    });
+                                });
+                                ui.separator();
+                                actions = self.properties_panel.render(ui, &self.environment, &layers);
+                            });
+                        
+                        // Track window dragging for dock zone snapping
+                        if let Some(resp) = window_response {
+                            if resp.response.drag_started() {
+                                let cursor_pos = self.egui_ctx.input(|i| i.pointer.hover_pos().unwrap_or_default());
+                                self.dock_manager.start_drag(crate::ui::dock::panel_ids::PROPERTIES, (cursor_pos.x, cursor_pos.y));
+                            }
+                            if resp.response.dragged() {
+                                let cursor_pos = self.egui_ctx.input(|i| i.pointer.hover_pos().unwrap_or_default());
+                                let screen_rect = self.egui_ctx.screen_rect();
+                                self.dock_manager.update_drag((cursor_pos.x, cursor_pos.y), (screen_rect.width(), screen_rect.height()));
+                            }
+                            if resp.response.drag_stopped() {
+                                let cursor_pos = self.egui_ctx.input(|i| i.pointer.hover_pos().unwrap_or_default());
+                                self.dock_manager.end_drag((cursor_pos.x, cursor_pos.y));
+                            }
+                        }
+                        
+                        if !open {
+                            if let Some(p) = self.dock_manager.get_panel_mut(crate::ui::dock::panel_ids::PROPERTIES) {
+                                p.open = false;
+                            }
+                        }
+                        actions
+                    }
+                    _ => {
+                        // For other zones (Right, Top, Bottom), render as appropriate panel type
+                        Vec::new()
+                    }
+                }
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+        
+        // Handle properties actions
+        for action in prop_actions {
+            self.handle_properties_action(action);
+        }
+        
+        // Render clip grid panel (right panel or floating)
+        let clip_actions = if let Some(panel) = self.dock_manager.get_panel(crate::ui::dock::panel_ids::CLIP_GRID) {
+            if panel.open {
+                let zone = panel.zone;
+                let floating_pos = panel.floating_pos;
+                let floating_size = panel.floating_size;
+                let dock_width = panel.dock_width;
+                
+                match zone {
+                    crate::ui::DockZone::Right => {
+                        let mut actions = Vec::new();
+                        egui::SidePanel::right("clip_grid_side_panel")
+                            .default_width(dock_width)
+                            .resizable(true)
+                            .show(&self.egui_ctx, |ui| {
+                                // Panel header with undock button
+                                ui.horizontal(|ui| {
+                                    ui.heading("Clip Grid");
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui.button("⊞").on_hover_text("Undock panel").clicked() {
+                                            if let Some(p) = self.dock_manager.get_panel_mut(crate::ui::dock::panel_ids::CLIP_GRID) {
+                                                p.zone = crate::ui::DockZone::Floating;
+                                                p.floating_pos = Some((400.0, 100.0));
+                                                p.floating_size = Some((400.0, 300.0));
+                                            }
+                                        }
+                                    });
+                                });
+                                ui.separator();
+                                actions = self.clip_grid_panel.render_contents(ui, &layers);
+                            });
+                        actions
+                    }
+                    crate::ui::DockZone::Floating => {
+                        let mut actions = Vec::new();
+                        let pos = floating_pos.unwrap_or((400.0, 100.0));
+                        let size = floating_size.unwrap_or((400.0, 300.0));
+                        let mut open = true;
+                        
+                        let window_response = egui::Window::new("Clip Grid")
+                            .id(egui::Id::new("clip_grid_window"))
+                            .default_pos(egui::pos2(pos.0, pos.1))
+                            .default_size(egui::vec2(size.0, size.1))
+                            .resizable(true)
+                            .collapsible(true)
+                            .open(&mut open)
+                            .show(&self.egui_ctx, |ui| {
+                                // Dock button in header
+                                ui.horizontal(|ui| {
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui.small_button("⊟").on_hover_text("Dock to right").clicked() {
+                                            if let Some(p) = self.dock_manager.get_panel_mut(crate::ui::dock::panel_ids::CLIP_GRID) {
+                                                p.zone = crate::ui::DockZone::Right;
+                                            }
+                                        }
+                                    });
+                                });
+                                ui.separator();
+                                actions = self.clip_grid_panel.render_contents(ui, &layers);
+                            });
+                        
+                        // Track window dragging for dock zone snapping
+                        if let Some(resp) = window_response {
+                            if resp.response.drag_started() {
+                                let cursor_pos = self.egui_ctx.input(|i| i.pointer.hover_pos().unwrap_or_default());
+                                self.dock_manager.start_drag(crate::ui::dock::panel_ids::CLIP_GRID, (cursor_pos.x, cursor_pos.y));
+                            }
+                            if resp.response.dragged() {
+                                let cursor_pos = self.egui_ctx.input(|i| i.pointer.hover_pos().unwrap_or_default());
+                                let screen_rect = self.egui_ctx.screen_rect();
+                                self.dock_manager.update_drag((cursor_pos.x, cursor_pos.y), (screen_rect.width(), screen_rect.height()));
+                            }
+                            if resp.response.drag_stopped() {
+                                let cursor_pos = self.egui_ctx.input(|i| i.pointer.hover_pos().unwrap_or_default());
+                                self.dock_manager.end_drag((cursor_pos.x, cursor_pos.y));
+                            }
+                        }
+                        
+                        if !open {
+                            if let Some(p) = self.dock_manager.get_panel_mut(crate::ui::dock::panel_ids::CLIP_GRID) {
+                                p.open = false;
+                            }
+                        }
+                        actions
+                    }
+                    _ => {
+                        // For other zones, render in default position
+                        self.clip_grid_panel.render(&self.egui_ctx, &layers)
+                    }
+                }
+            } else {
+                Vec::new()
+            }
+        } else {
+            // Fallback if dock manager doesn't have panel registered yet
+            self.clip_grid_panel.render(&self.egui_ctx, &layers)
+        };
 
         // Apply environment resolution changes (if any) before rendering.
         self.sync_environment_from_settings();
@@ -902,58 +1127,70 @@ impl App {
                 // For crossfade: render old content first at (1 - progress) opacity
                 if in_transition && runtime.transition_type.needs_old_content() {
                     if let Some(old_bind_group) = &runtime.old_bind_group {
-                        let old_opacity = layer.opacity * (1.0 - transition_progress);
-                        if old_opacity > 0.0 {
-                            let mut params = LayerParams::from_layer(
-                                layer,
-                                runtime.old_video_width,
-                                runtime.old_video_height,
-                                self.environment.width(),
-                                self.environment.height(),
-                            );
-                            params.opacity = old_opacity;
-                            self.video_renderer.set_layer_params(&self.queue, params);
-                            
-                            self.video_renderer.render_with_blend(
-                                &mut encoder,
-                                self.environment.texture_view(),
-                                old_bind_group,
-                                layer.blend_mode,
-                                false,
-                            );
+                        if let Some(old_params_buffer) = &runtime.old_params_buffer {
+                            let old_opacity = layer.opacity * (1.0 - transition_progress);
+                            if old_opacity > 0.0 {
+                                let mut params = LayerParams::from_layer(
+                                    layer,
+                                    runtime.old_video_width,
+                                    runtime.old_video_height,
+                                    self.environment.width(),
+                                    self.environment.height(),
+                                );
+                                params.opacity = old_opacity;
+                                // Write to old layer's params buffer (not shared)
+                                self.video_renderer.write_layer_params(&self.queue, old_params_buffer, &params);
+                                
+                                self.video_renderer.render_with_blend(
+                                    &mut encoder,
+                                    self.environment.texture_view(),
+                                    old_bind_group,
+                                    layer.blend_mode,
+                                    false,
+                                );
+                            }
                         }
                     }
                 }
 
                 // Only render if we have a bind_group AND at least one frame has been uploaded
                 if let Some(bind_group) = &runtime.bind_group {
-                    if runtime.has_frame {
-                        // Calculate opacity with transition
-                        let effective_opacity = if in_transition {
-                            layer.opacity * transition_progress
-                        } else {
-                            layer.opacity
-                        };
+                    if let Some(params_buffer) = &runtime.params_buffer {
+                        if runtime.has_frame {
+                            // Calculate opacity with transition and fade-out
+                            let effective_opacity = if runtime.fade_out_active {
+                                // Fading out: opacity goes from layer.opacity to 0
+                                layer.opacity * (1.0 - runtime.fade_out_progress())
+                            } else if in_transition {
+                                layer.opacity * transition_progress
+                            } else {
+                                layer.opacity
+                            };
 
-                        // Create LayerParams with full transform support
-                        let mut params = LayerParams::from_layer(
-                            layer,
-                            runtime.video_width,
-                            runtime.video_height,
-                            self.environment.width(),
-                            self.environment.height(),
-                        );
-                        params.opacity = effective_opacity;
-                        self.video_renderer.set_layer_params(&self.queue, params);
+                            // Skip rendering if fully transparent
+                            if effective_opacity > 0.0 {
+                                // Create LayerParams with full transform support
+                                let mut params = LayerParams::from_layer(
+                                    layer,
+                                    runtime.video_width,
+                                    runtime.video_height,
+                                    self.environment.width(),
+                                    self.environment.height(),
+                                );
+                                params.opacity = effective_opacity;
+                                // Write to this layer's params buffer (not shared)
+                                self.video_renderer.write_layer_params(&self.queue, params_buffer, &params);
 
-                        // Render this layer with its blend mode (no clear)
-                        self.video_renderer.render_with_blend(
-                            &mut encoder,
-                            self.environment.texture_view(),
-                            bind_group,
-                            layer.blend_mode,
-                            false,
-                        );
+                                // Render this layer with its blend mode (no clear)
+                                self.video_renderer.render_with_blend(
+                                    &mut encoder,
+                                    self.environment.texture_view(),
+                                    bind_group,
+                                    layer.blend_mode,
+                                    false,
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -1122,10 +1359,13 @@ impl App {
         // Create video texture
         let video_texture = VideoTexture::new(&self.device, player.width(), player.height());
 
-        // Create bind group
+        // Create per-layer params buffer to avoid overwrites during multi-layer rendering
+        let params_buffer = self.video_renderer.create_params_buffer(&self.device);
+
+        // Create bind group with per-layer params buffer
         let bind_group = self
             .video_renderer
-            .create_bind_group(&self.device, &video_texture);
+            .create_bind_group_with_buffer(&self.device, &video_texture, &params_buffer);
 
         // Store runtime
         let runtime = LayerRuntime {
@@ -1144,6 +1384,12 @@ impl App {
             old_bind_group: None,
             old_video_width: 0,
             old_video_height: 0,
+            old_params_buffer: None,
+            params_buffer: Some(params_buffer),
+            // Fade-out state (initialized empty)
+            fade_out_active: false,
+            fade_out_start: None,
+            fade_out_duration: std::time::Duration::ZERO,
         };
 
         if old_runtime_exists {
@@ -1267,20 +1513,71 @@ impl App {
     }
 
     /// Update all layer videos - pick up decoded frames (non-blocking)
+    /// Rate-limited to upload at most one texture per frame to prevent UI freezing.
     pub fn update_videos(&mut self) {
-        // Update active runtimes
-        for runtime in self.layer_runtimes.values_mut() {
-            runtime.update_texture(&self.queue);
+        // Collect layer IDs for round-robin iteration
+        let mut layer_ids: Vec<u32> = self.layer_runtimes.keys().copied().collect();
+        layer_ids.sort(); // Ensure consistent ordering
+        
+        // Find starting position in round-robin order
+        let start_idx = layer_ids.iter()
+            .position(|&id| id > self.last_upload_layer)
+            .unwrap_or(0);
+        
+        // Rate limit: only upload ONE texture per frame to avoid blocking
+        let mut uploaded_this_frame = false;
+        
+        // Collect layers that have completed fade-out (need to be cleared after iteration)
+        let mut fade_out_complete: Vec<u32> = Vec::new();
+
+        // Iterate in round-robin order starting after last uploaded layer
+        for i in 0..layer_ids.len() {
+            let idx = (start_idx + i) % layer_ids.len();
+            let layer_id = layer_ids[idx];
             
-            // Check if transition is complete
-            if runtime.transition_active && runtime.is_transition_complete() {
-                runtime.end_transition();
+            if let Some(runtime) = self.layer_runtimes.get_mut(&layer_id) {
+                // Check if transition is complete
+                if runtime.transition_active && runtime.is_transition_complete() {
+                    runtime.end_transition();
+                }
+
+                // Check if fade-out is complete
+                if runtime.is_fade_out_complete() {
+                    fade_out_complete.push(layer_id);
+                }
+                
+                // Only upload one texture per frame (rate limiting)
+                if !uploaded_this_frame {
+                    let had_frame = runtime.try_update_texture(&self.queue);
+                    if had_frame {
+                        uploaded_this_frame = true;
+                        self.last_upload_layer = layer_id;
+                    }
+                }
             }
         }
+
+        // Clear runtimes that have completed fade-out
+        for layer_id in fade_out_complete {
+            if let Some(runtime) = self.layer_runtimes.get_mut(&layer_id) {
+                runtime.clear();
+            }
+            // Clear the active clip in the layer
+            if let Some(layer) = self.environment.get_layer_mut(layer_id) {
+                layer.active_clip = None;
+                layer.source = crate::compositor::LayerSource::None;
+            }
+            log::info!("⏹️ Fade-out complete, stopped clip on layer {}", layer_id);
+        }
         
-        // Update pending runtimes (loading in background)
+        // Update pending runtimes - these get priority since user is waiting
         for runtime in self.pending_runtimes.values_mut() {
-            runtime.update_texture(&self.queue);
+            if !uploaded_this_frame {
+                let had_frame = runtime.try_update_texture(&self.queue);
+                if had_frame {
+                    uploaded_this_frame = true;
+                }
+            }
         }
         
         // Swap pending runtimes into active once they have a frame
@@ -1289,20 +1586,21 @@ impl App {
             .filter(|(_, runtime)| runtime.has_frame)
             .map(|(id, _)| *id)
             .collect();
-        
+
         for layer_id in ready_layers {
             if let Some(mut new_runtime) = self.pending_runtimes.remove(&layer_id) {
                 // Get the pending transition for this layer
                 let transition = self.pending_transition.remove(&layer_id)
                     .unwrap_or(crate::compositor::ClipTransition::Cut);
                 
-                // For crossfade, transfer the old_bind_group from the old runtime
+                // For fade transition, transfer the old content from the old runtime
                 if transition.needs_old_content() {
                     if let Some(old_runtime) = self.layer_runtimes.get_mut(&layer_id) {
-                        // Move old bind group to new runtime
+                        // Move old bind group and params buffer to new runtime
                         new_runtime.old_bind_group = old_runtime.bind_group.take();
                         new_runtime.old_video_width = old_runtime.video_width;
                         new_runtime.old_video_height = old_runtime.video_height;
+                        new_runtime.old_params_buffer = old_runtime.params_buffer.take();
                     }
                 }
                 
@@ -1422,14 +1720,9 @@ impl App {
             log::info!("🎬 Loading clip {} on layer {} with {:?} transition: {:?}", 
                 slot, layer_id, transition.name(), clip_path);
             
-            // For crossfade, store the old bind_group before loading new clip
-            if transition.needs_old_content() {
-                if let Some(runtime) = self.layer_runtimes.get_mut(&layer_id) {
-                    runtime.store_old_for_crossfade();
-                }
-            }
-            
             // Store the transition type for when the new clip is ready
+            // Note: We don't take the old bind_group here - that happens in poll_video_frames
+            // when the new runtime is ready, to avoid a flash while the new clip loads
             self.pending_transition.insert(layer_id, transition);
             
             self.load_layer_video(layer_id, &clip_path)?;
@@ -1460,6 +1753,37 @@ impl App {
         }
 
         log::info!("⏹️ Stopped clip on layer {}", layer_id);
+    }
+
+    /// Stop the currently playing clip on a layer with a fade-out transition
+    ///
+    /// Starts a fade-out animation; the actual clear happens when fade completes.
+    pub fn stop_clip_with_fade(&mut self, layer_id: u32) {
+        // Get the transition duration from the layer
+        let fade_duration = self.environment
+            .get_layer(layer_id)
+            .map(|l| l.transition.duration_ms())
+            .unwrap_or(0);
+
+        if fade_duration == 0 {
+            // No fade, just stop immediately
+            self.stop_clip(layer_id);
+            return;
+        }
+
+        // Start the fade-out on the runtime
+        if let Some(runtime) = self.layer_runtimes.get_mut(&layer_id) {
+            if runtime.has_frame && !runtime.fade_out_active {
+                runtime.start_fade_out(std::time::Duration::from_millis(fade_duration as u64));
+                log::info!("⏹️ Starting fade-out on layer {} ({}ms)", layer_id, fade_duration);
+            } else {
+                // No frame or already fading, just stop immediately
+                self.stop_clip(layer_id);
+            }
+        } else {
+            // No runtime, nothing to fade
+            self.stop_clip(layer_id);
+        }
     }
 
     /// Set a clip in a layer's clip slots
@@ -1496,6 +1820,99 @@ impl App {
             }
         }
         false
+    }
+
+    /// Copy a clip to the clipboard
+    pub fn copy_clip(&mut self, layer_id: u32, slot: usize) {
+        if let Some(layer) = self.environment.get_layer(layer_id) {
+            if let Some(clip) = layer.get_clip(slot) {
+                self.clip_grid_panel.copy_clip(clip.clone());
+                log::info!("📋 Copied clip from layer {} slot {}", layer_id, slot);
+                self.menu_bar.set_status(format!("Copied clip: {}", clip.display_name()));
+            }
+        }
+    }
+
+    /// Paste a clip from the clipboard to a slot
+    pub fn paste_clip(&mut self, layer_id: u32, slot: usize) {
+        if let Some(clip) = self.clip_grid_panel.get_clipboard().cloned() {
+            if let Some(layer) = self.environment.get_layer_mut(layer_id) {
+                layer.set_clip(slot, clip.clone());
+                log::info!("📋 Pasted clip to layer {} slot {}", layer_id, slot);
+                self.menu_bar.set_status(format!("Pasted clip: {}", clip.display_name()));
+            }
+        }
+    }
+
+    /// Clone (duplicate) an entire layer
+    ///
+    /// Creates a copy of the layer with all its clips and settings.
+    /// The new layer gets a unique ID and " Copy" suffix on the name.
+    /// If the original has active playback, the clone loads the same video independently.
+    pub fn clone_layer(&mut self, layer_id: u32) {
+        // Get the source layer data
+        let (new_layer, active_clip_path) = {
+            let Some(source_layer) = self.environment.get_layer(layer_id) else {
+                log::warn!("Cannot clone layer {}: not found", layer_id);
+                return;
+            };
+
+            // Find next available layer ID
+            let next_id = self.environment.layers()
+                .iter()
+                .map(|l| l.id)
+                .max()
+                .map(|id| id + 1)
+                .unwrap_or(1);
+
+            // Clone the layer with new ID and name
+            let mut cloned = source_layer.clone();
+            cloned.id = next_id;
+            cloned.name = format!("{} Copy", source_layer.name);
+            // Reset runtime state (source and active_clip are runtime, not saved)
+            cloned.source = crate::compositor::LayerSource::None;
+            cloned.active_clip = None;
+
+            // If the source has an active clip, get its path so we can load it independently
+            let active_path = if let Some(active_slot) = source_layer.active_clip {
+                source_layer.get_clip(active_slot)
+                    .map(|c| c.source_path.clone())
+            } else {
+                None
+            };
+
+            (cloned, active_path)
+        };
+
+        let new_id = new_layer.id;
+        let new_name = new_layer.name.clone();
+
+        // Add the cloned layer to the environment
+        self.environment.add_existing_layer(new_layer);
+
+        // If the original was playing, load the same video on the clone
+        if let Some(path) = active_clip_path {
+            if let Err(e) = self.load_layer_video(new_id, &path) {
+                log::warn!("Failed to load video for cloned layer: {}", e);
+            } else {
+                // Mark the first clip slot as active if it matches
+                if let Some(layer) = self.environment.get_layer_mut(new_id) {
+                    // Find which slot has this path
+                    for (slot, clip) in layer.clips.iter().enumerate() {
+                        if let Some(c) = clip {
+                            if c.source_path == path {
+                                layer.active_clip = Some(slot);
+                                layer.source = crate::compositor::LayerSource::Video(path.clone());
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        log::info!("📋 Cloned layer {} -> {} ({})", layer_id, new_id, new_name);
+        self.menu_bar.set_status(format!("Cloned layer: {}", new_name));
     }
 
     /// Set the transition mode for a layer
@@ -1541,7 +1958,7 @@ impl App {
                 }
             }
             ClipGridAction::StopClip { layer_id } => {
-                self.stop_clip(layer_id);
+                self.stop_clip_with_fade(layer_id);
             }
             ClipGridAction::AssignClip { layer_id, slot } => {
                 // Mark that we're waiting for a file to be assigned
@@ -1577,6 +1994,85 @@ impl App {
             }
             ClipGridAction::DeleteColumn { column_index } => {
                 self.delete_column(column_index);
+            }
+            ClipGridAction::SetLayerOpacity { layer_id, opacity } => {
+                if let Some(layer) = self.environment.get_layer_mut(layer_id) {
+                    layer.set_opacity(opacity);
+                }
+            }
+            ClipGridAction::CopyClip { layer_id, slot } => {
+                self.copy_clip(layer_id, slot);
+            }
+            ClipGridAction::PasteClip { layer_id, slot } => {
+                self.paste_clip(layer_id, slot);
+            }
+            ClipGridAction::CloneLayer { layer_id } => {
+                self.clone_layer(layer_id);
+            }
+            ClipGridAction::SelectLayer { layer_id } => {
+                // Select this layer in the properties panel
+                self.properties_panel.select_layer(layer_id);
+                // Ensure properties panel is visible
+                if let Some(p) = self.dock_manager.get_panel_mut(crate::ui::dock::panel_ids::PROPERTIES) {
+                    p.open = true;
+                }
+            }
+        }
+    }
+
+    /// Handle a properties panel action from the UI
+    fn handle_properties_action(&mut self, action: crate::ui::properties_panel::PropertiesAction) {
+        use crate::ui::properties_panel::PropertiesAction;
+
+        match action {
+            PropertiesAction::SetEnvironmentSize { width, height } => {
+                self.settings.environment_width = width;
+                self.settings.environment_height = height;
+                self.sync_environment_from_settings();
+                self.menu_bar.set_status(format!("Environment size: {}×{}", width, height));
+            }
+            PropertiesAction::SetLayerOpacity { layer_id, opacity } => {
+                if let Some(layer) = self.environment.get_layer_mut(layer_id) {
+                    layer.set_opacity(opacity);
+                }
+            }
+            PropertiesAction::SetLayerBlendMode { layer_id, blend_mode } => {
+                if let Some(layer) = self.environment.get_layer_mut(layer_id) {
+                    layer.blend_mode = blend_mode;
+                }
+            }
+            PropertiesAction::SetLayerVisibility { layer_id, visible } => {
+                if let Some(layer) = self.environment.get_layer_mut(layer_id) {
+                    layer.visible = visible;
+                }
+            }
+            PropertiesAction::SetLayerPosition { layer_id, x, y } => {
+                if let Some(layer) = self.environment.get_layer_mut(layer_id) {
+                    layer.transform.position = (x, y);
+                }
+            }
+            PropertiesAction::SetLayerScale { layer_id, scale_x, scale_y } => {
+                if let Some(layer) = self.environment.get_layer_mut(layer_id) {
+                    layer.transform.scale = (scale_x, scale_y);
+                }
+            }
+            PropertiesAction::SetLayerRotation { layer_id, degrees } => {
+                if let Some(layer) = self.environment.get_layer_mut(layer_id) {
+                    layer.transform.rotation = degrees.to_radians();
+                }
+            }
+            PropertiesAction::SetLayerAnchor { layer_id, anchor_x, anchor_y } => {
+                if let Some(layer) = self.environment.get_layer_mut(layer_id) {
+                    layer.transform.anchor = (anchor_x, anchor_y);
+                }
+            }
+            PropertiesAction::SetLayerTiling { layer_id, tile_x, tile_y } => {
+                if let Some(layer) = self.environment.get_layer_mut(layer_id) {
+                    layer.set_tiling(tile_x, tile_y);
+                }
+            }
+            PropertiesAction::SetLayerTransition { layer_id, transition } => {
+                self.set_layer_transition(layer_id, transition);
             }
         }
     }

@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Default number of clip slots per layer
 pub const DEFAULT_CLIP_SLOTS: usize = 8;
@@ -14,15 +14,47 @@ pub const DEFAULT_CLIP_SLOTS: usize = 8;
 pub const DEFAULT_TRANSITION_DURATION_MS: u32 = 500;
 
 /// Transition mode when switching between clips
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ClipTransition {
     /// Instant switch to new clip
     #[default]
     Cut,
-    /// Fade in from black/transparent (duration in ms)
+    /// Fade transition - old content fades out while new fades in (duration in ms)
     Fade(u32),
-    /// Crossfade from previous clip (duration in ms)
-    Crossfade(u32),
+}
+
+// Custom serialization as simple strings: "Cut" or "Fade:500"
+impl Serialize for ClipTransition {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            ClipTransition::Cut => serializer.serialize_str("Cut"),
+            ClipTransition::Fade(ms) => serializer.serialize_str(&format!("Fade:{}", ms)),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ClipTransition {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        if s == "Cut" || s.is_empty() {
+            Ok(ClipTransition::Cut)
+        } else if s == "Fade" {
+            // Just "Fade" without duration - use default
+            Ok(ClipTransition::Fade(DEFAULT_TRANSITION_DURATION_MS))
+        } else if let Some(duration_str) = s.strip_prefix("Fade:") {
+            let ms = duration_str.parse().unwrap_or(DEFAULT_TRANSITION_DURATION_MS);
+            Ok(ClipTransition::Fade(ms))
+        } else {
+            // Unknown format - default to Cut
+            Ok(ClipTransition::Cut)
+        }
+    }
 }
 
 impl ClipTransition {
@@ -31,7 +63,6 @@ impl ClipTransition {
         match self {
             ClipTransition::Cut => "Cut",
             ClipTransition::Fade(_) => "Fade",
-            ClipTransition::Crossfade(_) => "Crossfade",
         }
     }
 
@@ -40,23 +71,17 @@ impl ClipTransition {
         match self {
             ClipTransition::Cut => 0,
             ClipTransition::Fade(ms) => *ms,
-            ClipTransition::Crossfade(ms) => *ms,
         }
     }
 
     /// Check if this transition requires keeping the old content
     pub fn needs_old_content(&self) -> bool {
-        matches!(self, ClipTransition::Crossfade(_))
+        matches!(self, ClipTransition::Fade(_))
     }
 
     /// Create a fade transition with default duration
     pub fn fade() -> Self {
         ClipTransition::Fade(DEFAULT_TRANSITION_DURATION_MS)
-    }
-
-    /// Create a crossfade transition with default duration
-    pub fn crossfade() -> Self {
-        ClipTransition::Crossfade(DEFAULT_TRANSITION_DURATION_MS)
     }
 }
 
@@ -120,7 +145,6 @@ mod tests {
         let cell = ClipCell::new("/path/to/video.mp4");
         assert_eq!(cell.source_path, PathBuf::from("/path/to/video.mp4"));
         assert!(cell.label.is_none());
-        assert_eq!(cell.transition, ClipTransition::Cut);
     }
 
     #[test]

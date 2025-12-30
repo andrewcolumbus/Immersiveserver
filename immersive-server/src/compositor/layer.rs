@@ -6,23 +6,10 @@
 
 use std::path::PathBuf;
 
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 
 use crate::compositor::clip::{ClipCell, DEFAULT_CLIP_SLOTS};
 use crate::compositor::BlendMode;
-
-/// Deserialize Option<usize> from a string, treating empty strings as None
-fn deserialize_option_usize<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let s: Option<String> = Option::deserialize(deserializer)?;
-    match s {
-        Some(s) if s.is_empty() => Ok(None),
-        Some(s) => s.parse().map(Some).map_err(serde::de::Error::custom),
-        None => Ok(None),
-    }
-}
 
 /// 2D transform for layer positioning within the environment.
 ///
@@ -118,6 +105,8 @@ pub struct Layer {
     /// Human-readable name for the layer
     pub name: String,
     /// The content source for this layer (set automatically when clip is triggered)
+    /// This is runtime state, not saved - on load, source is always None
+    #[serde(skip)]
     pub source: LayerSource,
     /// 2D transform (position, scale, rotation)
     pub transform: Transform2D,
@@ -130,11 +119,22 @@ pub struct Layer {
     /// Clip slots for this layer (1D array of clips)
     pub clips: Vec<Option<ClipCell>>,
     /// Currently active/playing clip slot index, if any
-    #[serde(default, deserialize_with = "deserialize_option_usize")]
+    /// This is runtime state, not saved - on load, no clip is active
+    #[serde(skip)]
     pub active_clip: Option<usize>,
     /// Transition mode for clips on this layer
     #[serde(default)]
     pub transition: crate::compositor::ClipTransition,
+    /// Horizontal tiling (1 = no repeat, 2 = 2x repeat, etc.)
+    #[serde(default = "default_tile")]
+    pub tile_x: u32,
+    /// Vertical tiling (1 = no repeat, 2 = 2x repeat, etc.)
+    #[serde(default = "default_tile")]
+    pub tile_y: u32,
+}
+
+fn default_tile() -> u32 {
+    1
 }
 
 impl Default for Layer {
@@ -150,6 +150,8 @@ impl Default for Layer {
             clips: Vec::new(),
             active_clip: None,
             transition: crate::compositor::ClipTransition::Cut,
+            tile_x: 1,
+            tile_y: 1,
         }
     }
 }
@@ -168,6 +170,8 @@ impl Layer {
             clips: vec![None; DEFAULT_CLIP_SLOTS],
             active_clip: None,
             transition: crate::compositor::ClipTransition::Cut,
+            tile_x: 1,
+            tile_y: 1,
         }
     }
 
@@ -184,7 +188,15 @@ impl Layer {
             clips: vec![None; DEFAULT_CLIP_SLOTS],
             active_clip: None,
             transition: crate::compositor::ClipTransition::Cut,
+            tile_x: 1,
+            tile_y: 1,
         }
+    }
+
+    /// Set the layer's tiling
+    pub fn set_tiling(&mut self, tile_x: u32, tile_y: u32) {
+        self.tile_x = tile_x.max(1);
+        self.tile_y = tile_y.max(1);
     }
 
     /// Get the number of clip slots

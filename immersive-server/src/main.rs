@@ -12,7 +12,7 @@ use immersive_server::settings::{AppPreferences, EnvironmentSettings};
 use immersive_server::App;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, KeyEvent, Modifiers, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId};
@@ -224,6 +224,8 @@ struct ImmersiveApp {
     state: AppState,
     next_redraw_at: Instant,
     last_target_fps: u32,
+    /// Current modifier key state
+    modifiers: Modifiers,
 }
 
 impl ImmersiveApp {
@@ -236,6 +238,7 @@ impl ImmersiveApp {
             },
             next_redraw_at: Instant::now(),
             last_target_fps: initial_target_fps,
+            modifiers: Modifiers::default(),
         }
     }
 
@@ -343,6 +346,25 @@ impl ApplicationHandler for ImmersiveApp {
             WindowEvent::CloseRequested => {
                 log::info!("Close requested, exiting...");
                 event_loop.exit();
+            }
+
+            // Track modifier keys
+            WindowEvent::ModifiersChanged(new_modifiers) => {
+                self.modifiers = new_modifiers;
+            }
+
+            // Handle Cmd/Ctrl+S for save (always, even when egui wants keyboard)
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(KeyCode::KeyS),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } if self.modifiers.state().super_key() || self.modifiers.state().control_key() => {
+                // Trigger save action
+                app.menu_bar.pending_action = Some(immersive_server::ui::menu_bar::FileAction::Save);
             }
 
             // Handle keyboard input (only if egui doesn't want it)

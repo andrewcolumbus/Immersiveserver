@@ -84,7 +84,7 @@ impl VideoParams {
 /// Parameters for layer rendering with full 2D transforms.
 ///
 /// This struct matches the LayerParams uniform in fullscreen_quad.wgsl.
-/// It includes size scaling, position, rotation, and opacity.
+/// It includes size scaling, position, rotation, opacity, and tiling.
 ///
 /// IMPORTANT: WGSL struct alignment rules require vec2<f32> to be 8-byte aligned.
 /// After `rotation: f32`, we must add 4 bytes of padding before `anchor: vec2<f32>`.
@@ -100,16 +100,16 @@ pub struct LayerParams {
     pub scale: [f32; 2],               // offset 16, size 8
     /// Rotation in radians (clockwise)
     pub rotation: f32,                 // offset 24, size 4
-    /// Padding for WGSL vec2 alignment (vec2 requires 8-byte alignment)
-    pub _pad_rotation: f32,            // offset 28, size 4
+    /// Environment aspect ratio (width / height) for correct rotation
+    pub env_aspect: f32,               // offset 28, size 4
     /// Anchor point for rotation/scaling (0-1, where 0.5,0.5 = center)
     pub anchor: [f32; 2],              // offset 32, size 8
     /// Opacity (0.0 - 1.0)
     pub opacity: f32,                  // offset 40, size 4
     /// Padding for WGSL vec2 alignment
     pub _pad_opacity: f32,             // offset 44, size 4
-    /// Final padding for 16-byte struct alignment
-    pub _padding: [f32; 2],            // offset 48, size 8
+    /// Tiling factors (1.0 = no repeat, 2.0 = 2x2 grid, etc.)
+    pub tile: [f32; 2],                // offset 48, size 8
 }                                      // Total: 56 bytes
 
 impl Default for LayerParams {
@@ -119,11 +119,11 @@ impl Default for LayerParams {
             position: [0.0, 0.0],
             scale: [1.0, 1.0],
             rotation: 0.0,
-            _pad_rotation: 0.0,
+            env_aspect: 1.0,  // Default to square aspect
             anchor: [0.5, 0.5],
             opacity: 1.0,
             _pad_opacity: 0.0,
-            _padding: [0.0; 2],
+            tile: [1.0, 1.0],
         }
     }
 }
@@ -155,11 +155,11 @@ impl LayerParams {
             position: [pos_norm_x, pos_norm_y],
             scale: [layer.transform.scale.0, layer.transform.scale.1],
             rotation: layer.transform.rotation,
-            _pad_rotation: 0.0,
+            env_aspect: env_width as f32 / env_height.max(1) as f32,
             anchor: [layer.transform.anchor.0, layer.transform.anchor.1],
             opacity: layer.opacity,
             _pad_opacity: 0.0,
-            _padding: [0.0; 2],
+            tile: [layer.tile_x as f32, layer.tile_y as f32],
         }
     }
 
@@ -183,11 +183,11 @@ impl LayerParams {
             position: [pos_norm_x, pos_norm_y],
             scale: [transform.scale.0, transform.scale.1],
             rotation: transform.rotation,
-            _pad_rotation: 0.0,
+            env_aspect: env_width as f32 / env_height.max(1) as f32,
             anchor: [transform.anchor.0, transform.anchor.1],
             opacity,
             _pad_opacity: 0.0,
-            _padding: [0.0; 2],
+            tile: [1.0, 1.0],
         }
     }
 
@@ -201,11 +201,11 @@ impl LayerParams {
             position: [0.0, 0.0],
             scale: [1.0, 1.0],
             rotation: 0.0,
-            _pad_rotation: 0.0,
+            env_aspect: env_width as f32 / env_height.max(1) as f32,
             anchor: [0.5, 0.5],
             opacity: 1.0,
             _pad_opacity: 0.0,
-            _padding: [0.0; 2],
+            tile: [1.0, 1.0],
         }
     }
 }
@@ -448,17 +448,39 @@ impl VideoRenderer {
             position: params.offset,
             scale: [1.0, 1.0],
             rotation: 0.0,
-            _pad_rotation: 0.0,
+            env_aspect: 1.0,  // Legacy - assume square aspect
             anchor: [0.5, 0.5],
             opacity: params.opacity,
             _pad_opacity: 0.0,
-            _padding: [0.0; 2],
+            tile: [1.0, 1.0],
         };
         self.set_layer_params(queue, layer_params);
     }
 
-    /// Create a bind group for a video texture
+    /// Create a bind group for a video texture using the shared params buffer.
+    /// 
+    /// NOTE: This uses a shared params buffer which will be overwritten when
+    /// rendering multiple layers. For multi-layer rendering, use
+    /// `create_bind_group_with_buffer` with a per-layer params buffer instead.
     pub fn create_bind_group(&self, device: &wgpu::Device, video_texture: &VideoTexture) -> wgpu::BindGroup {
+        self.create_bind_group_with_buffer(device, video_texture, &self.params_buffer)
+    }
+
+    /// Create a bind group for a video texture with a custom params buffer.
+    ///
+    /// This allows each layer to have its own params buffer, avoiding overwrites
+    /// when rendering multiple layers in sequence.
+    ///
+    /// # Arguments
+    /// * `device` - The wgpu device
+    /// * `video_texture` - The video texture to bind
+    /// * `params_buffer` - The per-layer params buffer for GPU uniforms
+    pub fn create_bind_group_with_buffer(
+        &self,
+        device: &wgpu::Device,
+        video_texture: &VideoTexture,
+        params_buffer: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Video Bind Group"),
             layout: &self.bind_group_layout,
@@ -473,10 +495,30 @@ impl VideoRenderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: self.params_buffer.as_entire_binding(),
+                    resource: params_buffer.as_entire_binding(),
                 },
             ],
         })
+    }
+
+    /// Create a new params buffer for a layer.
+    ///
+    /// Each layer should have its own params buffer to avoid overwrites
+    /// when rendering multiple layers in sequence.
+    pub fn create_params_buffer(&self, device: &wgpu::Device) -> wgpu::Buffer {
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Layer Params Buffer"),
+            size: std::mem::size_of::<LayerParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+    }
+
+    /// Write layer params to a specific buffer.
+    ///
+    /// Used to update per-layer params buffers during rendering.
+    pub fn write_layer_params(&self, queue: &wgpu::Queue, buffer: &wgpu::Buffer, params: &LayerParams) {
+        queue.write_buffer(buffer, 0, bytemuck::bytes_of(params));
     }
 
     /// Render video to the output texture
