@@ -229,8 +229,11 @@ impl ConverterWindow {
             common_paths.iter().map(PathBuf::from).find(|p| p.exists())
         });
 
-        // Default output to current directory
-        let output_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        // Load saved output directory from preferences, or default to current directory
+        let prefs = crate::settings::AppPreferences::load();
+        let output_dir = prefs
+            .get_converter_output_dir()
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
         Self {
             is_open: false,
@@ -589,6 +592,10 @@ impl ConverterWindow {
         if let Some(path) = rfd::FileDialog::new().pick_folder() {
             self.output_dir = path.clone();
             
+            // Save to preferences for next time
+            let mut prefs = crate::settings::AppPreferences::load();
+            prefs.set_converter_output_dir(&path);
+            
             // Update output paths for all pending jobs
             let mut state = self.state.lock().unwrap();
             for job in state.jobs.iter_mut() {
@@ -610,33 +617,83 @@ impl ConverterWindow {
         }
     }
 
-    /// Get the frame count of a video using ffprobe.
+    /// Get the frame count of a video using ffprobe (fast metadata query).
+    /// Uses nb_frames from container metadata, or calculates from duration × fps.
     fn get_frame_count(&self, input: &PathBuf) -> Option<u64> {
         let ffprobe = self.ffprobe_path.as_ref()?;
         
+        // Fast query: get nb_frames (if available), duration, and frame rate from metadata
+        // This does NOT decode the video - just reads container metadata
         let output = Command::new(ffprobe)
             .args([
                 "-v", "error",
                 "-select_streams", "v:0",
-                "-count_frames",
-                "-show_entries", "stream=nb_read_frames",
-                "-of", "default=nokey=1:noprint_wrappers=1",
+                "-show_entries", "stream=nb_frames,duration,r_frame_rate",
+                "-of", "json",
             ])
             .arg(input)
             .output()
             .ok()?;
         
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            stdout.trim().parse().ok()
+        if !output.status.success() {
+            return None;
+        }
+        
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        
+        // Try to parse nb_frames directly (fastest, most accurate if available)
+        if let Some(nb_frames) = Self::parse_json_field(&stdout, "nb_frames") {
+            if let Ok(frames) = nb_frames.parse::<u64>() {
+                if frames > 0 {
+                    return Some(frames);
+                }
+            }
+        }
+        
+        // Fallback: calculate from duration × frame_rate
+        let duration: Option<f64> = Self::parse_json_field(&stdout, "duration")
+            .and_then(|s| s.parse().ok());
+        let frame_rate: Option<f64> = Self::parse_json_field(&stdout, "r_frame_rate")
+            .and_then(|s| {
+                // Parse "30000/1001" format
+                if let Some((num, den)) = s.split_once('/') {
+                    let n: f64 = num.parse().ok()?;
+                    let d: f64 = den.parse().ok()?;
+                    if d > 0.0 { Some(n / d) } else { None }
+                } else {
+                    s.parse().ok()
+                }
+            });
+        
+        if let (Some(dur), Some(fps)) = (duration, frame_rate) {
+            let frames = (dur * fps).round() as u64;
+            if frames > 0 {
+                return Some(frames);
+            }
+        }
+        
+        None
+    }
+    
+    /// Parse a simple JSON field value from ffprobe output.
+    fn parse_json_field(json: &str, field: &str) -> Option<String> {
+        let pattern = format!(r#""{}":"#, field);
+        let start = json.find(&pattern)?;
+        let rest = &json[start + pattern.len()..];
+        
+        // Handle quoted string or bare number
+        if rest.starts_with('"') {
+            let end = rest[1..].find('"')?;
+            Some(rest[1..=end].to_string())
         } else {
-            None
+            let end = rest.find([',', '}', '\n'])?;
+            Some(rest[..end].trim().trim_matches('"').to_string())
         }
     }
 
     /// Add files to the conversion queue.
     fn add_files(&mut self, paths: Vec<PathBuf>) {
-        // Get frame counts for all files (this can be slow, but we do it upfront)
+        // Get frame counts for all files
         let jobs_data: Vec<_> = paths
             .into_iter()
             .map(|input_path| {

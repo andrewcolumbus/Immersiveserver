@@ -143,6 +143,10 @@ pub struct AppPreferences {
     /// Path to the last opened .immersive file
     #[serde(rename = "lastOpenedFile")]
     pub last_opened_file: Option<String>,
+    
+    /// Last output folder used by HAP Converter
+    #[serde(rename = "converterOutputDir", default)]
+    pub converter_output_dir: Option<String>,
 }
 
 impl AppPreferences {
@@ -186,14 +190,20 @@ impl AppPreferences {
             .last_opened_file
             .as_deref()
             .unwrap_or("");
+        
+        let converter_dir = self
+            .converter_output_dir
+            .as_deref()
+            .unwrap_or("");
 
         let formatted = format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <ImmersivePreferences>
     <lastOpenedFile>{}</lastOpenedFile>
+    <converterOutputDir>{}</converterOutputDir>
 </ImmersivePreferences>
 "#,
-            last_file
+            last_file, converter_dir
         );
 
         fs::write(&path, formatted).map_err(SettingsError::Io)?;
@@ -211,6 +221,19 @@ impl AppPreferences {
     /// Get the last opened file path if it exists
     pub fn get_last_opened(&self) -> Option<PathBuf> {
         self.last_opened_file.as_ref().map(PathBuf::from).filter(|p| p.exists())
+    }
+    
+    /// Set the converter output directory and save
+    pub fn set_converter_output_dir(&mut self, path: &PathBuf) {
+        self.converter_output_dir = Some(path.to_string_lossy().to_string());
+        if let Err(e) = self.save() {
+            log::warn!("Failed to save preferences: {:?}", e);
+        }
+    }
+    
+    /// Get the converter output directory if it exists
+    pub fn get_converter_output_dir(&self) -> Option<PathBuf> {
+        self.converter_output_dir.as_ref().map(PathBuf::from).filter(|p| p.exists())
     }
 }
 
