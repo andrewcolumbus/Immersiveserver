@@ -42,6 +42,19 @@ notify = "7"
 rfd = "0.14"      # Native file dialogs
 which = "6.0"     # Find FFmpeg in PATH
 
+# Async runtime for networking
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "time", "macros"] }
+bytes = "1.5"     # Zero-copy byte buffers
+
+# OMT (Open Media Transport) - Aqueduct Rust implementation
+aqueduct = { path = "../external_libraries/Aqueduct (Rust OMT)", default-features = false }
+
+# mDNS for OMT service discovery
+mdns-sd = "0.10"
+
+# Hostname detection for mDNS registration
+hostname = "0.4"
+
 [[example]]
 name = "decode_video"
 path = "examples/decode_video.rs"
