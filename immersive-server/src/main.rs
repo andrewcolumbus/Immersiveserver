@@ -509,7 +509,6 @@ impl ApplicationHandler for ImmersiveApp {
                                     Ok(settings) => {
                                         app.settings = settings;
                                         app.current_file = Some(path.clone());
-                                        app.menu_bar.sync_from_settings(&app.settings);
                                         app.restore_layers_from_settings();
                                         preferences.set_last_opened(&path);
                                         app.menu_bar.set_status(format!(

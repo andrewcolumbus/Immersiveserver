@@ -290,13 +290,38 @@ impl ClipGridPanel {
         is_dragging: bool,
     ) -> Vec<ClipGridAction> {
         let mut actions = Vec::new();
+        let has_active = layer.has_active_clip();
+        let layer_id = layer.id;
 
         ui.horizontal(|ui| {
-            // Layer name (clickable to select layer, right-click for context menu)
-            let has_active = layer.has_active_clip();
-            let layer_id = layer.id;
+            // Stop button (X) on the LEFT - always visible, vertically centered
+            let (button_fill, button_text_color) = if has_active {
+                (egui::Color32::from_rgb(180, 60, 60), egui::Color32::WHITE)
+            } else {
+                (egui::Color32::from_rgb(60, 60, 65), egui::Color32::from_rgb(100, 100, 100))
+            };
             
-            let label_response = ui.allocate_ui(egui::vec2(LAYER_NAME_WIDTH - 20.0, CELL_SIZE), |ui| {
+            // Wrap in a container that matches the row height for vertical centering
+            ui.allocate_ui(egui::vec2(28.0, CELL_SIZE), |ui| {
+                ui.centered_and_justified(|ui| {
+                    let stop_button = egui::Button::new(
+                        egui::RichText::new("X")
+                            .size(12.0)
+                            .strong()
+                            .color(button_text_color)
+                    )
+                    .min_size(egui::vec2(24.0, 24.0))
+                    .fill(button_fill)
+                    .corner_radius(4.0);
+                    
+                    if ui.add(stop_button).on_hover_text("Stop clip").clicked() && has_active {
+                        actions.push(ClipGridAction::StopClip { layer_id });
+                    }
+                });
+            });
+            
+            // Layer name (clickable to select layer, right-click for context menu)
+            let label_response = ui.allocate_ui(egui::vec2(LAYER_NAME_WIDTH - 28.0, CELL_SIZE), |ui| {
                 let name_color = if has_active {
                     egui::Color32::from_rgb(100, 200, 100) // Green when playing
                 } else {
@@ -369,18 +394,6 @@ impl ClipGridPanel {
 
             // Show tooltip on layer name area
             label_response.response.on_hover_text("Click to select • Right-click for options");
-            
-            // Stop button (X) - only show when layer has active clip
-            if has_active {
-                if ui.add(egui::Button::new(
-                    egui::RichText::new("✕").size(10.0).color(egui::Color32::from_rgb(255, 100, 100))
-                ).min_size(egui::vec2(18.0, 18.0))).on_hover_text("Stop clip").clicked() {
-                    actions.push(ClipGridAction::StopClip { layer_id });
-                }
-            } else {
-                // Add spacer to keep alignment consistent
-                ui.allocate_space(egui::vec2(18.0, 18.0));
-            }
 
             // Opacity slider
             let mut opacity = layer.opacity;

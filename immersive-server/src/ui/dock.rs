@@ -5,8 +5,12 @@
 //! - Floated as independent windows
 //! - Dragged between dock zones
 //! - Snapped to magnetic dock zones
+//! - Snapped to other floating windows
 
 use serde::{Deserialize, Serialize};
+
+/// Distance threshold for window-to-window snapping (in pixels)
+const WINDOW_SNAP_THRESHOLD: f32 = 15.0;
 
 /// Dock zone where a panel can be placed
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
@@ -123,6 +127,80 @@ pub struct DockZoneIndicator {
     pub highlighted: bool,
 }
 
+/// Rectangle representing a floating window's bounds
+#[derive(Debug, Clone, Copy)]
+pub struct WindowRect {
+    pub left: f32,
+    pub top: f32,
+    pub right: f32,
+    pub bottom: f32,
+}
+
+impl WindowRect {
+    /// Create from position and size
+    pub fn from_pos_size(pos: (f32, f32), size: (f32, f32)) -> Self {
+        Self {
+            left: pos.0,
+            top: pos.1,
+            right: pos.0 + size.0,
+            bottom: pos.1 + size.1,
+        }
+    }
+
+    /// Get all edges as snap targets
+    pub fn edges(&self) -> [f32; 4] {
+        [self.left, self.top, self.right, self.bottom]
+    }
+
+    /// Calculate snapped position for another window being placed at `pos` with `size`
+    /// Returns the adjusted position if snapping occurred
+    pub fn snap_position(&self, pos: (f32, f32), size: (f32, f32), threshold: f32) -> (f32, f32) {
+        let mut snapped_x = pos.0;
+        let mut snapped_y = pos.1;
+
+        let other_left = pos.0;
+        let other_right = pos.0 + size.0;
+        let other_top = pos.1;
+        let other_bottom = pos.1 + size.1;
+
+        // Snap X: other's left to this right
+        if (other_left - self.right).abs() < threshold {
+            snapped_x = self.right;
+        }
+        // Snap X: other's right to this left
+        else if (other_right - self.left).abs() < threshold {
+            snapped_x = self.left - size.0;
+        }
+        // Snap X: other's left to this left (align left edges)
+        else if (other_left - self.left).abs() < threshold {
+            snapped_x = self.left;
+        }
+        // Snap X: other's right to this right (align right edges)
+        else if (other_right - self.right).abs() < threshold {
+            snapped_x = self.right - size.0;
+        }
+
+        // Snap Y: other's top to this bottom
+        if (other_top - self.bottom).abs() < threshold {
+            snapped_y = self.bottom;
+        }
+        // Snap Y: other's bottom to this top
+        else if (other_bottom - self.top).abs() < threshold {
+            snapped_y = self.top - size.1;
+        }
+        // Snap Y: other's top to this top (align top edges)
+        else if (other_top - self.top).abs() < threshold {
+            snapped_y = self.top;
+        }
+        // Snap Y: other's bottom to this bottom (align bottom edges)
+        else if (other_bottom - self.bottom).abs() < threshold {
+            snapped_y = self.bottom - size.1;
+        }
+
+        (snapped_x, snapped_y)
+    }
+}
+
 /// Manages all dockable panels and their states
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DockManager {
@@ -140,6 +218,9 @@ pub struct DockManager {
     /// Drag start position
     #[serde(skip)]
     drag_start_pos: Option<(f32, f32)>,
+    /// Pending snap position to apply on next frame (panel_id -> position)
+    #[serde(skip)]
+    pending_snap: Option<(String, (f32, f32))>,
 }
 
 impl DockManager {
@@ -179,6 +260,57 @@ impl DockManager {
         self.panels_in_zone(DockZone::Floating)
     }
 
+    /// Get rectangles of all floating panels except the one being dragged
+    pub fn floating_window_rects(&self, exclude_panel_id: Option<&str>) -> Vec<WindowRect> {
+        self.panels
+            .iter()
+            .filter(|p| {
+                p.zone == DockZone::Floating
+                    && p.open
+                    && exclude_panel_id.map(|id| p.id != id).unwrap_or(true)
+            })
+            .filter_map(|p| {
+                let pos = p.floating_pos?;
+                let size = p.floating_size.unwrap_or((300.0, 400.0));
+                Some(WindowRect::from_pos_size(pos, size))
+            })
+            .collect()
+    }
+
+    /// Calculate snapped position for a floating window
+    /// Snaps to edges of other floating windows if within threshold
+    pub fn calculate_snapped_position(
+        &self,
+        panel_id: &str,
+        pos: (f32, f32),
+        size: (f32, f32),
+    ) -> (f32, f32) {
+        let other_windows = self.floating_window_rects(Some(panel_id));
+        
+        let mut snapped_pos = pos;
+        let mut best_snap_dist_x = WINDOW_SNAP_THRESHOLD;
+        let mut best_snap_dist_y = WINDOW_SNAP_THRESHOLD;
+
+        for window in &other_windows {
+            let candidate = window.snap_position(pos, size, WINDOW_SNAP_THRESHOLD);
+            
+            // Check if this snap is closer than previous
+            let dx = (candidate.0 - pos.0).abs();
+            let dy = (candidate.1 - pos.1).abs();
+            
+            if dx > 0.0 && dx < best_snap_dist_x {
+                snapped_pos.0 = candidate.0;
+                best_snap_dist_x = dx;
+            }
+            if dy > 0.0 && dy < best_snap_dist_y {
+                snapped_pos.1 = candidate.1;
+                best_snap_dist_y = dy;
+            }
+        }
+
+        snapped_pos
+    }
+
     /// Check if any panel is docked to a zone
     pub fn has_panel_in_zone(&self, zone: DockZone) -> bool {
         self.panels.iter().any(|p| p.zone == zone && p.open)
@@ -200,39 +332,130 @@ impl DockManager {
         }
 
         // Detect which dock zone we're hovering over
+        // Note: Only Left/Right are supported for docking. Top/Bottom zones are
+        // disabled because they don't have rendering implementations yet.
         let margin = 80.0; // Size of magnetic zone at edges
 
         self.hover_zone = if pos.0 < margin {
             Some(DockZone::Left)
         } else if pos.0 > window_size.0 - margin {
             Some(DockZone::Right)
-        } else if pos.1 < margin + 30.0 {
-            // Account for menu bar
-            Some(DockZone::Top)
-        } else if pos.1 > window_size.1 - margin {
-            Some(DockZone::Bottom)
         } else {
             None // Floating zone
         };
     }
 
     /// End drag operation - dock or float the panel
-    pub fn end_drag(&mut self, pos: (f32, f32)) {
+    /// Returns the snapped position if window-to-window snapping occurred
+    pub fn end_drag(&mut self, pos: (f32, f32)) -> Option<(f32, f32)> {
+        let hover_zone = self.hover_zone.take();
+        let mut snapped_pos = None;
+        
         if let Some(idx) = self.dragging_panel.take() {
+            // Get panel info and calculate snap BEFORE mutating
+            let (panel_id, panel_size) = {
+                let panel = self.panels.get(idx);
+                (
+                    panel.map(|p| p.id.clone()),
+                    panel.and_then(|p| p.floating_size).unwrap_or((300.0, 400.0)),
+                )
+            };
+
+            // Calculate snapped position if we're floating (not docking to an edge)
+            let final_pos = if hover_zone.is_none() {
+                if let Some(ref id) = panel_id {
+                    let calculated = self.calculate_snapped_position(id, pos, panel_size);
+                    if calculated != pos {
+                        snapped_pos = Some(calculated);
+                    }
+                    calculated
+                } else {
+                    pos
+                }
+            } else {
+                pos
+            };
+
+            // Now apply the changes
             if let Some(panel) = self.panels.get_mut(idx) {
-                if let Some(zone) = self.hover_zone.take() {
+                if let Some(zone) = hover_zone {
                     // Dock to the hovered zone
                     panel.zone = zone;
                 } else {
-                    // Float at the current position
-                    let size = panel.floating_size.unwrap_or((300.0, 400.0));
-                    panel.float_at(pos, size);
+                    // Float at the snapped position
+                    panel.float_at(final_pos, panel_size);
                 }
             }
         }
         self.is_dragging = false;
         self.drag_start_pos = None;
-        self.hover_zone = None;
+        
+        snapped_pos
+    }
+
+    /// End drag with the window's actual rect (from egui)
+    /// This allows proper snapping based on the window's true position and size
+    /// Stores any snap in pending_snap to be applied on next frame
+    pub fn end_drag_with_rect(
+        &mut self,
+        window_pos: (f32, f32),
+        window_size: (f32, f32),
+    ) {
+        let hover_zone = self.hover_zone.take();
+        
+        if let Some(idx) = self.dragging_panel.take() {
+            // Get panel ID before mutating
+            let panel_id = self.panels.get(idx).map(|p| p.id.clone());
+
+            // Calculate snapped position if we're floating (not docking to an edge)
+            let final_pos = if hover_zone.is_none() {
+                if let Some(ref id) = panel_id {
+                    let calculated = self.calculate_snapped_position(id, window_pos, window_size);
+                    // Store pending snap if position changed significantly
+                    if (calculated.0 - window_pos.0).abs() > 0.5 
+                        || (calculated.1 - window_pos.1).abs() > 0.5 
+                    {
+                        self.pending_snap = Some((id.clone(), calculated));
+                    }
+                    calculated
+                } else {
+                    window_pos
+                }
+            } else {
+                window_pos
+            };
+
+            // Now apply the changes
+            if let Some(panel) = self.panels.get_mut(idx) {
+                if let Some(zone) = hover_zone {
+                    // Dock to the hovered zone
+                    panel.zone = zone;
+                } else {
+                    // Float at the snapped position, update stored size too
+                    panel.float_at(final_pos, window_size);
+                }
+            }
+        }
+        self.is_dragging = false;
+        self.drag_start_pos = None;
+    }
+
+    /// Get and clear any pending snap for a panel
+    /// Returns Some((x, y)) if this panel has a pending snap position
+    pub fn take_pending_snap(&mut self, panel_id: &str) -> Option<(f32, f32)> {
+        if let Some((ref id, pos)) = self.pending_snap {
+            if id == panel_id {
+                let result = Some(pos);
+                self.pending_snap = None;
+                return result;
+            }
+        }
+        None
+    }
+
+    /// Check if there's a pending snap for a panel (without consuming it)
+    pub fn has_pending_snap(&self, panel_id: &str) -> bool {
+        self.pending_snap.as_ref().map(|(id, _)| id == panel_id).unwrap_or(false)
     }
 
     /// Cancel drag operation
@@ -330,25 +553,8 @@ impl DockManager {
                     DockZone::Right,
                 );
 
-                // Top zone
-                draw_zone(
-                    ui,
-                    egui::Rect::from_min_size(
-                        egui::pos2(screen_rect.left() + margin, screen_rect.top()),
-                        egui::vec2(screen_rect.width() - margin * 2.0, margin),
-                    ),
-                    DockZone::Top,
-                );
-
-                // Bottom zone
-                draw_zone(
-                    ui,
-                    egui::Rect::from_min_size(
-                        egui::pos2(screen_rect.left() + margin, screen_rect.bottom() - margin),
-                        egui::vec2(screen_rect.width() - margin * 2.0, margin),
-                    ),
-                    DockZone::Bottom,
-                );
+                // Note: Top/Bottom dock zones are disabled because they don't
+                // have rendering implementations. Only Left/Right are supported.
             });
     }
 }

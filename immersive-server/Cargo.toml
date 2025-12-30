@@ -16,6 +16,10 @@ egui-winit = "0.31"
 # Video decoding
 ffmpeg-next = "7.1"
 
+# Hap codec decompression
+snap = "1"        # Snappy decompression for Hap
+lz4_flex = "0.11" # LZ4 decompression for Hap Q
+
 # Async runtime
 pollster = "0.4"
 
@@ -33,6 +37,10 @@ dirs = "6"
 
 # File watching (for shader hot-reload)
 notify = "7"
+
+# HAP Converter
+rfd = "0.14"      # Native file dialogs
+which = "6.0"     # Find FFmpeg in PATH
 
 [[example]]
 name = "decode_video"

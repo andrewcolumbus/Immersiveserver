@@ -124,11 +124,24 @@ impl LayerRuntime {
 
     /// Take the latest decoded frame (if any) and upload to texture.
     /// Returns true if a frame was uploaded, false if no new frame was available.
+    /// 
+    /// Note: For GPU-native frames, the texture format may need to be updated.
+    /// This requires the device to recreate the texture with the right format.
     pub fn try_update_texture(&mut self, queue: &wgpu::Queue) -> bool {
         let Some(player) = &self.player else { return false };
-        let Some(texture) = &self.texture else { return false };
+        let Some(texture) = &mut self.texture else { return false };
 
         if let Some(frame) = player.take_frame() {
+            // Check if texture format matches frame format
+            if frame.is_gpu_native != texture.is_gpu_native() {
+                log::warn!(
+                    "Texture format mismatch: frame is_gpu_native={}, texture is_gpu_native={}",
+                    frame.is_gpu_native,
+                    texture.is_gpu_native()
+                );
+                return false;
+            }
+            
             texture.upload(queue, &frame);
             self.has_frame = true;
             return true;

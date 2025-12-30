@@ -1,13 +1,13 @@
 //! GPU texture for video frames
 //!
 //! Manages a wgpu texture that can receive decoded video frame data
-//! and be used for rendering.
+//! and be used for rendering. Supports both RGBA and GPU-native (DXT/BC) formats.
 
 use super::DecodedFrame;
 
 /// A GPU texture for displaying video frames
 ///
-/// Handles texture creation and RGBA data upload.
+/// Handles texture creation and data upload for both RGBA and DXT/BC formats.
 /// Bind groups are created separately by VideoRenderer.
 pub struct VideoTexture {
     /// The GPU texture
@@ -18,31 +18,65 @@ pub struct VideoTexture {
     width: u32,
     /// Texture height in pixels
     height: u32,
+    /// Current texture format
+    format: wgpu::TextureFormat,
+    /// Whether the current texture is GPU-native (DXT/BC)
+    is_gpu_native: bool,
 }
 
 impl VideoTexture {
-    /// Create a new video texture with the specified dimensions
+    /// Create a new video texture with the specified dimensions (RGBA format)
     ///
     /// # Arguments
     /// * `device` - The wgpu device
     /// * `width` - Texture width in pixels
     /// * `height` - Texture height in pixels
     pub fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
-        let (texture, view) = Self::create_texture(device, width, height);
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let (texture, view) = Self::create_texture_with_format(device, width, height, format);
 
         Self {
             texture,
             view,
             width,
             height,
+            format,
+            is_gpu_native: false,
+        }
+    }
+    
+    /// Create a new video texture for GPU-native (DXT/BC) format
+    ///
+    /// # Arguments
+    /// * `device` - The wgpu device
+    /// * `width` - Texture width in pixels
+    /// * `height` - Texture height in pixels
+    /// * `is_bc3` - true for BC3/DXT5 (HAP Alpha/Q), false for BC1/DXT1 (HAP/DXV)
+    pub fn new_gpu_native(device: &wgpu::Device, width: u32, height: u32, is_bc3: bool) -> Self {
+        // Use sRGB variants to match video color space (same as RGBA path uses Rgba8UnormSrgb)
+        let format = if is_bc3 {
+            wgpu::TextureFormat::Bc3RgbaUnormSrgb
+        } else {
+            wgpu::TextureFormat::Bc1RgbaUnormSrgb
+        };
+        let (texture, view) = Self::create_texture_with_format(device, width, height, format);
+
+        Self {
+            texture,
+            view,
+            width,
+            height,
+            format,
+            is_gpu_native: true,
         }
     }
 
-    /// Create the GPU texture
-    fn create_texture(
+    /// Create the GPU texture with specified format
+    fn create_texture_with_format(
         device: &wgpu::Device,
         width: u32,
         height: u32,
+        format: wgpu::TextureFormat,
     ) -> (wgpu::Texture, wgpu::TextureView) {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Video Texture"),
@@ -54,8 +88,7 @@ impl VideoTexture {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            // Use Rgba8UnormSrgb for proper gamma-corrected color display
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            format,
             // COPY_DST for uploading data, TEXTURE_BINDING for shader sampling
             usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
@@ -69,7 +102,7 @@ impl VideoTexture {
     /// Upload a decoded frame to the GPU texture
     ///
     /// The frame must have the same dimensions as the texture.
-    /// If dimensions don't match, call `resize()` first.
+    /// Handles both RGBA and GPU-native (DXT/BC) formats.
     pub fn upload(&self, queue: &wgpu::Queue, frame: &DecodedFrame) {
         assert_eq!(
             frame.width, self.width,
@@ -81,26 +114,55 @@ impl VideoTexture {
             "Frame height {} doesn't match texture height {}",
             frame.height, self.height
         );
-
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &frame.data,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(frame.stride() as u32),
-                rows_per_image: Some(self.height),
-            },
-            wgpu::Extent3d {
-                width: self.width,
-                height: self.height,
-                depth_or_array_layers: 1,
-            },
-        );
+        
+        // For GPU-native (DXT/BC) formats, we upload compressed blocks
+        if frame.is_gpu_native {
+            let blocks_wide = (self.width + 3) / 4;
+            let bytes_per_block: u32 = if frame.is_bc3 { 16 } else { 8 };
+            let bytes_per_row = blocks_wide * bytes_per_block;
+            let block_rows = (self.height + 3) / 4;
+            
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &frame.data,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: Some(block_rows),
+                },
+                wgpu::Extent3d {
+                    width: self.width,
+                    height: self.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        } else {
+            // Standard RGBA upload
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &frame.data,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(frame.stride() as u32),
+                    rows_per_image: Some(self.height),
+                },
+                wgpu::Extent3d {
+                    width: self.width,
+                    height: self.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
     }
 
     /// Upload raw RGBA data to the GPU texture
@@ -148,7 +210,7 @@ impl VideoTexture {
         );
     }
 
-    /// Resize the texture to new dimensions
+    /// Resize the texture to new dimensions (preserves format)
     ///
     /// This recreates the texture. Note that any bind groups referencing
     /// this texture will need to be recreated.
@@ -157,7 +219,7 @@ impl VideoTexture {
             return; // No change needed
         }
 
-        let (texture, view) = Self::create_texture(device, width, height);
+        let (texture, view) = Self::create_texture_with_format(device, width, height, self.format);
 
         self.texture = texture;
         self.view = view;
@@ -165,6 +227,24 @@ impl VideoTexture {
         self.height = height;
 
         log::debug!("Resized video texture to {}x{}", width, height);
+    }
+    
+    /// Change the texture format (recreates texture)
+    ///
+    /// This is needed when switching between RGBA and GPU-native formats.
+    pub fn set_format(&mut self, device: &wgpu::Device, format: wgpu::TextureFormat, is_gpu_native: bool) {
+        if self.format == format {
+            return; // No change needed
+        }
+        
+        let (texture, view) = Self::create_texture_with_format(device, self.width, self.height, format);
+        
+        self.texture = texture;
+        self.view = view;
+        self.format = format;
+        self.is_gpu_native = is_gpu_native;
+        
+        log::debug!("Changed video texture format to {:?}", format);
     }
 
     /// Get the texture view
@@ -184,7 +264,12 @@ impl VideoTexture {
 
     /// Get the texture format
     pub fn format(&self) -> wgpu::TextureFormat {
-        wgpu::TextureFormat::Rgba8UnormSrgb
+        self.format
+    }
+    
+    /// Check if this texture uses GPU-native format
+    pub fn is_gpu_native(&self) -> bool {
+        self.is_gpu_native
     }
 }
 

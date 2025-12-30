@@ -48,6 +48,12 @@ pub struct VideoInfo {
     pub height: u32,
     pub frame_rate: f64,
     pub duration: f64,
+    /// Whether this is a GPU-native codec (HAP/DXV)
+    pub is_gpu_native: bool,
+    /// For GPU-native codecs: true = BC3/DXT5, false = BC1/DXT1
+    pub is_bc3: bool,
+    /// Whether this is specifically a HAP codec (not DXV)
+    pub is_hap: bool,
 }
 
 /// Background-threaded video player
@@ -71,16 +77,25 @@ impl VideoPlayer {
         // Open decoder to get video info
         let decoder = VideoDecoder::open(path)?;
         
+        // Determine BC3 vs BC1 for GPU-native codecs
+        let is_gpu_native = decoder.is_gpu_native();
+        let is_hap = decoder.is_hap();
+        let codec_name = decoder.codec_name();
+        let is_bc3 = codec_name.contains("alpha") || codec_name.contains("_q") || codec_name.contains("hapq");
+        
         let info = VideoInfo {
             width: decoder.width(),
             height: decoder.height(),
             frame_rate: decoder.frame_rate(),
             duration: decoder.duration(),
+            is_gpu_native,
+            is_bc3,
+            is_hap,
         };
         
         log::info!(
-            "VideoPlayer: {}x{} @ {:.2}fps, duration: {:.2}s",
-            info.width, info.height, info.frame_rate, info.duration
+            "VideoPlayer: {}x{} @ {:.2}fps, duration: {:.2}s, gpu_native: {}, codec: {}",
+            info.width, info.height, info.frame_rate, info.duration, is_gpu_native, codec_name
         );
         
         let state = Arc::new(SharedState::new());
@@ -271,6 +286,21 @@ impl VideoPlayer {
     /// Get path to video file
     pub fn path(&self) -> &Path {
         &self.path
+    }
+    
+    /// Check if this is a GPU-native codec (HAP/DXV)
+    pub fn is_gpu_native(&self) -> bool {
+        self.info.is_gpu_native
+    }
+    
+    /// For GPU-native codecs: true = BC3/DXT5, false = BC1/DXT1
+    pub fn is_bc3(&self) -> bool {
+        self.info.is_bc3
+    }
+    
+    /// Check if this is specifically a HAP codec (not DXV)
+    pub fn is_hap(&self) -> bool {
+        self.info.is_hap
     }
 }
 

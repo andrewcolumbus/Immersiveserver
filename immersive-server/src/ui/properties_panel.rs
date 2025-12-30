@@ -4,6 +4,7 @@
 //! Includes transform controls, tiling (multiplexing), and other settings.
 
 use crate::compositor::{BlendMode, ClipTransition, Environment, Layer};
+use crate::settings::EnvironmentSettings;
 
 /// Which tab is currently active in the properties panel
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -22,6 +23,10 @@ pub enum PropertiesTab {
 pub enum PropertiesAction {
     /// Environment resolution changed
     SetEnvironmentSize { width: u32, height: u32 },
+    /// Target FPS changed
+    SetTargetFPS { fps: u32 },
+    /// Show FPS toggle changed
+    SetShowFPS { show: bool },
     /// Layer opacity changed
     SetLayerOpacity { layer_id: u32, opacity: f32 },
     /// Layer blend mode changed
@@ -34,8 +39,6 @@ pub enum PropertiesAction {
     SetLayerScale { layer_id: u32, scale_x: f32, scale_y: f32 },
     /// Layer rotation changed
     SetLayerRotation { layer_id: u32, degrees: f32 },
-    /// Layer anchor changed
-    SetLayerAnchor { layer_id: u32, anchor_x: f32, anchor_y: f32 },
     /// Layer tiling changed
     SetLayerTiling { layer_id: u32, tile_x: u32, tile_y: u32 },
     /// Layer transition changed
@@ -57,6 +60,8 @@ pub struct PropertiesPanel {
     show_resolution_confirm: bool,
     /// Pending resolution to apply after confirmation
     pending_resolution: Option<(u32, u32)>,
+    /// Temporary FPS value for slider editing
+    temp_fps: u32,
 }
 
 impl Default for PropertiesPanel {
@@ -76,6 +81,7 @@ impl PropertiesPanel {
             env_height_text: String::new(),
             show_resolution_confirm: false,
             pending_resolution: None,
+            temp_fps: 60,
         }
     }
 
@@ -98,6 +104,7 @@ impl PropertiesPanel {
         ui: &mut egui::Ui,
         environment: &Environment,
         layers: &[Layer],
+        settings: &EnvironmentSettings,
     ) -> Vec<PropertiesAction> {
         let mut actions = Vec::new();
 
@@ -131,7 +138,7 @@ impl PropertiesPanel {
             .show(ui, |ui| {
                 match self.active_tab {
                     PropertiesTab::Environment => {
-                        self.render_environment_tab(ui, environment, &mut actions);
+                        self.render_environment_tab(ui, environment, settings, &mut actions);
                     }
                     PropertiesTab::Layer => {
                         self.render_layer_tab(ui, layers, &mut actions);
@@ -150,6 +157,7 @@ impl PropertiesPanel {
         &mut self,
         ui: &mut egui::Ui,
         environment: &Environment,
+        settings: &EnvironmentSettings,
         actions: &mut Vec<PropertiesAction>,
     ) {
         ui.heading("Environment");
@@ -286,6 +294,58 @@ impl PropertiesPanel {
                 self.env_height_text = "1200".to_string();
             }
         });
+
+        ui.add_space(16.0);
+        ui.separator();
+
+        // Frame Rate section
+        ui.add_space(8.0);
+        ui.heading("Frame Rate");
+        ui.add_space(4.0);
+
+        // Sync temp_fps from settings if it drifted
+        if self.temp_fps != settings.target_fps {
+            self.temp_fps = settings.target_fps;
+        }
+
+        // FPS slider
+        ui.horizontal(|ui| {
+            ui.label("Target FPS:");
+            let response = ui.add(
+                egui::Slider::new(&mut self.temp_fps, 24..=240)
+                    .suffix(" fps")
+                    .clamping(egui::SliderClamping::Always),
+            );
+            if response.changed() {
+                actions.push(PropertiesAction::SetTargetFPS { fps: self.temp_fps });
+            }
+        });
+
+        // FPS presets
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Presets:");
+            for &fps in &[24u32, 30, 60, 120, 144, 240] {
+                if ui.small_button(format!("{}", fps)).clicked() {
+                    self.temp_fps = fps;
+                    actions.push(PropertiesAction::SetTargetFPS { fps });
+                }
+            }
+        });
+
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(format!("Targeting {} fps", self.temp_fps))
+                .small()
+                .weak(),
+        );
+
+        ui.add_space(8.0);
+
+        // Show FPS checkbox
+        let mut show_fps = settings.show_fps;
+        if ui.checkbox(&mut show_fps, "Show FPS in menu bar").changed() {
+            actions.push(PropertiesAction::SetShowFPS { show: show_fps });
+        }
 
         ui.add_space(16.0);
         ui.separator();
@@ -544,118 +604,6 @@ impl PropertiesPanel {
                     ui.close_menu();
                 }
             });
-        });
-
-        ui.add_space(4.0);
-
-        // Anchor
-        let mut anchor_x = layer.transform.anchor.0;
-        let mut anchor_y = layer.transform.anchor.1;
-        ui.horizontal(|ui| {
-            ui.label("Anchor:");
-            let response_x = ui.add(egui::DragValue::new(&mut anchor_x).speed(0.01).range(0.0..=1.0));
-            if response_x.changed() {
-                actions.push(PropertiesAction::SetLayerAnchor { layer_id, anchor_x, anchor_y });
-            }
-            response_x.context_menu(|ui| {
-                if ui.button("Reset to Center (0.5)").clicked() {
-                    actions.push(PropertiesAction::SetLayerAnchor { layer_id, anchor_x: 0.5, anchor_y });
-                    ui.close_menu();
-                }
-                if ui.button("Reset Both to Center").clicked() {
-                    actions.push(PropertiesAction::SetLayerAnchor { layer_id, anchor_x: 0.5, anchor_y: 0.5 });
-                    ui.close_menu();
-                }
-            });
-            ui.label("×");
-            let response_y = ui.add(egui::DragValue::new(&mut anchor_y).speed(0.01).range(0.0..=1.0));
-            if response_y.changed() {
-                actions.push(PropertiesAction::SetLayerAnchor { layer_id, anchor_x, anchor_y });
-            }
-            response_y.context_menu(|ui| {
-                if ui.button("Reset to Center (0.5)").clicked() {
-                    actions.push(PropertiesAction::SetLayerAnchor { layer_id, anchor_x, anchor_y: 0.5 });
-                    ui.close_menu();
-                }
-                if ui.button("Reset Both to Center").clicked() {
-                    actions.push(PropertiesAction::SetLayerAnchor { layer_id, anchor_x: 0.5, anchor_y: 0.5 });
-                    ui.close_menu();
-                }
-            });
-        });
-
-        // Anchor presets
-        ui.horizontal(|ui| {
-            ui.label("       ");
-            if ui.small_button("↖").on_hover_text("Top-Left").clicked() {
-                actions.push(PropertiesAction::SetLayerAnchor {
-                    layer_id,
-                    anchor_x: 0.0,
-                    anchor_y: 0.0,
-                });
-            }
-            if ui.small_button("↑").on_hover_text("Top-Center").clicked() {
-                actions.push(PropertiesAction::SetLayerAnchor {
-                    layer_id,
-                    anchor_x: 0.5,
-                    anchor_y: 0.0,
-                });
-            }
-            if ui.small_button("↗").on_hover_text("Top-Right").clicked() {
-                actions.push(PropertiesAction::SetLayerAnchor {
-                    layer_id,
-                    anchor_x: 1.0,
-                    anchor_y: 0.0,
-                });
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.label("       ");
-            if ui.small_button("←").on_hover_text("Center-Left").clicked() {
-                actions.push(PropertiesAction::SetLayerAnchor {
-                    layer_id,
-                    anchor_x: 0.0,
-                    anchor_y: 0.5,
-                });
-            }
-            if ui.small_button("·").on_hover_text("Center").clicked() {
-                actions.push(PropertiesAction::SetLayerAnchor {
-                    layer_id,
-                    anchor_x: 0.5,
-                    anchor_y: 0.5,
-                });
-            }
-            if ui.small_button("→").on_hover_text("Center-Right").clicked() {
-                actions.push(PropertiesAction::SetLayerAnchor {
-                    layer_id,
-                    anchor_x: 1.0,
-                    anchor_y: 0.5,
-                });
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.label("       ");
-            if ui.small_button("↙").on_hover_text("Bottom-Left").clicked() {
-                actions.push(PropertiesAction::SetLayerAnchor {
-                    layer_id,
-                    anchor_x: 0.0,
-                    anchor_y: 1.0,
-                });
-            }
-            if ui.small_button("↓").on_hover_text("Bottom-Center").clicked() {
-                actions.push(PropertiesAction::SetLayerAnchor {
-                    layer_id,
-                    anchor_x: 0.5,
-                    anchor_y: 1.0,
-                });
-            }
-            if ui.small_button("↘").on_hover_text("Bottom-Right").clicked() {
-                actions.push(PropertiesAction::SetLayerAnchor {
-                    layer_id,
-                    anchor_x: 1.0,
-                    anchor_y: 1.0,
-                });
-            }
         });
 
         ui.add_space(16.0);

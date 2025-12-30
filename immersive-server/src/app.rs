@@ -69,6 +69,8 @@ pub struct App {
     config: wgpu::SurfaceConfiguration,
     /// Current window size in physical pixels
     size: PhysicalSize<u32>,
+    /// Whether BC texture compression is supported (for HAP/DXV)
+    bc_texture_supported: bool,
 
     // Environment (fixed-resolution composition canvas)
     environment: Environment,
@@ -123,6 +125,8 @@ pub struct App {
     pub dock_manager: crate::ui::DockManager,
     /// Properties panel (Environment/Layer/Clip tabs)
     pub properties_panel: crate::ui::PropertiesPanel,
+    /// HAP Converter window
+    pub converter_window: crate::converter::ConverterWindow,
 
     // Settings
     pub settings: EnvironmentSettings,
@@ -174,11 +178,21 @@ impl App {
         log::info!("Using GPU: {}", adapter.get_info().name);
         log::info!("Backend: {:?}", adapter.get_info().backend);
 
+        // Request BC texture compression for GPU-native codecs (HAP/DXV)
+        let bc_texture_supported = adapter.features().contains(wgpu::Features::TEXTURE_COMPRESSION_BC);
+        let mut required_features = wgpu::Features::empty();
+        if bc_texture_supported {
+            required_features |= wgpu::Features::TEXTURE_COMPRESSION_BC;
+            log::info!("BC texture compression enabled (for HAP/DXV support)");
+        } else {
+            log::warn!("BC texture compression not available - HAP/DXV will use software decode");
+        }
+        
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("Immersive Server Device"),
-                    required_features: wgpu::Features::empty(),
+                    required_features,
                     required_limits: adapter.limits(),
                     memory_hints: wgpu::MemoryHints::Performance,
                 },
@@ -346,6 +360,7 @@ impl App {
             queue,
             config,
             size,
+            bc_texture_supported,
             environment,
             viewport: Viewport::new(),
             cursor_position: (0.0, 0.0),
@@ -383,6 +398,7 @@ impl App {
                 dm
             },
             properties_panel: crate::ui::PropertiesPanel::new(),
+            converter_window: crate::converter::ConverterWindow::new(),
             settings,
             current_file: None,
             video_renderer,
@@ -850,6 +866,22 @@ impl App {
             0.0
         };
 
+        // Build panel states for View menu
+        let panel_states: Vec<(&str, &str, bool)> = vec![
+            (
+                crate::ui::dock::panel_ids::PROPERTIES,
+                "Properties",
+                self.dock_manager.get_panel(crate::ui::dock::panel_ids::PROPERTIES)
+                    .map(|p| p.open).unwrap_or(false),
+            ),
+            (
+                crate::ui::dock::panel_ids::CLIP_GRID,
+                "Clip Grid",
+                self.dock_manager.get_panel(crate::ui::dock::panel_ids::CLIP_GRID)
+                    .map(|p| p.open).unwrap_or(false),
+            ),
+        ];
+
         // Render menu bar with appropriate FPS
         let settings_changed = self.menu_bar.render(
             &self.egui_ctx,
@@ -857,10 +889,26 @@ impl App {
             &self.current_file,
             display_fps,
             display_frame_time_ms,
+            &panel_states,
         );
+
+        // Handle menu actions (e.g., toggle panel)
+        if let Some(action) = self.menu_bar.take_menu_action() {
+            match action {
+                crate::ui::menu_bar::MenuAction::TogglePanel { panel_id } => {
+                    self.dock_manager.toggle_panel(&panel_id);
+                }
+                crate::ui::menu_bar::MenuAction::OpenHAPConverter => {
+                    self.converter_window.open();
+                }
+            }
+        }
 
         // Render dock zones overlay during drag operations
         self.dock_manager.render_dock_zones(&self.egui_ctx);
+        
+        // Render HAP Converter window
+        self.converter_window.show(&self.egui_ctx);
         
         // Get layer list for property panels
         let layers: Vec<_> = self.environment.layers().to_vec();
@@ -894,7 +942,7 @@ impl App {
                                     });
                                 });
                                 ui.separator();
-                                actions = self.properties_panel.render(ui, &self.environment, &layers);
+                                actions = self.properties_panel.render(ui, &self.environment, &layers, &self.settings);
                             });
                         actions
                     }
@@ -904,12 +952,22 @@ impl App {
                         let size = floating_size.unwrap_or((300.0, 400.0));
                         let mut open = true;
                         
-                        let window_response = egui::Window::new("Properties")
+                        // Check if there's a pending snap to apply
+                        let snap_pos = self.dock_manager.take_pending_snap(crate::ui::dock::panel_ids::PROPERTIES);
+                        
+                        let mut window = egui::Window::new("Properties")
                             .id(egui::Id::new("properties_window"))
                             .default_pos(egui::pos2(pos.0, pos.1))
                             .default_size(egui::vec2(size.0, size.1))
                             .resizable(true)
-                            .collapsible(true)
+                            .collapsible(true);
+                        
+                        // Apply snap position if pending (overrides egui's tracked position)
+                        if let Some(snap) = snap_pos {
+                            window = window.current_pos(egui::pos2(snap.0, snap.1));
+                        }
+                        
+                        let window_response = window
                             .open(&mut open)
                             .show(&self.egui_ctx, |ui| {
                                 // Dock button in header
@@ -923,11 +981,11 @@ impl App {
                                     });
                                 });
                                 ui.separator();
-                                actions = self.properties_panel.render(ui, &self.environment, &layers);
+                                actions = self.properties_panel.render(ui, &self.environment, &layers, &self.settings);
                             });
                         
                         // Track window dragging for dock zone snapping
-                        if let Some(resp) = window_response {
+                        if let Some(resp) = &window_response {
                             if resp.response.drag_started() {
                                 let cursor_pos = self.egui_ctx.input(|i| i.pointer.hover_pos().unwrap_or_default());
                                 self.dock_manager.start_drag(crate::ui::dock::panel_ids::PROPERTIES, (cursor_pos.x, cursor_pos.y));
@@ -938,8 +996,13 @@ impl App {
                                 self.dock_manager.update_drag((cursor_pos.x, cursor_pos.y), (screen_rect.width(), screen_rect.height()));
                             }
                             if resp.response.drag_stopped() {
-                                let cursor_pos = self.egui_ctx.input(|i| i.pointer.hover_pos().unwrap_or_default());
-                                self.dock_manager.end_drag((cursor_pos.x, cursor_pos.y));
+                                // Get actual window rect from egui
+                                let window_rect = resp.response.rect;
+                                let window_pos = (window_rect.left(), window_rect.top());
+                                let window_size = (window_rect.width(), window_rect.height());
+                                
+                                // End drag with window rect for proper snapping
+                                self.dock_manager.end_drag_with_rect(window_pos, window_size);
                             }
                         }
                         
@@ -1006,12 +1069,22 @@ impl App {
                         let size = floating_size.unwrap_or((400.0, 300.0));
                         let mut open = true;
                         
-                        let window_response = egui::Window::new("Clip Grid")
+                        // Check if there's a pending snap to apply
+                        let snap_pos = self.dock_manager.take_pending_snap(crate::ui::dock::panel_ids::CLIP_GRID);
+                        
+                        let mut window = egui::Window::new("Clip Grid")
                             .id(egui::Id::new("clip_grid_window"))
                             .default_pos(egui::pos2(pos.0, pos.1))
                             .default_size(egui::vec2(size.0, size.1))
                             .resizable(true)
-                            .collapsible(true)
+                            .collapsible(true);
+                        
+                        // Apply snap position if pending (overrides egui's tracked position)
+                        if let Some(snap) = snap_pos {
+                            window = window.current_pos(egui::pos2(snap.0, snap.1));
+                        }
+                        
+                        let window_response = window
                             .open(&mut open)
                             .show(&self.egui_ctx, |ui| {
                                 // Dock button in header
@@ -1029,7 +1102,7 @@ impl App {
                             });
                         
                         // Track window dragging for dock zone snapping
-                        if let Some(resp) = window_response {
+                        if let Some(resp) = &window_response {
                             if resp.response.drag_started() {
                                 let cursor_pos = self.egui_ctx.input(|i| i.pointer.hover_pos().unwrap_or_default());
                                 self.dock_manager.start_drag(crate::ui::dock::panel_ids::CLIP_GRID, (cursor_pos.x, cursor_pos.y));
@@ -1040,8 +1113,13 @@ impl App {
                                 self.dock_manager.update_drag((cursor_pos.x, cursor_pos.y), (screen_rect.width(), screen_rect.height()));
                             }
                             if resp.response.drag_stopped() {
-                                let cursor_pos = self.egui_ctx.input(|i| i.pointer.hover_pos().unwrap_or_default());
-                                self.dock_manager.end_drag((cursor_pos.x, cursor_pos.y));
+                                // Get actual window rect from egui
+                                let window_rect = resp.response.rect;
+                                let window_pos = (window_rect.left(), window_rect.top());
+                                let window_size = (window_rect.width(), window_rect.height());
+                                
+                                // End drag with window rect for proper snapping
+                                self.dock_manager.end_drag_with_rect(window_pos, window_size);
                             }
                         }
                         
@@ -1348,16 +1426,26 @@ impl App {
             VideoPlayer::open(path).map_err(|e| format!("Failed to open video: {}", e))?;
 
         log::info!(
-            "Layer {}: Loaded video {}x{} @ {:.2}fps, duration: {:.2}s",
+            "Layer {}: Loaded video {}x{} @ {:.2}fps, duration: {:.2}s, gpu_native: {}",
             layer_id,
             player.width(),
             player.height(),
             player.frame_rate(),
-            player.duration()
+            player.duration(),
+            player.is_gpu_native()
         );
 
-        // Create video texture
-        let video_texture = VideoTexture::new(&self.device, player.width(), player.height());
+        // Create video texture with appropriate format
+        // HAP uses raw DXT extraction for GPU-native upload
+        // DXV v4 (most common) requires FFmpeg decode to RGBA due to proprietary compression
+        let use_gpu_native = player.is_hap() && self.bc_texture_supported;
+        
+        let video_texture = if use_gpu_native {
+            log::info!("Using GPU-native BC texture for layer {} (HAP fast path)", layer_id);
+            VideoTexture::new_gpu_native(&self.device, player.width(), player.height(), player.is_bc3())
+        } else {
+            VideoTexture::new(&self.device, player.width(), player.height())
+        };
 
         // Create per-layer params buffer to avoid overwrites during multi-layer rendering
         let params_buffer = self.video_renderer.create_params_buffer(&self.device);
@@ -1513,7 +1601,9 @@ impl App {
     }
 
     /// Update all layer videos - pick up decoded frames (non-blocking)
-    /// Rate-limited to upload at most one texture per frame to prevent UI freezing.
+    /// 
+    /// Uploads ALL available frames each update cycle.
+    /// The previous rate limiting (1 upload/frame) was too aggressive and caused video starvation.
     pub fn update_videos(&mut self) {
         // Collect layer IDs for round-robin iteration
         let mut layer_ids: Vec<u32> = self.layer_runtimes.keys().copied().collect();
@@ -1523,9 +1613,6 @@ impl App {
         let start_idx = layer_ids.iter()
             .position(|&id| id > self.last_upload_layer)
             .unwrap_or(0);
-        
-        // Rate limit: only upload ONE texture per frame to avoid blocking
-        let mut uploaded_this_frame = false;
         
         // Collect layers that have completed fade-out (need to be cleared after iteration)
         let mut fade_out_complete: Vec<u32> = Vec::new();
@@ -1546,13 +1633,9 @@ impl App {
                     fade_out_complete.push(layer_id);
                 }
                 
-                // Only upload one texture per frame (rate limiting)
-                if !uploaded_this_frame {
-                    let had_frame = runtime.try_update_texture(&self.queue);
-                    if had_frame {
-                        uploaded_this_frame = true;
-                        self.last_upload_layer = layer_id;
-                    }
+                // Upload all available frames - no rate limiting
+                if runtime.try_update_texture(&self.queue) {
+                    self.last_upload_layer = layer_id;
                 }
             }
         }
@@ -1572,12 +1655,7 @@ impl App {
         
         // Update pending runtimes - these get priority since user is waiting
         for runtime in self.pending_runtimes.values_mut() {
-            if !uploaded_this_frame {
-                let had_frame = runtime.try_update_texture(&self.queue);
-                if had_frame {
-                    uploaded_this_frame = true;
-                }
-            }
+            let _ = runtime.try_update_texture(&self.queue);
         }
         
         // Swap pending runtimes into active once they have a frame
@@ -2031,6 +2109,13 @@ impl App {
                 self.sync_environment_from_settings();
                 self.menu_bar.set_status(format!("Environment size: {}×{}", width, height));
             }
+            PropertiesAction::SetTargetFPS { fps } => {
+                self.settings.target_fps = fps;
+                self.menu_bar.set_status(format!("Target FPS set to {}", fps));
+            }
+            PropertiesAction::SetShowFPS { show } => {
+                self.settings.show_fps = show;
+            }
             PropertiesAction::SetLayerOpacity { layer_id, opacity } => {
                 if let Some(layer) = self.environment.get_layer_mut(layer_id) {
                     layer.set_opacity(opacity);
@@ -2059,11 +2144,6 @@ impl App {
             PropertiesAction::SetLayerRotation { layer_id, degrees } => {
                 if let Some(layer) = self.environment.get_layer_mut(layer_id) {
                     layer.transform.rotation = degrees.to_radians();
-                }
-            }
-            PropertiesAction::SetLayerAnchor { layer_id, anchor_x, anchor_y } => {
-                if let Some(layer) = self.environment.get_layer_mut(layer_id) {
-                    layer.transform.anchor = (anchor_x, anchor_y);
                 }
             }
             PropertiesAction::SetLayerTiling { layer_id, tile_x, tile_y } => {

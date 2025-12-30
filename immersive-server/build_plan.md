@@ -206,149 +206,65 @@ enum ClipTransition {
 
 **Goal:** Clone, multiplex, resize, and reposition videos within the environment.
 
-- [ ] **Video Cloning**
+- [x] **Video Cloning**
   - Duplicate video sources to multiple layers
   - Shared decode, independent transforms
-- [ ] **Video Multiplexing**
+- [x] **Video Multiplexing**
   - Single source feeding multiple outputs/regions
   - Efficient GPU resource sharing
-  - Establishes effects page, this is the first (optional) effect
-- [ ] **Resize & Scale**
+  - Establishes clip/layer/environment page, this is the first (optional) effect
+similar to this: /Users/andrewcolumbus/Documents/Code/Immersiveserver/image.png
+- [x] **Resize & Scale**
   - Arbitrary resize per layer (independent of source resolution)
   - Maintain or ignore aspect ratio option
-- [ ] **Positioning**
+  - this is also on the clip/layer page
+- [x] **Positioning**
   - Absolute pixel positioning within environment
   - Anchor points (center, corners, edges)
   - Drag-and-drop support in UI
 
 **✅ Verification Checklist (Phase 2.5):**
-- [ ] Clone same video to 3+ layers — verify single decode, multiple renders
-- [ ] Cloned layers can have independent transforms (position/scale/rotation)
-- [ ] Multiplex single source to multiple regions — verify GPU memory usage is shared
-- [ ] Resize video up (2× scale) — verify quality/interpolation
-- [ ] Resize video down (0.5× scale) — verify no aliasing artifacts
-- [ ] "Maintain aspect ratio" option works correctly
-- [ ] "Ignore aspect ratio" option allows stretching
-- [ ] Position video at exact pixel coordinates (test: place at 100,100)
-- [ ] Anchor points work: center places video center at position, top-left places corner
-- [ ] Drag-and-drop in UI updates position values correctly
-- [ ] Performance: 8 cloned layers maintains 60fps (shared decode)
+- [x] Clone same video to 3+ layers — verify single decode, multiple renders
+- [x] Cloned layers can have independent transforms (position/scale/rotation)
+- [x] Multiplex single source to multiple regions — verify GPU memory usage is shared
+- [x] Resize video up (2× scale) — verify quality/interpolation
+- [x] Resize video down (0.5× scale) — verify no aliasing artifacts
+- [x] "Maintain aspect ratio" option works correctly
+- [x] "Ignore aspect ratio" option allows stretching
+- [x] Position video at exact pixel coordinates (test: place at 100,100)
+- [x] Anchor points work: center places video center at position, top-left places corner
+- [x] Drag-and-drop in UI updates position values correctly
+- [x] Performance: 8 cloned layers maintains 60fps (shared decode)
 
 ---
 
-### Phase 3: Projection Mapping (Weeks 7–10)
-
-**Goal:** 2D mesh warping, edge blending, and soft-edge masking.
-
-- [ ] **Mesh Warp Engine**
-  - Define control point grid (e.g., 4×4, 8×8, arbitrary)
-  - Bezier or linear interpolation for surfaces
-  - Per-output mesh storage/serialization
-- [ ] **Edge Blending**
-  - Parametric blend curves (gamma-corrected)
-  - Left/Right/Top/Bottom blend regions per output
-  - Overlap calibration tools
-- [ ] **Masking**
-  - Bezier curve masks
-  - Feathered edges
-  - Invert/combine masks
-- [ ] **Color Correction**
-  - Per-output brightness, contrast, gamma
-  - Color temperature adjustment
-  - LUT support (optional)
-
-**Data Model:**
-```rust
-struct OutputConfig {
-    display_id: u32,
-    mesh: WarpMesh,
-    edge_blend: EdgeBlendConfig,
-    masks: Vec<Mask>,
-    color: ColorCorrection,
-}
-```
-
-**✅ Verification Checklist (Phase 3):**
-- [ ] Mesh warp: 4×4 grid deforms image correctly
-- [ ] Mesh warp: 8×8 grid provides finer control
-- [ ] Bezier interpolation produces smooth curves between control points
-- [ ] Mesh configuration saves/loads correctly from file
-- [ ] Edge blend: left/right blend creates smooth gradient overlap
-- [ ] Edge blend: top/bottom blend works correctly
-- [ ] Edge blend: gamma correction produces linear visual falloff
-- [ ] Two overlapping outputs blend seamlessly (no visible seam)
-- [ ] Bezier mask correctly hides portions of output
-- [ ] Mask feathering produces soft edges (test 0px, 10px, 50px feather)
-- [ ] Mask invert works correctly
-- [ ] Multiple masks combine correctly (union/intersection)
-- [ ] Color correction: brightness adjustment (-100% to +100%)
-- [ ] Color correction: contrast adjustment works
-- [ ] Color correction: gamma curve applies correctly
-- [ ] All settings persist across app restart
-
----
-
-### Phase 4: Hardware Video Decoding (Weeks 11–12)
+### Phase 3: Hardware Video Decoding (Weeks 11–12)
 
 **Goal:** Offload decode to GPU for 4K+ playback.
 
-- [ ] **macOS:** VideoToolbox via `ffmpeg-next` hwaccel
-- [ ] **Windows:** D3D11VA / NVDEC via `ffmpeg-next` hwaccel
-- [ ] **Hap Codec Support**
+- [x] **macOS:** VideoToolbox via `ffmpeg-next` hwaccel
+- [x] **Windows:** D3D11VA / NVDEC via `ffmpeg-next` hwaccel
+- [x] **Hap Codec Support**
   - Direct GPU texture upload (DXT/BC compression)
-  - Use Hap library from `external_libraries/hap`
+  - HapDecoder with BC1/BC3 texture format support
 - [ ] Benchmark: target 4× 4K @ 60fps decode headroom
 
-**✅ Verification Checklist (Phase 4):**
-- [ ] macOS: VideoToolbox hwaccel enabled (check logs for "hwaccel: videotoolbox")
+**✅ Verification Checklist (Phase 3):**
+- [x] macOS: VideoToolbox hwaccel enabled (check logs for "hwaccel: videotoolbox")
 - [ ] macOS: CPU usage drops significantly vs software decode (measure with Activity Monitor)
-- [ ] Windows: D3D11VA or NVDEC enabled (check logs)
+- [x] Windows: D3D11VA or NVDEC enabled (check logs)
 - [ ] Windows: GPU decode visible in Task Manager GPU stats
 - [ ] 4K H.264 video plays smoothly at 60fps
 - [ ] 4K H.265/HEVC video plays smoothly at 60fps
-- [ ] Hap codec: DXT texture uploads directly (no CPU conversion)
-- [ ] Hap Alpha codec works correctly
+- [x] Hap codec: DXT texture uploads directly (no CPU conversion)
+- [x] Hap Alpha codec works correctly
 - [ ] Benchmark test: decode 4× 4K streams simultaneously, verify <50% CPU usage
-- [ ] Graceful fallback to software decode if hwaccel unavailable
+- [x] Graceful fallback to software decode if hwaccel unavailable
 - [ ] No visual artifacts or color space issues with hwaccel
 
 ---
 
-### Phase 5: NDI Input/Output (Weeks 13–15)
-
-**Goal:** Receive and send video over NDI.
-
-- [ ] **NDI Receiver**
-  - Enumerate NDI sources on network
-  - Spawn receiver thread per source
-  - Push frames to ring buffer
-- [ ] **NDI Sender**
-  - Capture compositor output
-  - Encode and transmit via NDI
-  - Support multiple simultaneous outputs
-- [ ] **FFI Bindings**
-  - Use `bindgen` for NDI SDK headers
-  - Safe Rust wrapper around C API
-
-**Crate:** Create `ndi-rs` wrapper or use existing community bindings.
-
-**✅ Verification Checklist (Phase 5):**
-- [ ] NDI sources on local network are discovered and listed
-- [ ] NDI source discovery updates dynamically (new sources appear)
-- [ ] Receive NDI stream and display as layer (test with NDI Test Patterns)
-- [ ] Receive multiple NDI streams simultaneously (test 4 streams)
-- [ ] NDI receiver handles source disconnect gracefully (no crash, shows placeholder)
-- [ ] NDI receiver auto-reconnects when source comes back
-- [ ] Send compositor output as NDI stream
-- [ ] NDI output visible in NDI Studio Monitor
-- [ ] NDI output maintains quality (compare to direct output)
-- [ ] Multiple NDI outputs work simultaneously
-- [ ] Latency measurement: NDI round-trip < 3 frames
-- [ ] Memory stable after 1 hour of NDI streaming (no leaks)
-
----
-
-### Phase 6: OMT Input/Output (Weeks 16–17)
+### Phase 4: OMT Input/Output (Weeks 16–17)
 
 **Goal:** Integrate Open Media Transport for ultra-low latency.
 
@@ -358,7 +274,7 @@ struct OutputConfig {
 - [ ] OMT Sender: output compositor to OMT stream
 - [ ] Fallback to provided `libOMT.dylib` / `.dll` if needed
 
-**✅ Verification Checklist (Phase 6):**
+**✅ Verification Checklist (Phase 4):**
 - [ ] OMT sources are discovered on network
 - [ ] OMT receiver connects and displays stream
 - [ ] OMT latency is measurably lower than NDI (< 1 frame target)
@@ -371,7 +287,7 @@ struct OutputConfig {
 
 ---
 
-### Phase 7: Web Control Server (Weeks 18–20)
+### Phase 5: Web Control Server (Weeks 18–20)
 
 **Goal:** Full HTTP/WebSocket API for remote control.
 
@@ -405,7 +321,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ```
 
-**✅ Verification Checklist (Phase 7):**
+**✅ Verification Checklist (Phase 5):**
 - [ ] Server starts on configurable port (default 8080)
 - [ ] `GET /api/sources` returns JSON list of available inputs
 - [ ] `GET /api/environment` returns current environment state
@@ -430,7 +346,7 @@ serde_json = "1"
 
 ---
 
-### Phase 8: Web Dashboard (Weeks 21–24)
+### Phase 6: Web Dashboard (Weeks 21–24)
 
 **Goal:** Professional browser-based control surface.
 
@@ -447,7 +363,7 @@ serde_json = "1"
   - Mask drawing tools
 - [ ] **Responsive Design:** Tablet-friendly for on-site operation
 
-**✅ Verification Checklist (Phase 8):**
+**✅ Verification Checklist (Phase 6):**
 - [ ] Dashboard loads in Chrome, Firefox, Safari, Edge
 - [ ] Source browser lists files, NDI sources, and OMT sources
 - [ ] Can add source to environment by clicking/dragging
@@ -475,7 +391,7 @@ serde_json = "1"
 
 ---
 
-### Phase 9: Polish & Performance (Weeks 25–28)
+### Phase 7: Polish & Performance (Weeks 25–28)
 
 **Goal:** Production-ready stability and optimization.
 
@@ -500,7 +416,7 @@ serde_json = "1"
   - Windows: MSI or NSIS installer
   - Code signing for both platforms
 
-**✅ Verification Checklist (Phase 9):**
+**✅ Verification Checklist (Phase 7):**
 - [ ] GPU profiling data collected and reviewed (identify bottlenecks)
 - [ ] CPU profiling completed — no functions taking >10% of frame time
 - [ ] Memory leak test: run 24 hours, memory usage stable (±10%)
@@ -521,7 +437,7 @@ serde_json = "1"
 
 ---
 
-### Phase 10: REST API Feature Planning (Weeks 29–30)
+### Phase 8: REST API Feature Planning (Weeks 29–30)
 
 **Goal:** Design and implement comprehensive REST API based on user requirements.
 
@@ -541,7 +457,7 @@ serde_json = "1"
   - *TODO: Add endpoints based on user feedback*
   - *Ask: What functions should be exposed via API?*
 
-**✅ Verification Checklist (Phase 10):**
+**✅ Verification Checklist (Phase 8):**
 - [ ] Complete list of app functions documented
 - [ ] User survey sent and responses collected
 - [ ] API endpoints prioritized based on user feedback
@@ -556,6 +472,92 @@ serde_json = "1"
 - [ ] User-requested features implemented (list specific ones as added)
 - [ ] API versioning strategy documented (e.g., `/api/v1/`)
 - [ ] Breaking changes documented in changelog
+
+---
+
+### Phase 9: Projection Mapping (Weeks 31–34)
+
+**Goal:** 2D mesh warping, edge blending, and soft-edge masking.
+
+- [ ] **Mesh Warp Engine**
+  - Define control point grid (e.g., 4×4, 8×8, arbitrary)
+  - Bezier or linear interpolation for surfaces
+  - Per-output mesh storage/serialization
+- [ ] **Edge Blending**
+  - Parametric blend curves (gamma-corrected)
+  - Left/Right/Top/Bottom blend regions per output
+  - Overlap calibration tools
+- [ ] **Masking**
+  - Bezier curve masks
+  - Feathered edges
+  - Invert/combine masks
+- [ ] **Color Correction**
+  - Per-output brightness, contrast, gamma
+  - Color temperature adjustment
+  - LUT support (optional)
+
+**Data Model:**
+```rust
+struct OutputConfig {
+    display_id: u32,
+    mesh: WarpMesh,
+    edge_blend: EdgeBlendConfig,
+    masks: Vec<Mask>,
+    color: ColorCorrection,
+}
+```
+
+**✅ Verification Checklist (Phase 9):**
+- [ ] Mesh warp: 4×4 grid deforms image correctly
+- [ ] Mesh warp: 8×8 grid provides finer control
+- [ ] Bezier interpolation produces smooth curves between control points
+- [ ] Mesh configuration saves/loads correctly from file
+- [ ] Edge blend: left/right blend creates smooth gradient overlap
+- [ ] Edge blend: top/bottom blend works correctly
+- [ ] Edge blend: gamma correction produces linear visual falloff
+- [ ] Two overlapping outputs blend seamlessly (no visible seam)
+- [ ] Bezier mask correctly hides portions of output
+- [ ] Mask feathering produces soft edges (test 0px, 10px, 50px feather)
+- [ ] Mask invert works correctly
+- [ ] Multiple masks combine correctly (union/intersection)
+- [ ] Color correction: brightness adjustment (-100% to +100%)
+- [ ] Color correction: contrast adjustment works
+- [ ] Color correction: gamma curve applies correctly
+- [ ] All settings persist across app restart
+
+---
+
+### Phase 10: NDI Input/Output (Weeks 35–37)
+
+**Goal:** Receive and send video over NDI.
+
+- [ ] **NDI Receiver**
+  - Enumerate NDI sources on network
+  - Spawn receiver thread per source
+  - Push frames to ring buffer
+- [ ] **NDI Sender**
+  - Capture compositor output
+  - Encode and transmit via NDI
+  - Support multiple simultaneous outputs
+- [ ] **FFI Bindings**
+  - Use `bindgen` for NDI SDK headers
+  - Safe Rust wrapper around C API
+
+**Crate:** Create `ndi-rs` wrapper or use existing community bindings.
+
+**✅ Verification Checklist (Phase 10):**
+- [ ] NDI sources on local network are discovered and listed
+- [ ] NDI source discovery updates dynamically (new sources appear)
+- [ ] Receive NDI stream and display as layer (test with NDI Test Patterns)
+- [ ] Receive multiple NDI streams simultaneously (test 4 streams)
+- [ ] NDI receiver handles source disconnect gracefully (no crash, shows placeholder)
+- [ ] NDI receiver auto-reconnects when source comes back
+- [ ] Send compositor output as NDI stream
+- [ ] NDI output visible in NDI Studio Monitor
+- [ ] NDI output maintains quality (compare to direct output)
+- [ ] Multiple NDI outputs work simultaneously
+- [ ] Latency measurement: NDI round-trip < 3 frames
+- [ ] Memory stable after 1 hour of NDI streaming (no leaks)
 
 ---
 
@@ -624,7 +626,19 @@ immersive-server/
 
 ---
 
-## 5. Key Dependencies
+## 5. UI Guidelines
+
+### Window/Panel Management Rules
+
+1. **All windows and panels must be registered in the View menu** with visibility toggle checkboxes. This ensures users can always respawn a panel that was accidentally closed or lost.
+
+2. **Dockable panels must have fallback rendering** — if a panel can be docked to a zone (Left, Right, Top, Bottom), that zone must have rendering logic. If not implemented, disable the dock zone detection for that edge.
+
+3. **Panel state must persist** — open/closed state and dock position should be saved to settings and restored on app restart.
+
+---
+
+## 6. Key Dependencies
 
 ```toml
 [package]
@@ -675,7 +689,7 @@ bindgen = "0.71"  # For NDI/OMT FFI
 
 ---
 
-## 6. Performance Targets
+## 7. Performance Targets
 
 | Metric | Target |
 |--------|--------|
@@ -691,7 +705,7 @@ bindgen = "0.71"  # For NDI/OMT FFI
 
 ---
 
-## 7. Risk Mitigation
+## 8. Risk Mitigation
 
 | Risk | Mitigation |
 |------|------------|
@@ -704,24 +718,26 @@ bindgen = "0.71"  # For NDI/OMT FFI
 
 ---
 
-## 8. Milestones
+## 9. Milestones
 
 | Milestone | Target Date | Deliverable |
 |-----------|-------------|-------------|
 | M1: First Frame | Week 3 | Video file plays in window |
 | M2: Environment | Week 6 | Environment with layers and blending |
 | M2.5: Video Manipulation | Week 7 | Clone, multiplex, resize, move videos |
-| M3: Mapping v1 | Week 10 | Mesh warp + edge blend |
-| M4: NDI Working | Week 15 | Receive/send NDI streams |
+| M3: Hardware Decode | Week 12 | GPU-accelerated video decoding |
+| M4: OMT Working | Week 17 | OMT streaming input/output |
 | M5: Web Control | Week 20 | REST API + basic dashboard |
 | M6: Alpha Release | Week 24 | Feature-complete, internal testing |
 | M7: Performance | Week 28 | GPU tiling, optimization, polish |
 | M8: API Planning | Week 30 | User-driven API feature expansion |
-| M9: v1.0 Release | Week 34 | Production-ready |
+| M9: Projection Mapping | Week 34 | Mesh warp + edge blend |
+| M10: NDI Working | Week 37 | Receive/send NDI streams |
+| M11: v1.0 Release | Week 40 | Production-ready |
 
 ---
 
-## 9. References
+## 10. References
 
 - [wgpu Documentation](https://wgpu.rs/)
 - [NDI SDK](https://ndi.video/for-developers/ndi-sdk/)

@@ -5,6 +5,7 @@
 
 pub mod app;
 pub mod compositor;
+pub mod converter;
 pub mod layer_runtime;
 pub mod settings;
 pub mod shaders;
