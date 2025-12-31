@@ -1,7 +1,7 @@
-//! OMT (Open Media Transport) integration via Aqueduct.
+//! OMT (Open Media Transport) integration via official libOMT.
 //!
-//! Aqueduct is a Rust-native implementation of the OMT protocol,
-//! providing low-latency video, audio, and metadata streaming over IP.
+//! This module provides OMT sending/receiving using the official libOMT C library
+//! from IntoPix, ensuring compatibility with OBS and other OMT-enabled applications.
 //!
 //! # Architecture
 //!
@@ -16,19 +16,14 @@
 //! ┌─────────────────────────────────────────────────────────────┐
 //! │                     OmtSender                                │
 //! │  • Captures compositor output                               │
-//! │  • Encodes and transmits via OMT                           │
-//! │  • Registers with mDNS discovery                            │
+//! │  • Encodes with VMX1 codec via libOMT                       │
+//! │  • Automatic mDNS discovery registration                    │
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
 
-use aqueduct::{
-    Discovery, Packet, PixelFormat, Receiver, QuicReceiver, Sender, VideoFrame,
-    AqueductError, FrameFlags,
-};
+use super::omt_ffi::LibOmtSender;
 use bytes::Bytes;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
 
 /// Video frame received from OMT stream.
 #[derive(Debug, Clone)]
@@ -43,16 +38,11 @@ pub struct OmtFrame {
     pub timestamp: Duration,
 }
 
-/// Internal receiver types
-pub enum OmtReceiverType {
-    Tcp(Receiver),
-    Quic(QuicReceiver),
-}
-
 /// OMT receiver for receiving video streams from network sources.
+///
+/// NOTE: Receiver functionality is not yet implemented with libOMT.
+/// This is a placeholder for future implementation.
 pub struct OmtReceiver {
-    /// Internal Aqueduct receiver
-    receiver: Option<OmtReceiverType>,
     /// Currently connected source address
     connected_source: Option<String>,
     /// Running flag
@@ -67,7 +57,6 @@ impl OmtReceiver {
     /// Create a new OMT receiver (not yet connected).
     pub fn new() -> Self {
         Self {
-            receiver: None,
             connected_source: None,
             running: false,
             frame_count: 0,
@@ -75,34 +64,13 @@ impl OmtReceiver {
         }
     }
 
-    /// Connect to an OMT source at the given address (host:port) using TCP.
-    pub async fn connect(&mut self, address: &str) -> Result<(), AqueductError> {
-        log::info!("OMT Receiver: Connecting to {} via TCP", address);
-        
-        let receiver = Receiver::connect(address).await?;
-        self.receiver = Some(OmtReceiverType::Tcp(receiver));
+    /// Connect to an OMT source at the given address.
+    ///
+    /// NOTE: Not yet implemented with libOMT.
+    pub async fn connect(&mut self, address: &str) -> Result<(), OmtError> {
+        log::warn!("OMT Receiver: libOMT receiver not yet implemented");
         self.connected_source = Some(address.to_string());
-        self.running = true;
-        self.frame_count = 0;
-        self.start_time = Some(Instant::now());
-        
-        log::info!("OMT Receiver: Connected successfully to {} via TCP", address);
-        Ok(())
-    }
-
-    /// Connect to an OMT source at the given address (host:port) using QUIC.
-    pub async fn connect_quic(&mut self, address: &str) -> Result<(), AqueductError> {
-        log::info!("OMT Receiver: Connecting to {} via QUIC", address);
-        
-        let receiver = QuicReceiver::connect(address).await?;
-        self.receiver = Some(OmtReceiverType::Quic(receiver));
-        self.connected_source = Some(address.to_string());
-        self.running = true;
-        self.frame_count = 0;
-        self.start_time = Some(Instant::now());
-        
-        log::info!("OMT Receiver: Connected successfully to {} via QUIC", address);
-        Ok(())
+        Err(OmtError::NotImplemented)
     }
 
     /// Disconnect from the current source.
@@ -110,14 +78,13 @@ impl OmtReceiver {
         if self.connected_source.is_some() {
             log::info!("OMT Receiver: Disconnecting from {:?}", self.connected_source);
         }
-        self.receiver = None;
         self.connected_source = None;
         self.running = false;
     }
 
     /// Check if connected to a source.
     pub fn is_connected(&self) -> bool {
-        self.receiver.is_some() && self.running
+        self.running
     }
 
     /// Get the currently connected source address.
@@ -126,55 +93,9 @@ impl OmtReceiver {
     }
 
     /// Receive the next video frame from the stream.
-    ///
-    /// Returns `None` if not connected or on error.
     pub async fn receive_frame(&mut self) -> Option<OmtFrame> {
-        let receiver_type = self.receiver.as_mut()?;
-        
-        loop {
-            let result = match receiver_type {
-                OmtReceiverType::Tcp(r) => r.receive().await,
-                OmtReceiverType::Quic(r) => r.receive().await,
-            };
-
-            match result {
-                Ok(Packet::Video(frame)) => {
-                    self.frame_count += 1;
-                    
-                    // Convert BGRA or handle other formats
-                    let data = if frame.format == PixelFormat::BGRA {
-                        frame.data
-                    } else {
-                        log::warn!(
-                            "OMT Receiver: Unsupported pixel format {:?}, skipping frame",
-                            frame.format
-                        );
-                        continue;
-                    };
-                    
-                    return Some(OmtFrame {
-                        width: frame.width,
-                        height: frame.height,
-                        data,
-                        timestamp: frame.timestamp,
-                    });
-                }
-                Ok(Packet::Audio(_)) => {
-                    // Audio frames are received but not processed yet
-                    // Future: pipe to audio output
-                    continue;
-                }
-                Ok(Packet::Metadata(meta)) => {
-                    log::debug!("OMT Receiver: Metadata: {}", meta.content);
-                    continue;
-                }
-                Err(e) => {
-                    log::error!("OMT Receiver: Error receiving frame: {}", e);
-                    self.running = false;
-                    return None;
-                }
-            }
-        }
+        // Not implemented yet
+        None
     }
 
     /// Get the number of frames received.
@@ -200,14 +121,39 @@ impl Default for OmtReceiver {
     }
 }
 
+/// OMT error type.
+#[derive(Debug, Clone)]
+pub enum OmtError {
+    /// Failed to create sender/receiver
+    Creation(String),
+    /// Failed to send frame
+    Send(String),
+    /// Feature not yet implemented
+    NotImplemented,
+    /// I/O error
+    Io(String),
+}
+
+impl std::fmt::Display for OmtError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OmtError::Creation(msg) => write!(f, "OMT creation error: {}", msg),
+            OmtError::Send(msg) => write!(f, "OMT send error: {}", msg),
+            OmtError::NotImplemented => write!(f, "OMT feature not implemented"),
+            OmtError::Io(msg) => write!(f, "IO Error: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for OmtError {}
+
 /// OMT sender for transmitting video streams to the network.
+///
+/// Uses the official libOMT library for OBS compatibility.
+/// The sender automatically registers with mDNS discovery.
 pub struct OmtSender {
-    /// Internal Aqueduct sender
-    sender: Option<Arc<Mutex<Sender>>>,
-    /// Discovery service for mDNS registration
-    discovery: Option<Discovery>,
-    /// Port number
-    port: u16,
+    /// libOMT sender wrapper
+    sender: Option<LibOmtSender>,
     /// Stream name
     name: String,
     /// Running flag
@@ -216,70 +162,63 @@ pub struct OmtSender {
     frame_count: u64,
     /// Start time
     start_time: Option<Instant>,
-    /// Tokio runtime handle
-    runtime: Option<tokio::runtime::Handle>,
+    /// Frame rate (for frame metadata)
+    frame_rate: u32,
 }
 
+// OmtSender uses LibOmtSender which is Send
+unsafe impl Send for OmtSender {}
+
 impl OmtSender {
-    /// Create a new OMT sender with the given name and port.
-    pub fn new(name: String, port: u16) -> Self {
+    /// Create a new OMT sender with the given name.
+    ///
+    /// Note: The port parameter is ignored - libOMT uses auto port allocation
+    /// in the range 6400-6600 (configurable via settings).
+    pub fn new(name: String, _port: u16) -> Self {
         Self {
             sender: None,
-            discovery: None,
-            port,
             name,
             running: false,
             frame_count: 0,
             start_time: None,
-            runtime: tokio::runtime::Handle::try_current().ok(),
+            frame_rate: 60,
         }
     }
 
-    /// Start the OMT sender and register with discovery.
-    pub async fn start(&mut self) -> Result<(), AqueductError> {
+    /// Start the OMT sender.
+    ///
+    /// libOMT handles mDNS registration automatically.
+    pub async fn start(&mut self) -> Result<(), OmtError> {
         if self.sender.is_some() {
             return Ok(()); // Already started
         }
 
-        log::info!("OMT Sender: Starting on port {} as '{}'", self.port, self.name);
+        log::info!("libOMT Sender: Starting as '{}'", self.name);
 
-        // Create sender
-        let sender = Sender::new(self.port).await?;
-        self.sender = Some(Arc::new(Mutex::new(sender)));
-
-        // Register with mDNS discovery
-        match Discovery::new() {
-            Ok(discovery) => {
-                if let Err(e) = discovery.register_source(
-                    &hostname::get().unwrap_or_default().to_string_lossy(),
-                    &self.name,
-                    self.port,
-                ) {
-                    log::warn!("OMT Sender: Failed to register with discovery: {}", e);
-                } else {
-                    log::info!("OMT Sender: Registered with mDNS discovery");
+        match LibOmtSender::new(&self.name) {
+            Ok(sender) => {
+                if let Some(addr) = sender.get_address() {
+                    log::info!("libOMT Sender: Registered as '{}'", addr);
                 }
-                self.discovery = Some(discovery);
+                self.sender = Some(sender);
+                self.running = true;
+                self.frame_count = 0;
+                self.start_time = Some(Instant::now());
+                log::info!("libOMT Sender: Started successfully");
+                Ok(())
             }
             Err(e) => {
-                log::warn!("OMT Sender: Discovery service unavailable: {}", e);
+                log::error!("libOMT Sender: Failed to create: {}", e);
+                Err(OmtError::Creation(e))
             }
         }
-
-        self.running = true;
-        self.frame_count = 0;
-        self.start_time = Some(Instant::now());
-
-        log::info!("OMT Sender: Started successfully");
-        Ok(())
     }
 
     /// Stop the OMT sender.
     pub fn stop(&mut self) {
         if self.sender.is_some() {
-            log::info!("OMT Sender: Stopping");
+            log::info!("libOMT Sender: Stopping");
             self.sender = None;
-            self.discovery = None;
             self.running = false;
         }
     }
@@ -289,9 +228,9 @@ impl OmtSender {
         self.running && self.sender.is_some()
     }
 
-    /// Get the port number.
+    /// Get the port number (returns 0 since libOMT handles port allocation).
     pub fn port(&self) -> u16 {
-        self.port
+        0 // libOMT handles port allocation internally
     }
 
     /// Get the stream name.
@@ -299,7 +238,7 @@ impl OmtSender {
         &self.name
     }
 
-    /// Send a video frame.
+    /// Send a video frame synchronously.
     ///
     /// The data should be in BGRA format with dimensions width × height.
     pub fn send_frame(
@@ -307,78 +246,50 @@ impl OmtSender {
         width: u32,
         height: u32,
         data: &[u8],
-    ) -> Result<(), AqueductError> {
-        let sender = self.sender.as_ref().ok_or_else(|| {
-            AqueductError::Protocol("Sender not started".to_string())
+    ) -> Result<(), OmtError> {
+        let sender = self.sender.as_mut().ok_or_else(|| {
+            OmtError::Send("Sender not started".to_string())
         })?;
 
-        let timestamp = self.start_time
-            .map(|s| s.elapsed())
-            .unwrap_or(Duration::ZERO);
-
-        let frame = VideoFrame {
-            width,
-            height,
-            format: PixelFormat::BGRA,
-            flags: FrameFlags::default(),
-            timestamp,
-            data: Bytes::copy_from_slice(data),
-        };
-
-        // Send via runtime (blocking from sync context)
-        if let Some(rt) = &self.runtime {
-            rt.block_on(async {
-                let sender_lock = sender.lock().await;
-                sender_lock.send(Packet::Video(frame))
-            })?;
-        } else {
-            return Err(AqueductError::Protocol("No tokio runtime available".to_string()));
-        }
+        sender.send_frame(width, height, self.frame_rate, data)
+            .map_err(OmtError::Send)?;
 
         self.frame_count += 1;
         Ok(())
     }
 
     /// Send a video frame asynchronously.
+    ///
+    /// Note: libOMT send is synchronous, but we keep the async signature
+    /// for API compatibility.
     pub async fn send_frame_async(
         &mut self,
         width: u32,
         height: u32,
         data: Bytes,
-    ) -> Result<(), AqueductError> {
-        let sender = self.sender.as_ref().ok_or_else(|| {
-            AqueductError::Protocol("Sender not started".to_string())
-        })?;
-
-        let timestamp = self.start_time
-            .map(|s| s.elapsed())
-            .unwrap_or(Duration::ZERO);
-
-        let frame = VideoFrame {
-            width,
-            height,
-            format: PixelFormat::BGRA,
-            flags: FrameFlags::default(),
-            timestamp,
-            data,
-        };
-
-        let sender_lock = sender.lock().await;
-        sender_lock.send(Packet::Video(frame))?;
-
-        self.frame_count += 1;
-        Ok(())
+    ) -> Result<(), OmtError> {
+        self.send_frame(width, height, &data)
     }
 
     /// Get the number of frames sent.
     pub fn frame_count(&self) -> u64 {
         self.frame_count
     }
+
+    /// Get the number of connected receivers.
+    pub fn connection_count(&self) -> i32 {
+        self.sender.as_ref().map(|s| s.connection_count()).unwrap_or(0)
+    }
+
+    /// Set the frame rate for outgoing frames.
+    pub fn set_frame_rate(&mut self, fps: u32) {
+        self.frame_rate = fps;
+    }
 }
 
 impl Default for OmtSender {
     fn default() -> Self {
-        Self::new("Immersive Server".to_string(), 9000)
+        Self::new("Immersive Server".to_string(), 0)
     }
 }
 
@@ -398,8 +309,12 @@ mod tests {
     fn test_omt_sender_new() {
         let sender = OmtSender::new("Test".to_string(), 9001);
         assert!(!sender.is_running());
-        assert_eq!(sender.port(), 9001);
         assert_eq!(sender.name(), "Test");
     }
-}
 
+    #[test]
+    fn test_omt_error_display() {
+        let err = OmtError::Creation("test".to_string());
+        assert!(err.to_string().contains("creation"));
+    }
+}

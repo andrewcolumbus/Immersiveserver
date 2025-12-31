@@ -5,15 +5,19 @@
 # Point to FFmpeg 7 installation (required for ffmpeg-next crate)
 PKG_CONFIG_PATH = { value = "/opt/homebrew/opt/ffmpeg@7/lib/pkgconfig", force = true }
 FFMPEG_DIR = "/opt/homebrew/opt/ffmpeg@7"
+# libOMT runtime library path
+DYLD_LIBRARY_PATH = "/Users/andrewcolumbus/Documents/Code/Immersiveserver/external_libraries/OpenMediaTransport.Binaries.Release.v1.0.0.13/Libraries/MacOS"
 
 [target.aarch64-apple-darwin]
 rustflags = [
     "-L", "/opt/homebrew/opt/ffmpeg@7/lib",
+    "-L", "/Users/andrewcolumbus/Documents/Code/Immersiveserver/external_libraries/OpenMediaTransport.Binaries.Release.v1.0.0.13/Libraries/MacOS",
 ]
 
 [target.x86_64-apple-darwin]
 rustflags = [
     "-L", "/opt/homebrew/opt/ffmpeg@7/lib",
+    "-L", "/Users/andrewcolumbus/Documents/Code/Immersiveserver/external_libraries/OpenMediaTransport.Binaries.Release.v1.0.0.13/Libraries/MacOS",
 ]
 
 

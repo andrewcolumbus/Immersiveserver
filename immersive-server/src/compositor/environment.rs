@@ -85,6 +85,16 @@ impl Environment {
         &self.texture_view
     }
 
+    /// Get the environment texture (for copying to staging buffers).
+    pub fn texture(&self) -> &wgpu::Texture {
+        &self.texture
+    }
+
+    /// Get the texture format.
+    pub fn format(&self) -> wgpu::TextureFormat {
+        self.format
+    }
+
     // ========== Layer Management ==========
 
     /// Add a new layer with the given name.
@@ -211,7 +221,9 @@ impl Environment {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,  // For OMT output capture
             view_formats: &[],
         });
 

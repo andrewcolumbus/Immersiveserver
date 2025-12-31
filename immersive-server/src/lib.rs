@@ -7,14 +7,16 @@ pub mod app;
 pub mod compositor;
 pub mod converter;
 pub mod layer_runtime;
+pub mod network;
 pub mod settings;
 pub mod shaders;
 pub mod ui;
 pub mod video;
 
 pub use app::App;
-pub use compositor::{BlendMode, ClipCell, ClipTransition, DEFAULT_CLIP_SLOTS, Environment, Layer, LayerSource, Transform2D, Viewport};
+pub use compositor::{BlendMode, ClipCell, ClipSource, ClipTransition, DEFAULT_CLIP_SLOTS, Environment, Layer, LayerSource, Transform2D, Viewport};
 pub use layer_runtime::LayerRuntime;
 pub use settings::{AppPreferences, EnvironmentSettings};
 pub use video::{DecodedFrame, LayerParams, VideoDecoder, VideoDecoderError, VideoInfo, VideoParams, VideoPlayer, VideoRenderer, VideoTexture};
+pub use network::{DiscoveredSource, OmtFrame, OmtReceiver, OmtSender, SourceDiscovery, SourceType};
 

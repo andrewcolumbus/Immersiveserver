@@ -10,6 +10,26 @@ use std::path::PathBuf;
 
 use crate::compositor::Layer;
 
+/// Thumbnail display mode for clip grid cells
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ThumbnailMode {
+    /// Fit entire frame in cell (may show letterboxing)
+    #[default]
+    Fit,
+    /// Fill cell completely (crops to fit)
+    Fill,
+}
+
+impl ThumbnailMode {
+    /// Get display name for UI
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            ThumbnailMode::Fit => "Fit (show whole frame)",
+            ThumbnailMode::Fill => "Fill (crop to fit)",
+        }
+    }
+}
+
 /// Deserialize a usize from a string, treating empty strings as the default value
 fn deserialize_usize_or_default<'de, D>(deserializer: D) -> Result<usize, D::Error>
 where
@@ -62,6 +82,23 @@ pub struct EnvironmentSettings {
     /// Global clip count (number of columns in the clip grid)
     #[serde(rename = "clipColumns", default = "default_clip_columns", deserialize_with = "deserialize_usize_or_default")]
     pub global_clip_count: usize,
+
+    /// Whether OMT broadcast is enabled
+    #[serde(rename = "omtBroadcastEnabled", default)]
+    pub omt_broadcast_enabled: bool,
+
+    /// OMT capture frame rate (1-60, default 30)
+    #[serde(rename = "omtCaptureFps", default = "default_omt_capture_fps")]
+    pub omt_capture_fps: u32,
+
+    /// Thumbnail display mode (Fit or Fill)
+    #[serde(rename = "thumbnailMode", default)]
+    pub thumbnail_mode: ThumbnailMode,
+}
+
+/// Default OMT capture FPS
+fn default_omt_capture_fps() -> u32 {
+    30
 }
 
 /// Default number of clip columns
@@ -80,6 +117,9 @@ impl Default for EnvironmentSettings {
             window_height: 1080,
             layers: Vec::new(),
             global_clip_count: default_clip_columns(),
+            omt_broadcast_enabled: false,
+            omt_capture_fps: default_omt_capture_fps(),
+            thumbnail_mode: ThumbnailMode::default(),
         }
     }
 }

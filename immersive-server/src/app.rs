@@ -125,6 +125,12 @@ pub struct App {
     pub dock_manager: crate::ui::DockManager,
     /// Properties panel (Environment/Layer/Clip tabs)
     pub properties_panel: crate::ui::PropertiesPanel,
+    /// Sources panel for drag-and-drop of OMT/NDI sources
+    pub sources_panel: crate::ui::SourcesPanel,
+    /// File browser panel for drag-and-drop of video files
+    pub file_browser_panel: crate::ui::FileBrowserPanel,
+    /// Thumbnail cache for video previews in clip grid
+    pub thumbnail_cache: crate::ui::ThumbnailCache,
     /// HAP Converter window
     pub converter_window: crate::converter::ConverterWindow,
 
@@ -149,6 +155,20 @@ pub struct App {
     // Shader hot-reload
     /// Watches shader files for changes and triggers recompilation
     shader_watcher: Option<crate::shaders::ShaderWatcher>,
+
+    // OMT (Open Media Transport) networking
+    /// OMT source discovery service
+    omt_discovery: Option<crate::network::SourceDiscovery>,
+    /// OMT sender for broadcasting the environment
+    omt_sender: Option<crate::network::OmtSender>,
+    /// OMT capture for GPU texture readback
+    omt_capture: Option<crate::network::OmtCapture>,
+    /// Whether OMT sender is enabled (broadcasts environment)
+    omt_broadcast_enabled: bool,
+    /// Tokio runtime for async OMT operations
+    tokio_runtime: Option<tokio::runtime::Runtime>,
+    /// Pending OMT sender from background start (received when ready)
+    pending_omt_sender: Option<std::sync::mpsc::Receiver<Result<crate::network::OmtSender, String>>>,
 }
 
 impl App {
@@ -395,9 +415,22 @@ impl App {
                     "Properties",
                     crate::ui::DockZone::Left,
                 ));
+                dm.register_panel(crate::ui::DockablePanel::new(
+                    crate::ui::dock::panel_ids::SOURCES,
+                    "Sources",
+                    crate::ui::DockZone::Left,
+                ));
+                dm.register_panel(crate::ui::DockablePanel::new(
+                    crate::ui::dock::panel_ids::FILES,
+                    "Files",
+                    crate::ui::DockZone::Left,
+                ));
                 dm
             },
             properties_panel: crate::ui::PropertiesPanel::new(),
+            sources_panel: crate::ui::SourcesPanel::new(),
+            file_browser_panel: crate::ui::FileBrowserPanel::new(),
+            thumbnail_cache: crate::ui::ThumbnailCache::new(),
             converter_window: crate::converter::ConverterWindow::new(),
             settings,
             current_file: None,
@@ -407,6 +440,51 @@ impl App {
             pending_transition: HashMap::new(),
             last_upload_layer: 0,
             shader_watcher,
+
+            // Initialize OMT networking
+            omt_discovery: Self::create_omt_discovery(),
+            omt_sender: None,
+            omt_capture: None,
+            omt_broadcast_enabled: false, // Disabled by default - enable via menu
+            tokio_runtime: Self::create_tokio_runtime(),
+            pending_omt_sender: None,
+        }
+    }
+
+    /// Create the Tokio runtime for async OMT operations
+    fn create_tokio_runtime() -> Option<tokio::runtime::Runtime> {
+        match tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => {
+                log::info!("OMT: Tokio runtime initialized");
+                Some(rt)
+            }
+            Err(e) => {
+                log::warn!("OMT: Failed to create Tokio runtime: {}", e);
+                None
+            }
+        }
+    }
+
+    /// Create the OMT discovery service
+    fn create_omt_discovery() -> Option<crate::network::SourceDiscovery> {
+        match crate::network::SourceDiscovery::new() {
+            Ok(mut discovery) => {
+                // Start browsing for sources
+                if let Err(e) = discovery.start_browsing() {
+                    log::warn!("OMT: Failed to start source discovery: {}", e);
+                } else {
+                    log::info!("OMT: Source discovery started");
+                }
+                Some(discovery)
+            }
+            Err(e) => {
+                log::warn!("OMT: Discovery service unavailable: {}", e);
+                None
+            }
         }
     }
 
@@ -783,6 +861,11 @@ impl App {
             &self.copy_params_buffer,
         );
 
+        // Resize OMT capture buffers if broadcasting
+        if let Some(capture) = &mut self.omt_capture {
+            capture.resize(&self.device, desired_width, desired_height);
+        }
+
         self.update_present_params();
         self.update_checker_params();
         self.update_layer_params_for_environment();
@@ -849,10 +932,35 @@ impl App {
         }
     }
 
+    /// Sync OMT broadcast state from settings (after loading)
+    pub fn sync_omt_broadcast_from_settings(&mut self) {
+        let should_broadcast = self.settings.omt_broadcast_enabled;
+        let is_broadcasting = self.is_omt_broadcasting();
+
+        if should_broadcast && !is_broadcasting {
+            self.omt_broadcast_enabled = true;
+            self.start_omt_broadcast("Immersive Server", 5970);
+        } else if !should_broadcast && is_broadcasting {
+            self.omt_broadcast_enabled = false;
+            self.stop_omt_broadcast();
+        } else {
+            self.omt_broadcast_enabled = should_broadcast;
+        }
+    }
+
     /// Render a frame with egui UI
     pub fn render(&mut self) -> Result<bool, wgpu::SurfaceError> {
         // Poll for shader hot-reload (no-op in release builds)
         self.poll_shader_reload();
+
+        // Poll for pending OMT sender start
+        self.poll_pending_omt_sender();
+
+        // Poll for completed thumbnail generations
+        self.thumbnail_cache.poll(&self.egui_ctx);
+
+        // Sync thumbnail mode from settings (clears cache if changed)
+        self.thumbnail_cache.set_mode(self.settings.thumbnail_mode);
 
         // Begin egui frame
         let raw_input = self.egui_state.take_egui_input(&self.window);
@@ -878,6 +986,18 @@ impl App {
                 crate::ui::dock::panel_ids::CLIP_GRID,
                 "Clip Grid",
                 self.dock_manager.get_panel(crate::ui::dock::panel_ids::CLIP_GRID)
+                    .map(|p| p.open).unwrap_or(false),
+            ),
+            (
+                crate::ui::dock::panel_ids::SOURCES,
+                "Sources",
+                self.dock_manager.get_panel(crate::ui::dock::panel_ids::SOURCES)
+                    .map(|p| p.open).unwrap_or(false),
+            ),
+            (
+                crate::ui::dock::panel_ids::FILES,
+                "Files",
+                self.dock_manager.get_panel(crate::ui::dock::panel_ids::FILES)
                     .map(|p| p.open).unwrap_or(false),
             ),
         ];
@@ -912,7 +1032,8 @@ impl App {
         
         // Get layer list for property panels
         let layers: Vec<_> = self.environment.layers().to_vec();
-        
+        let omt_broadcasting = self.is_omt_broadcasting();
+
         // Render properties panel (left panel or floating)
         let prop_actions = if let Some(panel) = self.dock_manager.get_panel(crate::ui::dock::panel_ids::PROPERTIES) {
             if panel.open {
@@ -942,7 +1063,7 @@ impl App {
                                     });
                                 });
                                 ui.separator();
-                                actions = self.properties_panel.render(ui, &self.environment, &layers, &self.settings);
+                                actions = self.properties_panel.render(ui, &self.environment, &layers, &self.settings, omt_broadcasting);
                             });
                         actions
                     }
@@ -981,7 +1102,7 @@ impl App {
                                     });
                                 });
                                 ui.separator();
-                                actions = self.properties_panel.render(ui, &self.environment, &layers, &self.settings);
+                                actions = self.properties_panel.render(ui, &self.environment, &layers, &self.settings, omt_broadcasting);
                             });
                         
                         // Track window dragging for dock zone snapping
@@ -1059,7 +1180,7 @@ impl App {
                                     });
                                 });
                                 ui.separator();
-                                actions = self.clip_grid_panel.render_contents(ui, &layers);
+                                actions = self.clip_grid_panel.render_contents(ui, &layers, &mut self.thumbnail_cache);
                             });
                         actions
                     }
@@ -1098,9 +1219,9 @@ impl App {
                                     });
                                 });
                                 ui.separator();
-                                actions = self.clip_grid_panel.render_contents(ui, &layers);
+                                actions = self.clip_grid_panel.render_contents(ui, &layers, &mut self.thumbnail_cache);
                             });
-                        
+
                         // Track window dragging for dock zone snapping
                         if let Some(resp) = &window_response {
                             if resp.response.drag_started() {
@@ -1132,7 +1253,7 @@ impl App {
                     }
                     _ => {
                         // For other zones, render in default position
-                        self.clip_grid_panel.render(&self.egui_ctx, &layers)
+                        self.clip_grid_panel.render(&self.egui_ctx, &layers, &mut self.thumbnail_cache)
                     }
                 }
             } else {
@@ -1140,8 +1261,88 @@ impl App {
             }
         } else {
             // Fallback if dock manager doesn't have panel registered yet
-            self.clip_grid_panel.render(&self.egui_ctx, &layers)
+            self.clip_grid_panel.render(&self.egui_ctx, &layers, &mut self.thumbnail_cache)
         };
+
+        // Render sources panel (floating window for now)
+        let sources_actions = if let Some(panel) = self.dock_manager.get_panel(crate::ui::dock::panel_ids::SOURCES) {
+            if panel.open {
+                let floating_pos = panel.floating_pos;
+                let floating_size = panel.floating_size;
+                let mut actions = Vec::new();
+                let pos = floating_pos.unwrap_or((100.0, 300.0));
+                let size = floating_size.unwrap_or((250.0, 300.0));
+                let mut open = true;
+                
+                let window_response = egui::Window::new("Sources")
+                    .id(egui::Id::new("sources_window"))
+                    .default_pos(egui::pos2(pos.0, pos.1))
+                    .default_size(egui::vec2(size.0, size.1))
+                    .resizable(true)
+                    .collapsible(true)
+                    .open(&mut open)
+                    .show(&self.egui_ctx, |ui| {
+                        actions = self.sources_panel.render_contents(ui);
+                    });
+                
+                // Update window position for persistence
+                if let Some(resp) = &window_response {
+                    let rect = resp.response.rect;
+                    if let Some(p) = self.dock_manager.get_panel_mut(crate::ui::dock::panel_ids::SOURCES) {
+                        p.floating_pos = Some((rect.left(), rect.top()));
+                        p.floating_size = Some((rect.width(), rect.height()));
+                    }
+                }
+                
+                if !open {
+                    if let Some(p) = self.dock_manager.get_panel_mut(crate::ui::dock::panel_ids::SOURCES) {
+                        p.open = false;
+                    }
+                }
+                actions
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
+        // Render file browser panel (floating window)
+        if let Some(panel) = self.dock_manager.get_panel(crate::ui::dock::panel_ids::FILES) {
+            if panel.open {
+                let floating_pos = panel.floating_pos;
+                let floating_size = panel.floating_size;
+                let pos = floating_pos.unwrap_or((350.0, 100.0));
+                let size = floating_size.unwrap_or((280.0, 400.0));
+                let mut open = true;
+
+                let window_response = egui::Window::new("Files")
+                    .id(egui::Id::new("files_window"))
+                    .default_pos(egui::pos2(pos.0, pos.1))
+                    .default_size(egui::vec2(size.0, size.1))
+                    .resizable(true)
+                    .collapsible(true)
+                    .open(&mut open)
+                    .show(&self.egui_ctx, |ui| {
+                        self.file_browser_panel.render_contents(ui);
+                    });
+
+                // Update window position for persistence
+                if let Some(resp) = &window_response {
+                    let rect = resp.response.rect;
+                    if let Some(p) = self.dock_manager.get_panel_mut(crate::ui::dock::panel_ids::FILES) {
+                        p.floating_pos = Some((rect.left(), rect.top()));
+                        p.floating_size = Some((rect.width(), rect.height()));
+                    }
+                }
+
+                if !open {
+                    if let Some(p) = self.dock_manager.get_panel_mut(crate::ui::dock::panel_ids::FILES) {
+                        p.open = false;
+                    }
+                }
+            }
+        }
 
         // Apply environment resolution changes (if any) before rendering.
         self.sync_environment_from_settings();
@@ -1151,6 +1352,11 @@ impl App {
         // Process clip grid actions (after egui pass ends)
         for action in clip_actions {
             self.handle_clip_action(action);
+        }
+        
+        // Process sources panel actions
+        for action in sources_actions {
+            self.handle_sources_action(action);
         }
 
         self.egui_state
@@ -1274,6 +1480,13 @@ impl App {
             }
         }
 
+        // Capture environment texture for OMT output (before we move on to present)
+        if self.omt_broadcast_enabled {
+            if let Some(capture) = &mut self.omt_capture {
+                capture.capture_frame(&mut encoder, self.environment.texture());
+            }
+        }
+
         // Update egui textures
         for (id, image_delta) in &full_output.textures_delta.set {
             self.egui_renderer
@@ -1336,6 +1549,13 @@ impl App {
 
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
+
+        // Process OMT capture pipeline (non-blocking)
+        if self.omt_broadcast_enabled {
+            if let Some(capture) = &mut self.omt_capture {
+                capture.process(&self.device);
+            }
+        }
 
         Ok(settings_changed)
     }
@@ -1767,49 +1987,57 @@ impl App {
     /// Returns `Ok(())` if successful, or an error message if the clip
     /// couldn't be loaded.
     pub fn trigger_clip(&mut self, layer_id: u32, slot: usize) -> Result<(), String> {
-        // Get the clip path and layer transition
-        let (clip_path, transition) = {
+        // Get the clip source and layer transition
+        let (clip_source, transition) = {
             let layer = self.environment.get_layer(layer_id)
                 .ok_or_else(|| format!("Layer {} not found", layer_id))?;
-            
+
             let cell = layer.get_clip(slot)
                 .ok_or_else(|| format!("No clip at slot {}", slot))?;
-            
-            (cell.source_path.clone(), layer.transition)
+
+            (cell.source.clone(), layer.transition)
         };
 
-        // Check if this is a replay of the same clip (same path)
-        let is_same_clip = if let Some(runtime) = self.layer_runtimes.get(&layer_id) {
-            if let Some(player) = &runtime.player {
-                player.path() == clip_path.as_path()
-            } else {
-                false
+        // Handle different source types
+        match &clip_source {
+            crate::compositor::ClipSource::File { path } => {
+                // Check if this is a replay of the same clip (same path)
+                let is_same_clip = if let Some(runtime) = self.layer_runtimes.get(&layer_id) {
+                    if let Some(player) = &runtime.player {
+                        player.path() == path.as_path()
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+
+                if is_same_clip {
+                    // Same clip - just restart playback (no flash!)
+                    log::info!("🔄 Restarting clip {} on layer {}", slot, layer_id);
+                    self.restart_layer_video(layer_id);
+                } else {
+                    // Different clip - need to load it
+                    log::info!("🎬 Loading clip {} on layer {} with {:?} transition: {:?}",
+                        slot, layer_id, transition.name(), path.display());
+
+                    // Store the transition type for when the new clip is ready
+                    self.pending_transition.insert(layer_id, transition);
+
+                    self.load_layer_video(layer_id, path)?;
+                }
+
+                // Update the active clip slot in the layer
+                if let Some(layer) = self.environment.get_layer_mut(layer_id) {
+                    layer.active_clip = Some(slot);
+                    layer.source = crate::compositor::LayerSource::Video(path.clone());
+                }
             }
-        } else {
-            false
-        };
-
-        if is_same_clip {
-            // Same clip - just restart playback (no flash!)
-            log::info!("🔄 Restarting clip {} on layer {}", slot, layer_id);
-            self.restart_layer_video(layer_id);
-        } else {
-            // Different clip - need to load it
-            log::info!("🎬 Loading clip {} on layer {} with {:?} transition: {:?}", 
-                slot, layer_id, transition.name(), clip_path);
-            
-            // Store the transition type for when the new clip is ready
-            // Note: We don't take the old bind_group here - that happens in poll_video_frames
-            // when the new runtime is ready, to avoid a flash while the new clip loads
-            self.pending_transition.insert(layer_id, transition);
-            
-            self.load_layer_video(layer_id, &clip_path)?;
-        }
-
-        // Update the active clip slot in the layer
-        if let Some(layer) = self.environment.get_layer_mut(layer_id) {
-            layer.active_clip = Some(slot);
-            layer.source = crate::compositor::LayerSource::Video(clip_path);
+            crate::compositor::ClipSource::Omt { address, name } => {
+                // OMT source playback not yet implemented
+                log::warn!("📡 OMT playback not yet implemented: {} ({})", name, address);
+                return Err(format!("OMT playback not yet implemented. Source: {} ({})", name, address));
+            }
         }
 
         Ok(())
@@ -1898,6 +2126,192 @@ impl App {
             }
         }
         false
+    }
+
+    // =========================================================================
+    // OMT (Open Media Transport) Methods
+    // =========================================================================
+
+    /// Set an OMT source as a clip in a layer's clip slots
+    pub fn set_layer_omt_clip(
+        &mut self,
+        layer_id: u32,
+        slot: usize,
+        address: String,
+        name: String,
+    ) -> bool {
+        if let Some(layer) = self.environment.get_layer_mut(layer_id) {
+            let cell = crate::compositor::ClipCell::from_omt(&address, &name);
+            if layer.set_clip(slot, cell) {
+                log::info!(
+                    "📡 Assigned OMT source '{}' ({}) to layer {} slot {}",
+                    name, address, layer_id, slot
+                );
+                self.menu_bar.set_status(format!("Assigned OMT source: {}", name));
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Refresh the list of discovered OMT sources
+    pub fn refresh_omt_sources(&mut self) {
+        // Get sources from discovery service
+        let sources: Vec<(String, String, String)> = if let Some(discovery) = &self.omt_discovery {
+            discovery.get_sources()
+                .into_iter()
+                .map(|s| {
+                    let address = s.address(); // Call before moving name
+                    (s.id, s.name, address)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let count = sources.len();
+        self.sources_panel.set_omt_sources(sources);
+        log::info!("📡 OMT: Refreshed source list, found {} sources", count);
+        self.menu_bar.set_status(format!("Found {} OMT sources", count));
+    }
+
+    /// Update the UI with the current OMT sources (called periodically)
+    pub fn update_omt_sources_in_ui(&mut self) {
+        if let Some(discovery) = &self.omt_discovery {
+            let sources: Vec<(String, String, String)> = discovery.get_sources()
+                .into_iter()
+                .map(|s| {
+                    let address = s.address(); // Call before moving name
+                    (s.id, s.name, address)
+                })
+                .collect();
+            self.sources_panel.set_omt_sources(sources);
+        }
+    }
+
+    /// Start OMT broadcast of the environment
+    ///
+    /// This announces the server as an OMT source so other applications
+    /// can receive the environment's output. Non-blocking - spawns background thread.
+    pub fn start_omt_broadcast(&mut self, name: &str, port: u16) {
+        if self.omt_capture.is_some() || self.pending_omt_sender.is_some() {
+            log::info!("OMT: Broadcast already active or starting");
+            return;
+        }
+
+        if let Some(rt) = &self.tokio_runtime {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let name = name.to_string();
+            let runtime_handle = rt.handle().clone();
+
+            // Spawn background thread to start sender (avoids blocking UI)
+            std::thread::spawn(move || {
+                let mut sender = crate::network::OmtSender::new(name.clone(), port);
+                let result = runtime_handle.block_on(async {
+                    sender.start().await
+                });
+
+                match result {
+                    Ok(()) => {
+                        log::info!("📡 OMT: Started sender as '{}' on port {}", name, port);
+                        let _ = tx.send(Ok(sender));
+                    }
+                    Err(e) => {
+                        log::error!("OMT: Failed to start broadcast: {}", e);
+                        let _ = tx.send(Err(format!("{}", e)));
+                    }
+                }
+            });
+
+            self.pending_omt_sender = Some(rx);
+            self.menu_bar.set_status("Starting OMT broadcast...");
+        } else {
+            log::warn!("OMT: Cannot start broadcast - no Tokio runtime");
+        }
+    }
+
+    /// Poll for pending OMT sender and complete setup if ready.
+    /// Call this each frame from the render loop.
+    fn poll_pending_omt_sender(&mut self) {
+        let rx = match self.pending_omt_sender.take() {
+            Some(rx) => rx,
+            None => return,
+        };
+
+        match rx.try_recv() {
+            Ok(Ok(sender)) => {
+                // Sender is ready, create capture and start streaming
+                if let Some(rt) = &self.tokio_runtime {
+                    let w = self.environment.width();
+                    let h = self.environment.height();
+                    log::info!("📡 OMT: Creating capture pipeline for {}x{}", w, h);
+
+                    let mut capture = crate::network::OmtCapture::new(&self.device, w, h);
+                    capture.set_target_fps(self.settings.omt_capture_fps);
+                    capture.start_sender_thread(sender, rt.handle().clone());
+                    self.omt_capture = Some(capture);
+                    self.omt_broadcast_enabled = true;
+                    self.menu_bar.set_status(format!("OMT broadcast started ({}x{})", w, h));
+                    log::info!("📡 OMT: Capture pipeline started, broadcasting {}x{} on port 5970", w, h);
+                }
+            }
+            Ok(Err(e)) => {
+                // Sender failed to start
+                self.omt_broadcast_enabled = false;
+                self.settings.omt_broadcast_enabled = false;
+                self.menu_bar.set_status(format!("OMT broadcast failed: {}", e));
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                // Still waiting, put the receiver back
+                self.pending_omt_sender = Some(rx);
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                // Thread crashed or was dropped
+                self.omt_broadcast_enabled = false;
+                self.settings.omt_broadcast_enabled = false;
+                self.menu_bar.set_status("OMT broadcast failed");
+            }
+        }
+    }
+
+    /// Stop OMT broadcast
+    pub fn stop_omt_broadcast(&mut self) {
+        if self.omt_capture.is_some() {
+            // Drop capture - this stops the sender thread
+            self.omt_capture = None;
+            self.omt_sender = None;
+            self.omt_broadcast_enabled = false;
+            log::info!("📡 OMT: Stopped broadcast");
+            self.menu_bar.set_status("OMT broadcast stopped");
+        }
+    }
+
+    /// Check if OMT broadcast is active
+    pub fn is_omt_broadcasting(&self) -> bool {
+        self.omt_capture.as_ref().map(|c| c.is_sender_running()).unwrap_or(false)
+    }
+
+    /// Check if OMT broadcast is starting (pending)
+    pub fn is_omt_starting(&self) -> bool {
+        self.pending_omt_sender.is_some()
+    }
+
+    /// Get the number of discovered OMT sources
+    pub fn omt_source_count(&self) -> usize {
+        self.omt_discovery.as_ref().map(|d| d.source_count()).unwrap_or(0)
+    }
+
+    /// Initialize default OMT broadcast of the environment
+    ///
+    /// Call this after App is created to start broadcasting the environment
+    /// as an OMT source on the network (default port 9000).
+    pub fn init_omt_broadcast(&mut self) {
+        if self.omt_broadcast_enabled && self.omt_sender.is_none() {
+            let w = self.environment.width();
+            let h = self.environment.height();
+            let name = format!("Immersive Server ({}×{})", w, h);
+            self.start_omt_broadcast(&name, 9000);
+        }
     }
 
     /// Copy a clip to the clipboard
@@ -2095,6 +2509,10 @@ impl App {
                     p.open = true;
                 }
             }
+            ClipGridAction::AssignOmtSource { layer_id, slot, address, name } => {
+                // Assign an OMT source to a clip slot
+                self.set_layer_omt_clip(layer_id, slot, address, name);
+            }
         }
     }
 
@@ -2153,6 +2571,36 @@ impl App {
             }
             PropertiesAction::SetLayerTransition { layer_id, transition } => {
                 self.set_layer_transition(layer_id, transition);
+            }
+            PropertiesAction::SetOmtBroadcast { enabled } => {
+                self.settings.omt_broadcast_enabled = enabled;
+                self.omt_broadcast_enabled = enabled;
+                if enabled {
+                    self.start_omt_broadcast("Immersive Server", 5970);
+                } else {
+                    self.stop_omt_broadcast();
+                }
+            }
+            PropertiesAction::SetOmtCaptureFps { fps } => {
+                self.settings.omt_capture_fps = fps;
+                if let Some(ref mut capture) = self.omt_capture {
+                    capture.set_target_fps(fps);
+                }
+            }
+            PropertiesAction::SetThumbnailMode { mode } => {
+                self.settings.thumbnail_mode = mode;
+                // Cache will be automatically cleared on next poll via set_mode()
+            }
+        }
+    }
+
+    /// Handle a sources panel action from the UI
+    fn handle_sources_action(&mut self, action: crate::ui::SourcesAction) {
+        use crate::ui::SourcesAction;
+
+        match action {
+            SourcesAction::RefreshOmtSources => {
+                self.refresh_omt_sources();
             }
         }
     }

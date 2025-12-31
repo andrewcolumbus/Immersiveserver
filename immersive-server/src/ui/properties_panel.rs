@@ -4,7 +4,7 @@
 //! Includes transform controls, tiling (multiplexing), and other settings.
 
 use crate::compositor::{BlendMode, ClipTransition, Environment, Layer};
-use crate::settings::EnvironmentSettings;
+use crate::settings::{EnvironmentSettings, ThumbnailMode};
 
 /// Which tab is currently active in the properties panel
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -43,6 +43,12 @@ pub enum PropertiesAction {
     SetLayerTiling { layer_id: u32, tile_x: u32, tile_y: u32 },
     /// Layer transition changed
     SetLayerTransition { layer_id: u32, transition: ClipTransition },
+    /// OMT broadcast toggle changed
+    SetOmtBroadcast { enabled: bool },
+    /// OMT capture FPS changed
+    SetOmtCaptureFps { fps: u32 },
+    /// Thumbnail mode changed
+    SetThumbnailMode { mode: ThumbnailMode },
 }
 
 /// Properties panel state
@@ -105,6 +111,7 @@ impl PropertiesPanel {
         environment: &Environment,
         layers: &[Layer],
         settings: &EnvironmentSettings,
+        omt_broadcasting: bool,
     ) -> Vec<PropertiesAction> {
         let mut actions = Vec::new();
 
@@ -138,7 +145,7 @@ impl PropertiesPanel {
             .show(ui, |ui| {
                 match self.active_tab {
                     PropertiesTab::Environment => {
-                        self.render_environment_tab(ui, environment, settings, &mut actions);
+                        self.render_environment_tab(ui, environment, settings, omt_broadcasting, &mut actions);
                     }
                     PropertiesTab::Layer => {
                         self.render_layer_tab(ui, layers, &mut actions);
@@ -158,6 +165,7 @@ impl PropertiesPanel {
         ui: &mut egui::Ui,
         environment: &Environment,
         settings: &EnvironmentSettings,
+        omt_broadcasting: bool,
         actions: &mut Vec<PropertiesAction>,
     ) {
         ui.heading("Environment");
@@ -350,6 +358,63 @@ impl PropertiesPanel {
         ui.add_space(16.0);
         ui.separator();
 
+        // Clip Grid section
+        ui.add_space(8.0);
+        ui.heading("Clip Grid");
+        ui.add_space(4.0);
+
+        ui.horizontal(|ui| {
+            ui.label("Thumbnail Mode:");
+            let mut current_mode = settings.thumbnail_mode;
+            egui::ComboBox::from_id_salt("thumbnail_mode")
+                .selected_text(current_mode.display_name())
+                .show_ui(ui, |ui| {
+                    if ui.selectable_value(&mut current_mode, ThumbnailMode::Fit, ThumbnailMode::Fit.display_name()).changed() {
+                        actions.push(PropertiesAction::SetThumbnailMode { mode: ThumbnailMode::Fit });
+                    }
+                    if ui.selectable_value(&mut current_mode, ThumbnailMode::Fill, ThumbnailMode::Fill.display_name()).changed() {
+                        actions.push(PropertiesAction::SetThumbnailMode { mode: ThumbnailMode::Fill });
+                    }
+                });
+        });
+
+        ui.add_space(16.0);
+        ui.separator();
+
+        // OMT Broadcast section
+        ui.add_space(8.0);
+        ui.heading("OMT Broadcast");
+        ui.add_space(4.0);
+
+        let mut broadcast_enabled = settings.omt_broadcast_enabled;
+        if ui.checkbox(&mut broadcast_enabled, "Broadcast Output via OMT").changed() {
+            actions.push(PropertiesAction::SetOmtBroadcast { enabled: broadcast_enabled });
+        }
+
+        if omt_broadcasting {
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new("Broadcasting...")
+                    .small()
+                    .color(egui::Color32::GREEN),
+            );
+        }
+
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.label("Capture FPS:");
+            let mut fps = settings.omt_capture_fps;
+            let slider = egui::Slider::new(&mut fps, 10..=60)
+                .suffix(" fps")
+                .clamping(egui::SliderClamping::Always);
+            if ui.add(slider).changed() {
+                actions.push(PropertiesAction::SetOmtCaptureFps { fps });
+            }
+        });
+
+        ui.add_space(16.0);
+        ui.separator();
+
         // Layer count info
         ui.add_space(8.0);
         ui.label(format!("Layers: {}", environment.layer_count()));
@@ -529,8 +594,31 @@ impl PropertiesPanel {
         // Scale
         let mut scale_x = layer.transform.scale.0 * 100.0;
         let mut scale_y = layer.transform.scale.1 * 100.0;
+        let mut uniform_scale = scale_x; // Use X as the uniform value
         ui.horizontal(|ui| {
             ui.label("Scale:");
+            // Uniform scale (controls both X and Y)
+            let response_uniform = ui.add(
+                egui::DragValue::new(&mut uniform_scale)
+                    .speed(1.0)
+                    .suffix("%")
+                    .range(1.0..=1000.0),
+            );
+            if response_uniform.changed() {
+                actions.push(PropertiesAction::SetLayerScale {
+                    layer_id,
+                    scale_x: uniform_scale / 100.0,
+                    scale_y: uniform_scale / 100.0,
+                });
+            }
+            response_uniform.context_menu(|ui| {
+                if ui.button("Reset to 100%").clicked() {
+                    actions.push(PropertiesAction::SetLayerScale { layer_id, scale_x: 1.0, scale_y: 1.0 });
+                    ui.close_menu();
+                }
+            });
+            ui.add_space(8.0);
+            // Independent X scale
             let response_x = ui.add(
                 egui::DragValue::new(&mut scale_x)
                     .speed(1.0)
@@ -555,6 +643,7 @@ impl PropertiesPanel {
                 }
             });
             ui.label("×");
+            // Independent Y scale
             let response_y = ui.add(
                 egui::DragValue::new(&mut scale_y)
                     .speed(1.0)

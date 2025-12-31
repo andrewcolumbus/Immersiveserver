@@ -307,7 +307,13 @@ impl ApplicationHandler for ImmersiveApp {
                 app.restore_layers_from_settings();
             }
 
+            // Sync OMT broadcast state from settings
+            app.sync_omt_broadcast_from_settings();
+
             let preferences = AppPreferences::load();
+            
+            // Refresh OMT source list for UI
+            app.refresh_omt_sources();
 
             log::info!("Immersive Server ready!");
             log::info!("Press ESC to exit, F11 for fullscreen");
@@ -510,6 +516,7 @@ impl ApplicationHandler for ImmersiveApp {
                                         app.settings = settings;
                                         app.current_file = Some(path.clone());
                                         app.restore_layers_from_settings();
+                                        app.sync_omt_broadcast_from_settings();
                                         preferences.set_last_opened(&path);
                                         app.menu_bar.set_status(format!(
                                             "Opened: {}",

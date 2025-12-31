@@ -21,6 +21,8 @@ pub enum VideoDecoderError {
     ScalerCreationFailed(String),
     /// Decoding error
     DecodeFailed(String),
+    /// Reached end of file unexpectedly
+    EndOfFile,
     /// FFmpeg error
     Ffmpeg(ffmpeg_next::Error),
 }
@@ -37,6 +39,7 @@ impl std::fmt::Display for VideoDecoderError {
                 write!(f, "Failed to create scaler: {}", msg)
             }
             VideoDecoderError::DecodeFailed(msg) => write!(f, "Decoding failed: {}", msg),
+            VideoDecoderError::EndOfFile => write!(f, "Reached end of file"),
             VideoDecoderError::Ffmpeg(e) => write!(f, "FFmpeg error: {}", e),
         }
     }
@@ -532,6 +535,44 @@ impl VideoDecoder {
         self.frame_index = 0;
         self.eof = false;
         Ok(())
+    }
+
+    /// Seek to a specific timestamp in seconds and decode one frame
+    ///
+    /// This is useful for generating thumbnails - seek to the middle of
+    /// the video and grab a single frame.
+    ///
+    /// NOTE: For HAP videos, this returns DXT compressed data (is_gpu_native=true).
+    /// Use `seek_and_decode_frame_rgba` if you need raw RGBA pixels.
+    pub fn seek_and_decode_frame(&mut self, timestamp_secs: f64) -> Result<DecodedFrame, VideoDecoderError> {
+        // Convert seconds to stream timestamp units
+        // timestamp = seconds / time_base
+        let timestamp = (timestamp_secs / self.time_base) as i64;
+
+        // Seek to the timestamp (seeks to nearest keyframe before)
+        self.input.seek(timestamp, ..timestamp)?;
+        self.decoder.flush();
+        self.eof = false;
+
+        // Decode frames until we get one at or after our target
+        // (seek goes to keyframe, may need to decode a few frames)
+        self.decode_next_frame()?
+            .ok_or(VideoDecoderError::DecodeFailed("No frame available after seek".to_string()))
+    }
+
+    /// Seek and decode a frame, always returning RGBA pixel data
+    ///
+    /// This forces the standard FFmpeg decode path even for HAP videos,
+    /// ensuring the result is always raw RGBA pixels suitable for thumbnails.
+    pub fn seek_and_decode_frame_rgba(&mut self, timestamp_secs: f64) -> Result<DecodedFrame, VideoDecoderError> {
+        let timestamp = (timestamp_secs / self.time_base) as i64;
+        self.input.seek(timestamp, ..timestamp)?;
+        self.decoder.flush();
+        self.eof = false;
+
+        // Always use standard decode path (returns RGBA, not DXT)
+        self.decode_standard_frame()?
+            .ok_or(VideoDecoderError::DecodeFailed("No frame available after seek".to_string()))
     }
 
     /// Get the video width in pixels

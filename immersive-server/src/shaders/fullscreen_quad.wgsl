@@ -86,8 +86,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Step 1: Undo position translation
     uv = uv - params.position;
     
-    // Calculate the layer's center in UV space (accounting for adjusted size)
-    let layer_center = params.anchor * adjusted_size_scale;
+    // Calculate the layer's center in UV space for scale/rotate transforms
+    let layer_center = params.anchor;
     
     // Step 2: Move to anchor-relative coordinates
     uv = uv - layer_center;

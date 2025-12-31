@@ -125,10 +125,10 @@ impl VideoPlayer {
                 return;
             }
         };
-        
+
         let frame_duration = Duration::from_secs_f64(1.0 / decoder.frame_rate());
         let mut next_frame_time = Instant::now();
-        
+
         // Decode first frame immediately
         if let Ok(Some(frame)) = decoder.decode_next_frame() {
             if let Ok(mut current) = state.current_frame.lock() {
@@ -136,7 +136,7 @@ impl VideoPlayer {
                 state.new_frame_available.store(true, Ordering::Release);
             }
         }
-        
+
         while state.running.load(Ordering::Acquire) {
             // Check for restart request
             if state.restart_requested.swap(false, Ordering::AcqRel) {
@@ -147,32 +147,31 @@ impl VideoPlayer {
                 state.frame_index.store(0, Ordering::Release);
                 log::debug!("VideoPlayer: restarted");
             }
-            
+
             // Check if paused
             if state.paused.load(Ordering::Acquire) {
                 thread::sleep(Duration::from_millis(10));
-                next_frame_time = Instant::now(); // Reset timing when paused
+                next_frame_time = Instant::now();
                 continue;
             }
-            
-            // Wait until next frame time
+
+            // Wait until next frame time (only if we're ahead of schedule)
             let now = Instant::now();
             if now < next_frame_time {
                 let sleep_time = next_frame_time - now;
                 if sleep_time > Duration::from_micros(500) {
                     thread::sleep(sleep_time - Duration::from_micros(500));
                 }
-                // Spin-wait for precise timing
                 while Instant::now() < next_frame_time {
                     std::hint::spin_loop();
                 }
             }
-            
+
             // Decode next frame
             match decoder.decode_next_frame() {
                 Ok(Some(frame)) => {
                     let frame_idx = frame.frame_index;
-                    
+
                     // Store frame for main thread pickup
                     if let Ok(mut current) = state.current_frame.lock() {
                         *current = Some(frame);
@@ -185,25 +184,25 @@ impl VideoPlayer {
                     if let Err(e) = decoder.reset() {
                         log::warn!("Failed to reset decoder for loop: {}", e);
                     }
+                    next_frame_time = Instant::now();
                     state.frame_index.store(0, Ordering::Release);
                     log::debug!("VideoPlayer: looping");
                 }
                 Err(e) => {
                     log::error!("Decode error: {}", e);
-                    // Try to continue
                 }
             }
-            
-            // Advance to next frame time
+
+            // Schedule next frame
             next_frame_time += frame_duration;
-            
-            // If we're behind, catch up
+
+            // If we fell behind, reset to now (don't try to catch up)
             let now = Instant::now();
             if next_frame_time < now {
                 next_frame_time = now;
             }
         }
-        
+
         log::debug!("VideoPlayer decode thread stopped");
     }
     

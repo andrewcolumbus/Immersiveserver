@@ -17,7 +17,7 @@ pub mod layer;
 pub mod viewport;
 
 pub use blend::BlendMode;
-pub use clip::{ClipCell, ClipTransition, DEFAULT_CLIP_SLOTS};
+pub use clip::{ClipCell, ClipSource, ClipTransition, DEFAULT_CLIP_SLOTS};
 pub use environment::Environment;
 pub use layer::{Layer, LayerSource, Transform2D};
 pub use viewport::Viewport;

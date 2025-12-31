@@ -6,17 +6,18 @@
 //!
 //! This is the primary interface for triggering clips in a VJ-style workflow.
 
-use crate::compositor::{ClipCell, Layer};
+use crate::compositor::{ClipCell, ClipSource, Layer};
+use crate::ui::ThumbnailCache;
 use std::path::PathBuf;
 
 /// Size of clip grid cells in pixels
-const CELL_SIZE: f32 = 50.0;
+const CELL_SIZE: f32 = 80.0;
 /// Spacing between cells
 const CELL_SPACING: f32 = 3.0;
 /// Width of the layer name column
 const LAYER_NAME_WIDTH: f32 = 80.0;
 /// Width of the opacity slider column
-const OPACITY_SLIDER_WIDTH: f32 = 50.0;
+const OPACITY_SLIDER_WIDTH: f32 = 40.0;
 /// Padding inside the panel
 const PANEL_PADDING: f32 = 8.0;
 
@@ -38,6 +39,13 @@ pub enum ClipGridAction {
         layer_id: u32,
         slot: usize,
         path: PathBuf,
+    },
+    /// User wants to assign an OMT source to a cell
+    AssignOmtSource {
+        layer_id: u32,
+        slot: usize,
+        address: String,
+        name: String,
     },
     /// User wants to clear a clip from a cell
     ClearClip {
@@ -141,6 +149,7 @@ impl ClipGridPanel {
         &mut self,
         ctx: &egui::Context,
         layers: &[Layer],
+        thumbnail_cache: &mut ThumbnailCache,
     ) -> Vec<ClipGridAction> {
         if !self.open {
             return Vec::new();
@@ -161,7 +170,7 @@ impl ClipGridPanel {
                     ui.heading("Clip Grid");
                 });
                 ui.separator();
-                actions = self.render_contents(ui, layers);
+                actions = self.render_contents(ui, layers, thumbnail_cache);
             });
 
         actions
@@ -174,26 +183,33 @@ impl ClipGridPanel {
         &mut self,
         ui: &mut egui::Ui,
         layers: &[Layer],
+        thumbnail_cache: &mut ThumbnailCache,
     ) -> Vec<ClipGridAction> {
         let mut actions = Vec::new();
 
-        // Check for drag-drop events
-        let is_dragging = ui.ctx().input(|i| !i.raw.hovered_files.is_empty());
-        let dropped_files: Vec<PathBuf> = ui.ctx().input(|i| {
-            i.raw.dropped_files.iter()
-                .filter_map(|f| f.path.clone())
-                .filter(|p| Self::is_video_file(p))
-                .collect()
-        });
+        // Check for source drag-drop events (from Sources panel or File Browser panel)
+        let is_dragging = crate::ui::sources_panel::is_source_being_dragged(ui.ctx());
 
-        // Handle dropped files
-        if let Some(path) = dropped_files.first() {
+        // Handle dropped sources (from Sources panel or File Browser panel)
+        if let Some(dropped_source) = crate::ui::sources_panel::get_dropped_source(ui.ctx()) {
             if let Some((layer_id, slot)) = self.drag_hover_cell.take() {
-                actions.push(ClipGridAction::AssignClipWithPath {
-                    layer_id,
-                    slot,
-                    path: path.clone(),
-                });
+                match dropped_source {
+                    crate::ui::DraggableSource::Omt { address, name, .. } => {
+                        actions.push(ClipGridAction::AssignOmtSource {
+                            layer_id,
+                            slot,
+                            address,
+                            name,
+                        });
+                    }
+                    crate::ui::DraggableSource::File { path, .. } => {
+                        actions.push(ClipGridAction::AssignClipWithPath {
+                            layer_id,
+                            slot,
+                            path,
+                        });
+                    }
+                }
             }
         }
 
@@ -242,19 +258,24 @@ impl ClipGridPanel {
 
         // Column headers (clip slot numbers) - right-click to delete
         ui.horizontal(|ui| {
-            // Empty space for layer name column
-            ui.allocate_space(egui::vec2(LAYER_NAME_WIDTH, 20.0));
-            // Empty space for opacity slider column
-            ui.allocate_space(egui::vec2(OPACITY_SLIDER_WIDTH + CELL_SPACING, 20.0));
-            
+            // Use consistent spacing with grid rows
+            ui.spacing_mut().item_spacing.x = CELL_SPACING;
+
+            // Space for stop button (matches row layout)
+            ui.allocate_space(egui::vec2(28.0, 20.0));
+            // Space for layer name (matches LAYER_NAME_WIDTH - 28.0 in rows)
+            ui.allocate_space(egui::vec2(LAYER_NAME_WIDTH - 28.0, 20.0));
+            // Space for opacity slider column
+            ui.allocate_space(egui::vec2(OPACITY_SLIDER_WIDTH, 20.0));
+
             for slot in 0..max_clips {
                 let label = format!("{}", slot + 1);
-                let response = ui.allocate_ui(egui::vec2(CELL_SIZE + CELL_SPACING, 20.0), |ui| {
+                let response = ui.allocate_ui(egui::vec2(CELL_SIZE, 20.0), |ui| {
                     ui.centered_and_justified(|ui| {
                         ui.label(egui::RichText::new(label).size(11.0).color(egui::Color32::GRAY))
                     }).inner
                 }).inner;
-                
+
                 // Right-click context menu on column header
                 response.context_menu(|ui| {
                     if ui.button("🗑 Delete Column").clicked() {
@@ -273,7 +294,7 @@ impl ClipGridPanel {
             .show(ui, |ui| {
                 // Iterate in REVERSE order so top layer (rendered last) appears at top of UI
                 for layer in layers.iter().rev() {
-                    let row_actions = self.render_layer_row(ui, layer, max_clips, is_dragging);
+                    let row_actions = self.render_layer_row(ui, layer, max_clips, is_dragging, thumbnail_cache);
                     actions.extend(row_actions);
                 }
             });
@@ -288,12 +309,16 @@ impl ClipGridPanel {
         layer: &Layer,
         max_clips: usize,
         is_dragging: bool,
+        thumbnail_cache: &mut ThumbnailCache,
     ) -> Vec<ClipGridAction> {
         let mut actions = Vec::new();
         let has_active = layer.has_active_clip();
         let layer_id = layer.id;
 
         ui.horizontal(|ui| {
+            // Use consistent spacing with header row
+            ui.spacing_mut().item_spacing.x = CELL_SPACING;
+
             // Stop button (X) on the LEFT - always visible, vertically centered
             let (button_fill, button_text_color) = if has_active {
                 (egui::Color32::from_rgb(180, 60, 60), egui::Color32::WHITE)
@@ -395,40 +420,33 @@ impl ClipGridPanel {
             // Show tooltip on layer name area
             label_response.response.on_hover_text("Click to select • Right-click for options");
 
-            // Opacity slider
+            // Opacity slider (vertical fader)
             let mut opacity = layer.opacity;
-            let slider_response = ui.allocate_ui(egui::vec2(OPACITY_SLIDER_WIDTH, CELL_SIZE), |ui| {
-                ui.vertical_centered(|ui| {
-                    // Show percentage label
-                    let opacity_pct = (opacity * 100.0).round() as u32;
-                    ui.label(
-                        egui::RichText::new(format!("{}%", opacity_pct))
-                            .size(9.0)
-                            .color(egui::Color32::GRAY)
-                    );
-                    
-                    // Compact slider (no labels, just the slider control)
-                    let slider = egui::Slider::new(&mut opacity, 0.0..=1.0)
-                        .show_value(false)
-                        .clamping(egui::SliderClamping::Always);
-                    ui.add(slider)
-                }).inner
+            let slider_result = ui.allocate_ui(egui::vec2(OPACITY_SLIDER_WIDTH, CELL_SIZE), |ui| {
+                // Remove internal spacing so slider fills full height
+                ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+
+                let slider = egui::Slider::new(&mut opacity, 0.0..=1.0)
+                    .vertical()
+                    .show_value(false)
+                    .clamping(egui::SliderClamping::Always);
+                ui.add_sized([OPACITY_SLIDER_WIDTH, CELL_SIZE], slider)
             });
-            
+
             // Emit action if opacity changed
-            if slider_response.inner.changed() {
+            if slider_result.inner.changed() {
                 actions.push(ClipGridAction::SetLayerOpacity { layer_id, opacity });
             }
-            
+
             // Tooltip for the slider
-            slider_response.response.on_hover_text("Layer opacity (0% = invisible, 100% = opaque)");
+            slider_result.inner.on_hover_text("Layer opacity (0% = invisible, 100% = opaque)");
 
             // Clip cells
             let layer_has_active_clip = layer.has_active_clip();
             for slot in 0..max_clips {
                 let cell = layer.get_clip(slot);
                 let is_active = layer.active_clip == Some(slot);
-                let cell_actions = self.render_cell(ui, layer.id, slot, cell, is_active, layer_has_active_clip, is_dragging);
+                let cell_actions = self.render_cell(ui, layer.id, slot, cell, is_active, layer_has_active_clip, is_dragging, thumbnail_cache);
                 actions.extend(cell_actions);
             }
         });
@@ -448,21 +466,22 @@ impl ClipGridPanel {
         is_active: bool,
         layer_has_active_clip: bool,
         is_dragging: bool,
+        thumbnail_cache: &mut ThumbnailCache,
     ) -> Vec<ClipGridAction> {
         let mut actions = Vec::new();
 
         let size = egui::vec2(CELL_SIZE, CELL_SIZE);
 
-        // Check if this cell is being hovered during drag
+        // Check if this cell is being hovered during drag (for drop indicator)
         let is_drag_hover = self.drag_hover_cell == Some((layer_id, slot));
 
-        // Determine cell appearance
-        let (bg_color, text_color, label) = if is_drag_hover {
+        // Determine cell appearance and get thumbnail if available
+        let (bg_color, text_color, label, thumbnail) = if is_drag_hover {
             // Highlight during drag hover
             let bg = egui::Color32::from_rgb(80, 120, 200); // Blue highlight
             let text = egui::Color32::WHITE;
             let label = "⬇".to_string(); // Drop indicator
-            (bg, text, label)
+            (bg, text, label, None)
         } else if let Some(clip) = cell {
             let bg = if is_active {
                 egui::Color32::from_rgb(40, 160, 80) // Green for active
@@ -470,14 +489,34 @@ impl ClipGridPanel {
                 egui::Color32::from_rgb(55, 55, 70) // Dark blue-gray for clips
             };
             let text = egui::Color32::WHITE;
-            // Truncate label to fit cell
+            // Truncate label to fit cell (use chars() for unicode safety)
             let name = clip.display_name();
-            let label = if name.len() > 8 {
-                format!("{}…", &name[..7])
+            let char_count = name.chars().count();
+            let label = if char_count > 6 {
+                let truncated: String = name.chars().take(5).collect();
+                format!("{}…", truncated)
             } else {
                 name
             };
-            (bg, text, label)
+
+            // Try to get thumbnail for file sources (returns id and size for proper centering)
+            let thumbnail = if let ClipSource::File { path } = &clip.source {
+                let mode = thumbnail_cache.mode();
+                // Include mode in cache key so switching modes regenerates thumbnails
+                let cache_key = format!("{}:{:?}", path.to_string_lossy(), mode);
+                if let Some(tex) = thumbnail_cache.get(&cache_key) {
+                    let size = tex.size();
+                    Some((tex.id(), egui::vec2(size[0] as f32, size[1] as f32)))
+                } else {
+                    // Request thumbnail generation with current mode
+                    thumbnail_cache.request(cache_key, path.clone(), mode);
+                    None
+                }
+            } else {
+                None // No thumbnails for OMT sources
+            };
+
+            (bg, text, label, thumbnail)
         } else {
             // Empty cell
             let bg = if is_dragging {
@@ -487,24 +526,93 @@ impl ClipGridPanel {
             };
             let text = egui::Color32::from_rgb(80, 80, 80);
             let label = String::new(); // Empty cells have no text
-            (bg, text, label)
+            (bg, text, label, None)
         };
 
-        // Create the button
-        let button = egui::Button::new(
-            egui::RichText::new(&label)
-                .color(text_color)
-                .size(9.0)
-        )
-        .min_size(size)
-        .fill(bg_color)
-        .corner_radius(3.0);
+        // Create the cell with fixed size
+        let response = ui.allocate_ui_with_layout(
+            size,
+            egui::Layout::centered_and_justified(egui::Direction::TopDown),
+            |ui| {
+                // Draw background
+                let rect = ui.available_rect_before_wrap();
+                ui.painter().rect_filled(rect, 3.0, bg_color);
 
-        let response = ui.add(button);
+                // Draw thumbnail if available
+                if let Some((texture_id, tex_size)) = thumbnail {
+                    let padding = 2.0;
+                    let available = rect.shrink(padding);
 
-        // Track drag hover state
-        if is_dragging && response.hovered() {
-            self.drag_hover_cell = Some((layer_id, slot));
+                    // Calculate centered rect that maintains aspect ratio
+                    let tex_aspect = tex_size.x / tex_size.y;
+                    let cell_aspect = available.width() / available.height();
+
+                    let image_rect = if (tex_aspect - cell_aspect).abs() < 0.01 {
+                        // Aspect ratios match, fill the cell
+                        available
+                    } else if tex_aspect > cell_aspect {
+                        // Thumbnail is wider - fit width, center vertically
+                        let height = available.width() / tex_aspect;
+                        let y_offset = (available.height() - height) / 2.0;
+                        egui::Rect::from_min_size(
+                            egui::pos2(available.left(), available.top() + y_offset),
+                            egui::vec2(available.width(), height),
+                        )
+                    } else {
+                        // Thumbnail is taller - fit height, center horizontally
+                        let width = available.height() * tex_aspect;
+                        let x_offset = (available.width() - width) / 2.0;
+                        egui::Rect::from_min_size(
+                            egui::pos2(available.left() + x_offset, available.top()),
+                            egui::vec2(width, available.height()),
+                        )
+                    };
+
+                    ui.painter().image(
+                        texture_id,
+                        image_rect,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
+
+                    // Draw active indicator border
+                    if is_active {
+                        ui.painter().rect_stroke(
+                            rect,
+                            3.0,
+                            egui::Stroke::new(3.0, egui::Color32::from_rgb(40, 160, 80)),
+                            egui::StrokeKind::Outside,
+                        );
+                    }
+                }
+
+                // Draw label at bottom
+                if !label.is_empty() {
+                    let label_pos = egui::pos2(
+                        rect.center().x,
+                        rect.bottom() - 10.0,
+                    );
+                    ui.painter().text(
+                        label_pos,
+                        egui::Align2::CENTER_CENTER,
+                        &label,
+                        egui::FontId::proportional(9.0),
+                        text_color,
+                    );
+                }
+
+                // Return sense response for the whole area
+                ui.allocate_rect(rect, egui::Sense::click())
+            }
+        ).inner;
+
+        // Track drag hover state for visual feedback during drags
+        if is_dragging {
+            if let Some(pos) = ui.ctx().pointer_latest_pos() {
+                if response.rect.contains(pos) {
+                    self.drag_hover_cell = Some((layer_id, slot));
+                }
+            }
         }
 
         // Handle left-click: trigger clip, stop layer, or open file picker
@@ -554,6 +662,7 @@ impl ClipGridPanel {
                     ui.close_menu();
                 }
                 if has_clipboard {
+                    ui.separator();
                     if ui.button("📋 Paste").clicked() {
                         actions.push(ClipGridAction::PasteClip { layer_id, slot });
                         ui.close_menu();
@@ -562,20 +671,24 @@ impl ClipGridPanel {
             }
         });
 
-        // Tooltip with full name and path
+        // Tooltip with full name and source info
         if let Some(clip) = cell {
             let active_text = if is_active { " (playing)" } else { "" };
+            let source_info = match &clip.source {
+                crate::compositor::ClipSource::File { path } => format!("📁 {}", path.display()),
+                crate::compositor::ClipSource::Omt { address, .. } => format!("📡 OMT: {}", address),
+            };
             response.on_hover_text(format!(
                 "{}{}\n{}",
                 clip.display_name(),
                 active_text,
-                clip.source_path.display()
+                source_info
             ));
         } else {
             let tooltip = if layer_has_active_clip {
                 "Click to stop layer"
             } else {
-                "Click to assign a video clip"
+                "Click to assign a clip\nDrag from Files or Sources panel"
             };
             response.on_hover_text(tooltip);
         }
@@ -598,14 +711,5 @@ impl ClipGridPanel {
         self.pending_clip_assignment.take().map(|(layer_id, slot)| {
             (layer_id, slot, path)
         })
-    }
-
-    /// Check if a file path is a supported video file
-    fn is_video_file(path: &std::path::Path) -> bool {
-        let video_extensions = ["mp4", "mov", "avi", "mkv", "webm", "m4v", "wmv", "flv"];
-        path.extension()
-            .and_then(|ext| ext.to_str())
-            .map(|ext| video_extensions.contains(&ext.to_lowercase().as_str()))
-            .unwrap_or(false)
     }
 }

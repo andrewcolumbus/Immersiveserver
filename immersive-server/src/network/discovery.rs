@@ -1,9 +1,8 @@
 //! Network source discovery for OMT and NDI streams.
 //!
-//! Uses mDNS-SD (Bonjour-compatible) for automatic discovery of
-//! video sources on the local network.
+//! Uses libOMT's built-in discovery for finding OMT sources on the network.
 
-use aqueduct::{Discovery as AqueductDiscovery, AqueductError};
+use super::omt_ffi::get_discovered_sources;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -34,9 +33,9 @@ pub struct DiscoveredSource {
     pub name: String,
     /// Source type (OMT, NDI, etc.)
     pub source_type: SourceType,
-    /// Host address
+    /// Host address (from discovery string)
     pub host: String,
-    /// Port number
+    /// Port number (0 if not resolved yet)
     pub port: u16,
     /// Additional properties
     pub properties: HashMap<String, String>,
@@ -45,7 +44,11 @@ pub struct DiscoveredSource {
 impl DiscoveredSource {
     /// Get the full address (host:port) for connection.
     pub fn address(&self) -> String {
-        format!("{}:{}", self.host, self.port)
+        if self.port > 0 {
+            format!("{}:{}", self.host, self.port)
+        } else {
+            self.host.clone()
+        }
     }
 }
 
@@ -63,112 +66,131 @@ pub enum DiscoveryEvent {
     Error(String),
 }
 
+/// Error type for discovery operations.
+#[derive(Debug, Clone)]
+pub struct DiscoveryError(pub String);
+
+impl std::fmt::Display for DiscoveryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Discovery error: {}", self.0)
+    }
+}
+
+impl std::error::Error for DiscoveryError {}
+
 /// Manages discovery of network video sources.
+///
+/// Uses libOMT's built-in discovery which returns sources in format:
+/// "HOSTNAME (NAME)" e.g. "MACBOOKPRO.LOCAL (OBS Output)"
 pub struct SourceDiscovery {
-    /// Internal Aqueduct discovery service
-    aqueduct_discovery: Option<AqueductDiscovery>,
-    /// Currently discovered sources
+    /// Currently discovered sources (cached)
     sources: Arc<RwLock<HashMap<String, DiscoveredSource>>>,
-    /// Is discovery running?
+    /// Is discovery active?
     running: bool,
 }
 
 impl SourceDiscovery {
     /// Create a new source discovery manager.
-    pub fn new() -> Result<Self, AqueductError> {
-        let discovery = AqueductDiscovery::new()?;
-        
+    pub fn new() -> Result<Self, DiscoveryError> {
         Ok(Self {
-            aqueduct_discovery: Some(discovery),
             sources: Arc::new(RwLock::new(HashMap::new())),
             running: false,
         })
     }
 
     /// Start browsing for OMT sources on the network.
-    pub fn start_browsing(&mut self) -> Result<(), AqueductError> {
+    ///
+    /// Note: libOMT discovery is polled (not callback-based), so this just
+    /// marks discovery as active. Call `refresh()` periodically to update sources.
+    pub fn start_browsing(&mut self) -> Result<(), DiscoveryError> {
         if self.running {
-            return Ok(()); // Already running
+            return Ok(());
         }
 
-        let discovery = self.aqueduct_discovery.as_ref().ok_or_else(|| {
-            AqueductError::Discovery("Discovery not initialized".to_string())
-        })?;
+        log::info!("SourceDiscovery: Starting libOMT discovery");
+        self.running = true;
 
-        let sources = Arc::clone(&self.sources);
+        // Do an initial refresh
+        self.refresh();
 
-        log::info!("SourceDiscovery: Starting mDNS browse for OMT sources");
+        Ok(())
+    }
 
-        discovery.browse_sources(move |event| {
-            use mdns_sd::ServiceEvent;
-            
-            match event {
-                ServiceEvent::ServiceResolved(info) => {
-                    let source = DiscoveredSource {
-                        id: info.get_fullname().to_string(),
-                        name: info.get_fullname()
-                            .split('.')
-                            .next()
-                            .unwrap_or("Unknown")
-                            .to_string(),
-                        source_type: SourceType::Omt,
-                        host: info.get_addresses()
-                            .iter()
-                            .next()
-                            .map(|a| a.to_string())
-                            .unwrap_or_else(|| info.get_hostname().to_string()),
-                        port: info.get_port(),
-                        properties: info.get_properties()
-                            .iter()
-                            .map(|p| (p.key().to_string(), p.val_str().to_string()))
-                            .collect(),
-                    };
+    /// Refresh the list of discovered sources from libOMT.
+    ///
+    /// Call this periodically (e.g., every 1-2 seconds) to update the source list.
+    pub fn refresh(&mut self) {
+        if !self.running {
+            return;
+        }
 
-                    log::info!(
-                        "SourceDiscovery: Found OMT source '{}' at {}:{}",
-                        source.name,
-                        source.host,
-                        source.port
-                    );
+        let addresses = get_discovered_sources();
 
-                    if let Ok(mut sources) = sources.write() {
-                        sources.insert(source.id.clone(), source);
-                    }
-                }
-                ServiceEvent::ServiceFound(service_type, fullname) => {
-                    log::debug!(
-                        "SourceDiscovery: Found service '{}' of type '{}'",
-                        fullname,
-                        service_type
-                    );
-                    // ServiceFound is fired before ServiceResolved
-                    // We wait for ServiceResolved to get full details
-                }
-                ServiceEvent::ServiceRemoved(_, fullname) => {
-                    log::info!("SourceDiscovery: OMT source removed: {}", fullname);
-                    
-                    if let Ok(mut sources) = sources.write() {
-                        sources.remove(&fullname);
-                    }
-                }
-                ServiceEvent::SearchStarted(_) => {
-                    log::debug!("SourceDiscovery: mDNS search started");
-                }
-                ServiceEvent::SearchStopped(_) => {
-                    log::debug!("SourceDiscovery: mDNS search stopped");
+        let mut new_sources = HashMap::new();
+
+        for addr in addresses {
+            // libOMT returns format: "HOSTNAME (NAME)"
+            // Parse into host and name
+            let (host, name) = Self::parse_discovery_address(&addr);
+
+            let source = DiscoveredSource {
+                id: addr.clone(),
+                name,
+                source_type: SourceType::Omt,
+                host,
+                port: 0, // libOMT discovery doesn't include port
+                properties: HashMap::new(),
+            };
+
+            // Check if this is a new source
+            let is_new = self.sources
+                .read()
+                .map(|s| !s.contains_key(&addr))
+                .unwrap_or(true);
+
+            if is_new {
+                log::info!("SourceDiscovery: Found OMT source '{}'", source.name);
+            }
+
+            new_sources.insert(addr, source);
+        }
+
+        // Log removed sources
+        if let Ok(old_sources) = self.sources.read() {
+            for id in old_sources.keys() {
+                if !new_sources.contains_key(id) {
+                    log::info!("SourceDiscovery: OMT source removed: {}", id);
                 }
             }
-        })?;
+        }
 
-        self.running = true;
-        Ok(())
+        // Update the source list
+        if let Ok(mut sources) = self.sources.write() {
+            *sources = new_sources;
+        }
+    }
+
+    /// Parse a libOMT discovery address string.
+    ///
+    /// Format: "HOSTNAME (NAME)" -> (hostname, name)
+    fn parse_discovery_address(addr: &str) -> (String, String) {
+        // Try to split on " (" to extract name
+        if let Some(paren_start) = addr.find(" (") {
+            let host = addr[..paren_start].trim().to_string();
+            let name = addr[paren_start + 2..]
+                .trim_end_matches(')')
+                .to_string();
+            (host, name)
+        } else {
+            // No parenthetical name, use the whole thing
+            (addr.to_string(), addr.to_string())
+        }
     }
 
     /// Stop browsing for sources.
     pub fn stop_browsing(&mut self) {
         self.running = false;
-        // Note: Aqueduct discovery runs in a background thread
-        // It will stop when the Discovery object is dropped
+        log::info!("SourceDiscovery: Stopped browsing");
     }
 
     /// Get all currently discovered sources.
@@ -212,7 +234,6 @@ impl SourceDiscovery {
 impl Default for SourceDiscovery {
     fn default() -> Self {
         Self::new().unwrap_or_else(|_| Self {
-            aqueduct_discovery: None,
             sources: Arc::new(RwLock::new(HashMap::new())),
             running: false,
         })
@@ -233,7 +254,7 @@ mod tests {
             port: 9000,
             properties: HashMap::new(),
         };
-        
+
         assert_eq!(source.address(), "192.168.1.100:9000");
     }
 
@@ -242,5 +263,15 @@ mod tests {
         assert_eq!(SourceType::Omt.to_string(), "OMT");
         assert_eq!(SourceType::Ndi.to_string(), "NDI");
     }
-}
 
+    #[test]
+    fn test_parse_discovery_address() {
+        let (host, name) = SourceDiscovery::parse_discovery_address("MACBOOKPRO.LOCAL (OBS Output)");
+        assert_eq!(host, "MACBOOKPRO.LOCAL");
+        assert_eq!(name, "OBS Output");
+
+        let (host, name) = SourceDiscovery::parse_discovery_address("just-a-host");
+        assert_eq!(host, "just-a-host");
+        assert_eq!(name, "just-a-host");
+    }
+}

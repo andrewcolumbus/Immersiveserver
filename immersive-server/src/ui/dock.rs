@@ -562,6 +562,8 @@ impl DockManager {
 /// Panel IDs for the standard panels
 pub mod panel_ids {
     pub const CLIP_GRID: &str = "clip_grid";
+    pub const FILES: &str = "files";
     pub const PROPERTIES: &str = "properties";
+    pub const SOURCES: &str = "sources";
 }
 
