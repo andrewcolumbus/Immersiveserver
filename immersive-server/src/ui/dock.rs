@@ -562,7 +562,9 @@ impl DockManager {
 /// Panel IDs for the standard panels
 pub mod panel_ids {
     pub const CLIP_GRID: &str = "clip_grid";
+    pub const EFFECTS_BROWSER: &str = "effects_browser";
     pub const FILES: &str = "files";
+    pub const PREVIEW_MONITOR: &str = "preview_monitor";
     pub const PROPERTIES: &str = "properties";
     pub const SOURCES: &str = "sources";
 }

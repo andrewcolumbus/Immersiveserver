@@ -238,6 +238,76 @@ similar to this: /Users/andrewcolumbus/Documents/Code/Immersiveserver/image.png
 
 ---
 
+### Phase 2.6: Effects System (Weeks 8–10)
+
+**Goal:** Resolume-style stackable effects with GPU processing and BPM automation.
+
+- [x] **Core Effect System**
+  - Data/runtime separation pattern (EffectStack / EffectStackRuntime)
+  - Effect registry with category-based organization
+  - Ping-pong texture pool for multi-effect GPU chains
+  - Parameter system with Float, Int, Bool, Vec2, Vec3, Color, Enum support
+
+- [x] **GPU Effect Processing**
+  - GpuEffectRuntime trait for WGSL-based effects
+  - Integration with layer render loop
+  - Efficient texture management (reusable ping-pong buffers)
+
+- [x] **Built-in Effects**
+  - Color Correction (brightness, contrast, saturation, hue, gamma)
+  - Invert (amount, invert_alpha)
+
+- [x] **BPM/LFO Automation**
+  - BpmClock with tap tempo support
+  - LFO waveforms: Sine, Triangle, Square, Sawtooth, Random
+  - Beat-sync envelope (Attack, Decay, Sustain, Release)
+  - AutomationSource for parameter modulation
+
+- [x] **UI**
+  - Effects Browser Panel (category tree, search, drag-and-drop)
+  - Properties Panel Effects Section (bypass, solo, reorder, parameters)
+  - Per-effect bypass (B) and solo (S) buttons
+  - Parameter sliders/controls based on type
+
+**Files Created:**
+```
+src/effects/
+├── mod.rs              # Module exports
+├── types.rs            # EffectStack, EffectInstance, Parameter, ParameterValue
+├── traits.rs           # EffectDefinition, GpuEffectRuntime, CpuEffectRuntime
+├── registry.rs         # EffectRegistry with category support
+├── runtime.rs          # EffectStackRuntime, EffectTexturePool
+├── automation.rs       # BpmClock, LfoSource, BeatEnvelopeState
+├── manager.rs          # EffectManager (coordinates processing)
+└── builtin/
+    ├── mod.rs
+    ├── color_correction.rs
+    └── invert.rs
+
+src/shaders/effects/
+├── common.wgsl         # Shared utilities (HSV conversion, etc.)
+├── color_correction.wgsl
+└── invert.wgsl
+
+src/ui/effects_browser_panel.rs
+```
+
+**✅ Verification Checklist (Phase 2.6):**
+- [x] `cargo test` passes — all 72+ effect-related tests pass
+- [x] Effects Browser Panel shows Color and other categories
+- [x] Add Effect to layer via Properties Panel works
+- [x] Effect parameter sliders update in real-time
+- [x] Bypass (B) button disables effect visually (strikethrough)
+- [x] Solo (S) button isolates single effect
+- [x] Reorder (▲/▼) buttons move effects in chain
+- [x] Remove (✕) button deletes effect
+- [x] Effects serialize/deserialize in .immersive files
+- [x] Multiple effects chain correctly (ping-pong rendering)
+- [x] Color Correction effect: brightness, contrast, saturation work
+- [x] Invert effect: amount slider blends with original
+
+---
+
 ### Phase 3: Hardware Video Decoding (Weeks 11–12)
 
 **Goal:** Offload decode to GPU for 4K+ playback.
@@ -247,20 +317,20 @@ similar to this: /Users/andrewcolumbus/Documents/Code/Immersiveserver/image.png
 - [x] **Hap Codec Support**
   - Direct GPU texture upload (DXT/BC compression)
   - HapDecoder with BC1/BC3 texture format support
-- [ ] Benchmark: target 4× 4K @ 60fps decode headroom
+- [x] Benchmark: target 4× 4K @ 60fps decode headroom
 
 **✅ Verification Checklist (Phase 3):**
 - [x] macOS: VideoToolbox hwaccel enabled (check logs for "hwaccel: videotoolbox")
-- [ ] macOS: CPU usage drops significantly vs software decode (measure with Activity Monitor)
+- [x] macOS: CPU usage drops significantly vs software decode (measure with Activity Monitor)
 - [x] Windows: D3D11VA or NVDEC enabled (check logs)
-- [ ] Windows: GPU decode visible in Task Manager GPU stats
-- [ ] 4K H.264 video plays smoothly at 60fps
-- [ ] 4K H.265/HEVC video plays smoothly at 60fps
+- [t] Windows: GPU decode visible in Task Manager GPU stats
+- [x] 4K H.264 video plays smoothly at 60fps
+- [x] 4K H.265/HEVC video plays smoothly at 60fps
 - [x] Hap codec: DXT texture uploads directly (no CPU conversion)
 - [x] Hap Alpha codec works correctly
-- [ ] Benchmark test: decode 4× 4K streams simultaneously, verify <50% CPU usage
+- [x] Benchmark test: decode 4× 4K streams simultaneously, verify <50% CPU usage
 - [x] Graceful fallback to software decode if hwaccel unavailable
-- [ ] No visual artifacts or color space issues with hwaccel
+- [x] No visual artifacts or color space issues with hwaccel
 
 ---
 
@@ -268,21 +338,21 @@ similar to this: /Users/andrewcolumbus/Documents/Code/Immersiveserver/image.png
 
 **Goal:** Integrate Open Media Transport for ultra-low latency.
 
-- [ ] Evaluate Aqueduct (Rust-native OMT implementation)
-- [ ] OMT Discovery: announce and find sources
-- [ ] OMT Receiver: QUIC-based frame reception
-- [ ] OMT Sender: output compositor to OMT stream
+- [x] Evaluate Aqueduct (Rust-native OMT implementation)
+- [x] OMT Discovery: announce and find sources
+- [] OMT Receiver: QUIC-based frame reception
+- [x] OMT Sender: output environment to OMT stream
 - [ ] Fallback to provided `libOMT.dylib` / `.dll` if needed
 
 **✅ Verification Checklist (Phase 4):**
-- [ ] OMT sources are discovered on network
+- [x] OMT sources are discovered on network
 - [ ] OMT receiver connects and displays stream
-- [ ] OMT latency is measurably lower than NDI (< 1 frame target)
-- [ ] OMT sender outputs compositor to OMT stream
+- [ ] OMT latency is measurably lower than NDI (< 1 frame target) [AFTER NDI IMPLTEMENTATION]
+- [x] OMT sender outputs compositor to OMT stream
 - [ ] OMT output receivable by other OMT clients
 - [ ] QUIC transport handles packet loss gracefully
 - [ ] Fallback to libOMT works when Aqueduct unavailable
-- [ ] OMT and NDI can run simultaneously without conflicts
+- [ ] OMT and NDI can run simultaneously without conflicts - [AFTER NDI IMPLTEMENTATION]
 - [ ] OMT reconnects automatically on network interruption
 
 ---
@@ -737,7 +807,47 @@ bindgen = "0.71"  # For NDI/OMT FFI
 
 ---
 
-## 10. References
+## 10. Technical Notes
+
+### XML Serialization (quick-xml)
+
+The `.immersive` project files use XML format via `quick-xml`. This crate has limitations with enum struct variants.
+
+**Problem:** `quick-xml` cannot serialize enum variants with named fields by default:
+```rust
+// This FAILS to serialize
+pub enum ClipSource {
+    File { path: PathBuf },  // Struct variant - not supported
+    Omt { address: String, name: String },
+}
+```
+
+**Solution:** Use custom Serialize/Deserialize implementations with helper structs:
+```rust
+// Helper struct flattens the enum for XML compatibility
+#[derive(Serialize, Deserialize)]
+struct ClipSourceHelper {
+    #[serde(rename = "type")]
+    source_type: String,    // "File" or "Omt"
+    #[serde(default)]
+    path: Option<PathBuf>,  // Only for File
+    #[serde(default)]
+    address: Option<String>, // Only for Omt
+    #[serde(default)]
+    name: Option<String>,   // Only for Omt
+}
+
+impl Serialize for ClipSource { /* use helper */ }
+impl Deserialize for ClipSource { /* use helper */ }
+```
+
+**Affected Types (custom serialization implemented):**
+- `ClipSource` (`src/compositor/clip.rs`) - helper struct with type discriminant
+- `ParameterValue` (`src/effects/types.rs`) - helper struct with type discriminant
+
+---
+
+## 11. References
 
 - [wgpu Documentation](https://wgpu.rs/)
 - [NDI SDK](https://ndi.video/for-developers/ndi-sdk/)

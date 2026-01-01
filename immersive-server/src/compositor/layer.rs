@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::compositor::clip::{ClipCell, DEFAULT_CLIP_SLOTS};
 use crate::compositor::BlendMode;
+use crate::effects::EffectStack;
 
 /// 2D transform for layer positioning within the environment.
 ///
@@ -131,6 +132,9 @@ pub struct Layer {
     /// Vertical tiling (1 = no repeat, 2 = 2x repeat, etc.)
     #[serde(default = "default_tile")]
     pub tile_y: u32,
+    /// Effect stack for this layer
+    #[serde(default)]
+    pub effects: EffectStack,
 }
 
 fn default_tile() -> u32 {
@@ -152,6 +156,7 @@ impl Default for Layer {
             transition: crate::compositor::ClipTransition::Cut,
             tile_x: 1,
             tile_y: 1,
+            effects: EffectStack::default(),
         }
     }
 }
@@ -172,6 +177,7 @@ impl Layer {
             transition: crate::compositor::ClipTransition::Cut,
             tile_x: 1,
             tile_y: 1,
+            effects: EffectStack::new(),
         }
     }
 
@@ -190,6 +196,7 @@ impl Layer {
             transition: crate::compositor::ClipTransition::Cut,
             tile_x: 1,
             tile_y: 1,
+            effects: EffectStack::new(),
         }
     }
 

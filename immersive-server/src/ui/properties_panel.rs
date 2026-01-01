@@ -1,10 +1,12 @@
 //! Properties Panel with Environment/Layer/Clip tabs
 //!
 //! A tabbed panel for editing properties of the environment, layers, and clips.
-//! Includes transform controls, tiling (multiplexing), and other settings.
+//! Includes transform controls, tiling (multiplexing), effects, and other settings.
 
 use crate::compositor::{BlendMode, ClipTransition, Environment, Layer};
+use crate::effects::{EffectRegistry, ParameterValue};
 use crate::settings::{EnvironmentSettings, ThumbnailMode};
+use crate::ui::effects_browser_panel::DraggableEffect;
 
 /// Which tab is currently active in the properties panel
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -47,8 +49,24 @@ pub enum PropertiesAction {
     SetOmtBroadcast { enabled: bool },
     /// OMT capture FPS changed
     SetOmtCaptureFps { fps: u32 },
+    /// Syphon/Spout texture sharing toggle changed
+    SetTextureShare { enabled: bool },
     /// Thumbnail mode changed
     SetThumbnailMode { mode: ThumbnailMode },
+
+    // Effect-related actions
+    /// Add effect to layer
+    AddLayerEffect { layer_id: u32, effect_type: String },
+    /// Remove effect from layer
+    RemoveLayerEffect { layer_id: u32, effect_id: u32 },
+    /// Toggle effect bypass
+    SetLayerEffectBypassed { layer_id: u32, effect_id: u32, bypassed: bool },
+    /// Toggle effect solo
+    SetLayerEffectSoloed { layer_id: u32, effect_id: u32, soloed: bool },
+    /// Set effect parameter value
+    SetLayerEffectParameter { layer_id: u32, effect_id: u32, param_name: String, value: ParameterValue },
+    /// Reorder effect (move up/down)
+    ReorderLayerEffect { layer_id: u32, effect_id: u32, new_index: usize },
 }
 
 /// Properties panel state
@@ -57,6 +75,8 @@ pub struct PropertiesPanel {
     pub active_tab: PropertiesTab,
     /// Currently selected layer ID (for Layer/Clip tabs)
     pub selected_layer_id: Option<u32>,
+    /// Currently selected clip slot index (for Clip tab)
+    pub selected_clip_slot: Option<usize>,
     /// Whether the panel is open
     pub open: bool,
     /// Temporary values for editing (to avoid per-frame updates)
@@ -82,6 +102,7 @@ impl PropertiesPanel {
         Self {
             active_tab: PropertiesTab::Environment,
             selected_layer_id: None,
+            selected_clip_slot: None,
             open: true,
             env_width_text: String::new(),
             env_height_text: String::new(),
@@ -94,12 +115,21 @@ impl PropertiesPanel {
     /// Select a layer to edit
     pub fn select_layer(&mut self, layer_id: u32) {
         self.selected_layer_id = Some(layer_id);
+        self.selected_clip_slot = None; // Clear clip selection when changing layers
         self.active_tab = PropertiesTab::Layer;
     }
 
-    /// Clear layer selection
+    /// Select a clip to edit (also selects the containing layer)
+    pub fn select_clip(&mut self, layer_id: u32, slot: usize) {
+        self.selected_layer_id = Some(layer_id);
+        self.selected_clip_slot = Some(slot);
+        self.active_tab = PropertiesTab::Clip;
+    }
+
+    /// Clear layer and clip selection
     pub fn clear_selection(&mut self) {
         self.selected_layer_id = None;
+        self.selected_clip_slot = None;
     }
 
     /// Render the properties panel
@@ -112,6 +142,8 @@ impl PropertiesPanel {
         layers: &[Layer],
         settings: &EnvironmentSettings,
         omt_broadcasting: bool,
+        texture_sharing_active: bool,
+        effect_registry: &EffectRegistry,
     ) -> Vec<PropertiesAction> {
         let mut actions = Vec::new();
 
@@ -145,10 +177,10 @@ impl PropertiesPanel {
             .show(ui, |ui| {
                 match self.active_tab {
                     PropertiesTab::Environment => {
-                        self.render_environment_tab(ui, environment, settings, omt_broadcasting, &mut actions);
+                        self.render_environment_tab(ui, environment, settings, omt_broadcasting, texture_sharing_active, &mut actions);
                     }
                     PropertiesTab::Layer => {
-                        self.render_layer_tab(ui, layers, &mut actions);
+                        self.render_layer_tab(ui, layers, effect_registry, &mut actions);
                     }
                     PropertiesTab::Clip => {
                         self.render_clip_tab(ui, layers, &mut actions);
@@ -166,6 +198,7 @@ impl PropertiesPanel {
         environment: &Environment,
         settings: &EnvironmentSettings,
         omt_broadcasting: bool,
+        texture_sharing_active: bool,
         actions: &mut Vec<PropertiesAction>,
     ) {
         ui.heading("Environment");
@@ -415,6 +448,50 @@ impl PropertiesPanel {
         ui.add_space(16.0);
         ui.separator();
 
+        // Syphon/Spout Texture Sharing section
+        ui.add_space(8.0);
+        #[cfg(target_os = "macos")]
+        let tech_name = "Syphon";
+        #[cfg(target_os = "windows")]
+        let tech_name = "Spout";
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        let tech_name = "Texture Share";
+
+        ui.heading(format!("{} Output", tech_name));
+        ui.add_space(4.0);
+
+        let mut share_enabled = settings.texture_share_enabled;
+        if ui
+            .checkbox(&mut share_enabled, format!("Share via {}", tech_name))
+            .changed()
+        {
+            actions.push(PropertiesAction::SetTextureShare {
+                enabled: share_enabled,
+            });
+        }
+
+        if texture_sharing_active {
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new("Sharing...")
+                    .small()
+                    .color(egui::Color32::GREEN),
+            );
+        }
+
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new("Not available on this platform")
+                    .small()
+                    .color(egui::Color32::GRAY),
+            );
+        }
+
+        ui.add_space(16.0);
+        ui.separator();
+
         // Layer count info
         ui.add_space(8.0);
         ui.label(format!("Layers: {}", environment.layer_count()));
@@ -425,6 +502,7 @@ impl PropertiesPanel {
         &mut self,
         ui: &mut egui::Ui,
         layers: &[Layer],
+        effect_registry: &EffectRegistry,
         actions: &mut Vec<PropertiesAction>,
     ) {
         // Layer selector
@@ -773,6 +851,291 @@ impl PropertiesPanel {
                 });
             }
         });
+
+        // Effects section
+        ui.add_space(16.0);
+        ui.separator();
+        ui.add_space(8.0);
+        ui.heading("Effects");
+        ui.add_space(8.0);
+
+        self.render_effect_stack(ui, layer_id, layer, effect_registry, actions);
+    }
+
+    /// Render effect stack for a layer
+    fn render_effect_stack(
+        &self,
+        ui: &mut egui::Ui,
+        layer_id: u32,
+        layer: &Layer,
+        effect_registry: &EffectRegistry,
+        actions: &mut Vec<PropertiesAction>,
+    ) {
+        let effects = &layer.effects;
+
+        // Check if a DraggableEffect is specifically being dragged (not just any widget interaction)
+        let is_dragging_effect = egui::DragAndDrop::payload::<DraggableEffect>(ui.ctx()).is_some();
+
+        // Visual feedback for drop zone only when dragging an effect
+        let frame = if is_dragging_effect {
+            egui::Frame::new()
+                .stroke(egui::Stroke::new(2.0, egui::Color32::from_rgb(100, 149, 237)))
+                .inner_margin(4.0)
+                .corner_radius(4.0)
+        } else {
+            egui::Frame::NONE
+        };
+
+        // Wrap effects list in a drop zone
+        let drop_response = frame.show(ui, |ui| {
+            ui.dnd_drop_zone::<DraggableEffect, ()>(egui::Frame::NONE, |ui| {
+                if effects.is_empty() {
+                    ui.add_space(20.0);
+                    ui.label(
+                        egui::RichText::new("Drop effects here or use + button below")
+                            .italics()
+                            .color(egui::Color32::GRAY),
+                    );
+                    ui.add_space(20.0);
+                } else {
+                    // Render each effect
+                    for (index, effect) in effects.effects.iter().enumerate() {
+                        ui.push_id(effect.id, |ui| {
+                            // Effect header
+                            ui.horizontal(|ui| {
+                                // Bypass button (B)
+                                let bypass_color = if effect.bypassed {
+                                    egui::Color32::GRAY
+                                } else {
+                                    egui::Color32::GREEN
+                                };
+                                if ui
+                                    .small_button(egui::RichText::new("B").color(bypass_color))
+                                    .on_hover_text(if effect.bypassed { "Enable effect" } else { "Bypass effect" })
+                                    .clicked()
+                                {
+                                    actions.push(PropertiesAction::SetLayerEffectBypassed {
+                                        layer_id,
+                                        effect_id: effect.id,
+                                        bypassed: !effect.bypassed,
+                                    });
+                                }
+
+                                // Solo button (S)
+                                let solo_color = if effect.soloed {
+                                    egui::Color32::YELLOW
+                                } else {
+                                    egui::Color32::GRAY
+                                };
+                                if ui
+                                    .small_button(egui::RichText::new("S").color(solo_color))
+                                    .on_hover_text(if effect.soloed { "Unsolo effect" } else { "Solo this effect" })
+                                    .clicked()
+                                {
+                                    actions.push(PropertiesAction::SetLayerEffectSoloed {
+                                        layer_id,
+                                        effect_id: effect.id,
+                                        soloed: !effect.soloed,
+                                    });
+                                }
+
+                                // Effect name
+                                let name_style = if effect.bypassed {
+                                    egui::RichText::new(&effect.name).strikethrough().color(egui::Color32::GRAY)
+                                } else {
+                                    egui::RichText::new(&effect.name)
+                                };
+                                ui.label(name_style);
+
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    // Remove button
+                                    if ui.small_button("✕").on_hover_text("Remove effect").clicked() {
+                                        actions.push(PropertiesAction::RemoveLayerEffect {
+                                            layer_id,
+                                            effect_id: effect.id,
+                                        });
+                                    }
+
+                                    // Move up/down buttons
+                                    if index > 0 && ui.small_button("▲").on_hover_text("Move up").clicked() {
+                                        actions.push(PropertiesAction::ReorderLayerEffect {
+                                            layer_id,
+                                            effect_id: effect.id,
+                                            new_index: index - 1,
+                                        });
+                                    }
+                                    if index < effects.effects.len() - 1
+                                        && ui.small_button("▼").on_hover_text("Move down").clicked()
+                                    {
+                                        actions.push(PropertiesAction::ReorderLayerEffect {
+                                            layer_id,
+                                            effect_id: effect.id,
+                                            new_index: index + 1,
+                                        });
+                                    }
+                                });
+                            });
+
+                            // Render parameters if not bypassed
+                            if !effect.bypassed {
+                                ui.indent(effect.id, |ui| {
+                                    for param in &effect.parameters {
+                                        self.render_effect_parameter(ui, layer_id, effect.id, param, actions);
+                                    }
+                                });
+                            }
+
+                            ui.add_space(4.0);
+                        });
+                    }
+                }
+            })
+        });
+
+        // Handle dropped effect
+        // dnd_drop_zone returns (InnerResponse<R>, Option<Arc<T>>)
+        if let Some(dragged_effect) = drop_response.inner.1 {
+            actions.push(PropertiesAction::AddLayerEffect {
+                layer_id,
+                effect_type: dragged_effect.effect_type.clone(),
+            });
+        }
+
+        ui.add_space(8.0);
+
+        // Add effect button with dropdown
+        ui.horizontal(|ui| {
+            ui.menu_button("+ Add Effect", |ui| {
+                for category in effect_registry.categories() {
+                    ui.menu_button(category, |ui| {
+                        if let Some(effect_types) = effect_registry.effects_in_category(category) {
+                            for effect_type in effect_types {
+                                if let Some(def) = effect_registry.get(effect_type) {
+                                    if ui.button(def.display_name()).clicked() {
+                                        actions.push(PropertiesAction::AddLayerEffect {
+                                            layer_id,
+                                            effect_type: effect_type.clone(),
+                                        });
+                                        ui.close_menu();
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+            });
+        });
+    }
+
+    /// Render a single effect parameter
+    fn render_effect_parameter(
+        &self,
+        ui: &mut egui::Ui,
+        layer_id: u32,
+        effect_id: u32,
+        param: &crate::effects::Parameter,
+        actions: &mut Vec<PropertiesAction>,
+    ) {
+        use crate::effects::ParameterValue;
+
+        ui.horizontal(|ui| {
+            ui.label(&param.meta.label);
+
+            match &param.value {
+                ParameterValue::Float(value) => {
+                    let mut val = *value;
+                    let range = param.meta.min.unwrap_or(0.0)..=param.meta.max.unwrap_or(1.0);
+                    let response = ui.add(egui::Slider::new(&mut val, range))
+                        .on_hover_text("Right-click to reset to default");
+
+                    if response.changed() {
+                        actions.push(PropertiesAction::SetLayerEffectParameter {
+                            layer_id,
+                            effect_id,
+                            param_name: param.meta.name.clone(),
+                            value: ParameterValue::Float(val),
+                        });
+                    }
+
+                    // Right-click to reset to default (check rect for slider bar clicks)
+                    let clicked_in_rect = ui.input(|i| {
+                        i.pointer.secondary_clicked() &&
+                        response.rect.contains(i.pointer.interact_pos().unwrap_or_default())
+                    });
+                    if response.secondary_clicked() || clicked_in_rect {
+                        if let ParameterValue::Float(default_val) = param.meta.default {
+                            actions.push(PropertiesAction::SetLayerEffectParameter {
+                                layer_id,
+                                effect_id,
+                                param_name: param.meta.name.clone(),
+                                value: ParameterValue::Float(default_val),
+                            });
+                        }
+                    }
+                }
+                ParameterValue::Int(value) => {
+                    let mut val = *value;
+                    let range = param.meta.min.unwrap_or(0.0) as i32..=param.meta.max.unwrap_or(100.0) as i32;
+                    let response = ui.add(egui::Slider::new(&mut val, range))
+                        .on_hover_text("Right-click to reset to default");
+
+                    if response.changed() {
+                        actions.push(PropertiesAction::SetLayerEffectParameter {
+                            layer_id,
+                            effect_id,
+                            param_name: param.meta.name.clone(),
+                            value: ParameterValue::Int(val),
+                        });
+                    }
+
+                    // Right-click to reset to default (check rect for slider bar clicks)
+                    let clicked_in_rect = ui.input(|i| {
+                        i.pointer.secondary_clicked() &&
+                        response.rect.contains(i.pointer.interact_pos().unwrap_or_default())
+                    });
+                    if response.secondary_clicked() || clicked_in_rect {
+                        if let ParameterValue::Int(default_val) = param.meta.default {
+                            actions.push(PropertiesAction::SetLayerEffectParameter {
+                                layer_id,
+                                effect_id,
+                                param_name: param.meta.name.clone(),
+                                value: ParameterValue::Int(default_val),
+                            });
+                        }
+                    }
+                }
+                ParameterValue::Bool(value) => {
+                    let mut val = *value;
+                    let response = ui.checkbox(&mut val, "")
+                        .on_hover_text("Right-click to reset to default");
+
+                    if response.changed() {
+                        actions.push(PropertiesAction::SetLayerEffectParameter {
+                            layer_id,
+                            effect_id,
+                            param_name: param.meta.name.clone(),
+                            value: ParameterValue::Bool(val),
+                        });
+                    }
+
+                    // Right-click to reset to default
+                    if response.secondary_clicked() {
+                        if let ParameterValue::Bool(default_val) = param.meta.default {
+                            actions.push(PropertiesAction::SetLayerEffectParameter {
+                                layer_id,
+                                effect_id,
+                                param_name: param.meta.name.clone(),
+                                value: ParameterValue::Bool(default_val),
+                            });
+                        }
+                    }
+                }
+                _ => {
+                    // Other parameter types (Color, Vec2, Enum) can be added later
+                    ui.label("(unsupported type)");
+                }
+            }
+        });
     }
 
     /// Render the Clip tab
@@ -795,18 +1158,25 @@ impl PropertiesPanel {
             return;
         };
 
-        // Get active clip
-        let Some(active_slot) = layer.active_clip else {
+        // Use selected clip if set, otherwise fall back to active clip
+        let clip_slot = self.selected_clip_slot.or(layer.active_clip);
+
+        let Some(slot) = clip_slot else {
             ui.centered_and_justified(|ui| {
-                ui.label("No clip playing on this layer");
+                ui.label("No clip selected");
             });
             return;
         };
 
-        let Some(clip) = layer.get_clip(active_slot) else {
-            ui.label("Active clip not found");
+        let Some(clip) = layer.get_clip(slot) else {
+            ui.centered_and_justified(|ui| {
+                ui.label("Selected clip not found");
+            });
             return;
         };
+
+        // Check if this clip is currently playing
+        let is_playing = layer.active_clip == Some(slot);
 
         ui.heading("Clip Info");
         ui.add_space(8.0);
@@ -825,7 +1195,8 @@ impl PropertiesPanel {
         );
 
         ui.add_space(8.0);
-        ui.label(format!("Slot: {}", active_slot + 1));
+        let status = if is_playing { " (playing)" } else { "" };
+        ui.label(format!("Slot: {}{}", slot + 1, status));
 
         ui.add_space(16.0);
         ui.separator();

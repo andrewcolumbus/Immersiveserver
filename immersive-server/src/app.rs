@@ -127,8 +127,14 @@ pub struct App {
     pub properties_panel: crate::ui::PropertiesPanel,
     /// Sources panel for drag-and-drop of OMT/NDI sources
     pub sources_panel: crate::ui::SourcesPanel,
+    /// Effects browser panel for drag-and-drop of effects
+    pub effects_browser_panel: crate::ui::EffectsBrowserPanel,
     /// File browser panel for drag-and-drop of video files
     pub file_browser_panel: crate::ui::FileBrowserPanel,
+    /// Preview monitor panel for previewing clips before triggering
+    pub preview_monitor_panel: crate::ui::PreviewMonitorPanel,
+    /// Preview player for clip preview playback
+    preview_player: crate::preview_player::PreviewPlayer,
     /// Thumbnail cache for video previews in clip grid
     pub thumbnail_cache: crate::ui::ThumbnailCache,
     /// HAP Converter window
@@ -169,6 +175,22 @@ pub struct App {
     tokio_runtime: Option<tokio::runtime::Runtime>,
     /// Pending OMT sender from background start (received when ready)
     pending_omt_sender: Option<std::sync::mpsc::Receiver<Result<crate::network::OmtSender, String>>>,
+
+    // Syphon/Spout texture sharing
+    /// Texture sharer for Syphon (macOS) or Spout (Windows)
+    #[cfg(target_os = "macos")]
+    texture_sharer: Option<crate::network::SyphonSharer>,
+    #[cfg(target_os = "windows")]
+    spout_capture: Option<crate::network::SpoutCapture>,
+    /// Whether texture sharing is enabled
+    texture_share_enabled: bool,
+    /// Metal command queue for Syphon (macOS only)
+    #[cfg(target_os = "macos")]
+    metal_command_queue: Option<metal::CommandQueue>,
+
+    // Effects system
+    /// Effect manager for processing effects on layers and environment
+    effect_manager: crate::effects::EffectManager,
 }
 
 impl App {
@@ -372,6 +394,7 @@ impl App {
 
         let now = Instant::now();
         let initial_target_fps = settings.target_fps as f64;
+        let texture_share_enabled = settings.texture_share_enabled;
 
         Self {
             window,
@@ -421,15 +444,28 @@ impl App {
                     crate::ui::DockZone::Left,
                 ));
                 dm.register_panel(crate::ui::DockablePanel::new(
+                    crate::ui::dock::panel_ids::EFFECTS_BROWSER,
+                    "Effects",
+                    crate::ui::DockZone::Left,
+                ));
+                dm.register_panel(crate::ui::DockablePanel::new(
                     crate::ui::dock::panel_ids::FILES,
                     "Files",
                     crate::ui::DockZone::Left,
+                ));
+                dm.register_panel(crate::ui::DockablePanel::new(
+                    crate::ui::dock::panel_ids::PREVIEW_MONITOR,
+                    "Preview Monitor",
+                    crate::ui::DockZone::Floating,
                 ));
                 dm
             },
             properties_panel: crate::ui::PropertiesPanel::new(),
             sources_panel: crate::ui::SourcesPanel::new(),
+            effects_browser_panel: crate::ui::EffectsBrowserPanel::new(),
             file_browser_panel: crate::ui::FileBrowserPanel::new(),
+            preview_monitor_panel: crate::ui::PreviewMonitorPanel::new(),
+            preview_player: crate::preview_player::PreviewPlayer::new(bc_texture_supported),
             thumbnail_cache: crate::ui::ThumbnailCache::new(),
             converter_window: crate::converter::ConverterWindow::new(),
             settings,
@@ -448,6 +484,18 @@ impl App {
             omt_broadcast_enabled: false, // Disabled by default - enable via menu
             tokio_runtime: Self::create_tokio_runtime(),
             pending_omt_sender: None,
+
+            // Syphon/Spout texture sharing
+            #[cfg(target_os = "macos")]
+            texture_sharer: None,
+            #[cfg(target_os = "windows")]
+            spout_capture: None,
+            texture_share_enabled,
+            #[cfg(target_os = "macos")]
+            metal_command_queue: None,
+
+            // Effects
+            effect_manager: crate::effects::EffectManager::new(),
         }
     }
 
@@ -950,6 +998,9 @@ impl App {
 
     /// Render a frame with egui UI
     pub fn render(&mut self) -> Result<bool, wgpu::SurfaceError> {
+        // Update effect manager timing (BPM clock, frame time)
+        self.effect_manager.update();
+
         // Poll for shader hot-reload (no-op in release builds)
         self.poll_shader_reload();
 
@@ -995,9 +1046,21 @@ impl App {
                     .map(|p| p.open).unwrap_or(false),
             ),
             (
+                crate::ui::dock::panel_ids::EFFECTS_BROWSER,
+                "Effects",
+                self.dock_manager.get_panel(crate::ui::dock::panel_ids::EFFECTS_BROWSER)
+                    .map(|p| p.open).unwrap_or(false),
+            ),
+            (
                 crate::ui::dock::panel_ids::FILES,
                 "Files",
                 self.dock_manager.get_panel(crate::ui::dock::panel_ids::FILES)
+                    .map(|p| p.open).unwrap_or(false),
+            ),
+            (
+                crate::ui::dock::panel_ids::PREVIEW_MONITOR,
+                "Preview Monitor",
+                self.dock_manager.get_panel(crate::ui::dock::panel_ids::PREVIEW_MONITOR)
                     .map(|p| p.open).unwrap_or(false),
             ),
         ];
@@ -1063,7 +1126,7 @@ impl App {
                                     });
                                 });
                                 ui.separator();
-                                actions = self.properties_panel.render(ui, &self.environment, &layers, &self.settings, omt_broadcasting);
+                                actions = self.properties_panel.render(ui, &self.environment, &layers, &self.settings, omt_broadcasting, self.texture_share_enabled, self.effect_manager.registry());
                             });
                         actions
                     }
@@ -1102,9 +1165,9 @@ impl App {
                                     });
                                 });
                                 ui.separator();
-                                actions = self.properties_panel.render(ui, &self.environment, &layers, &self.settings, omt_broadcasting);
+                                actions = self.properties_panel.render(ui, &self.environment, &layers, &self.settings, omt_broadcasting, self.texture_share_enabled, self.effect_manager.registry());
                             });
-                        
+
                         // Track window dragging for dock zone snapping
                         if let Some(resp) = &window_response {
                             if resp.response.drag_started() {
@@ -1307,6 +1370,49 @@ impl App {
             Vec::new()
         };
 
+        // Render effects browser panel (floating window)
+        let _effects_actions = if let Some(panel) = self.dock_manager.get_panel(crate::ui::dock::panel_ids::EFFECTS_BROWSER) {
+            if panel.open {
+                let floating_pos = panel.floating_pos;
+                let floating_size = panel.floating_size;
+                let mut actions = Vec::new();
+                let pos = floating_pos.unwrap_or((100.0, 400.0));
+                let size = floating_size.unwrap_or((250.0, 350.0));
+                let mut open = true;
+
+                let window_response = egui::Window::new("Effects")
+                    .id(egui::Id::new("effects_browser_window"))
+                    .default_pos(egui::pos2(pos.0, pos.1))
+                    .default_size(egui::vec2(size.0, size.1))
+                    .resizable(true)
+                    .collapsible(true)
+                    .open(&mut open)
+                    .show(&self.egui_ctx, |ui| {
+                        actions = self.effects_browser_panel.render_contents(ui, self.effect_manager.registry());
+                    });
+
+                // Update window position for persistence
+                if let Some(resp) = &window_response {
+                    let rect = resp.response.rect;
+                    if let Some(p) = self.dock_manager.get_panel_mut(crate::ui::dock::panel_ids::EFFECTS_BROWSER) {
+                        p.floating_pos = Some((rect.left(), rect.top()));
+                        p.floating_size = Some((rect.width(), rect.height()));
+                    }
+                }
+
+                if !open {
+                    if let Some(p) = self.dock_manager.get_panel_mut(crate::ui::dock::panel_ids::EFFECTS_BROWSER) {
+                        p.open = false;
+                    }
+                }
+                actions
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
         // Render file browser panel (floating window)
         if let Some(panel) = self.dock_manager.get_panel(crate::ui::dock::panel_ids::FILES) {
             if panel.open {
@@ -1344,6 +1450,79 @@ impl App {
             }
         }
 
+        // Render preview monitor panel (floating window)
+        let preview_actions = if let Some(panel) = self.dock_manager.get_panel(crate::ui::dock::panel_ids::PREVIEW_MONITOR) {
+            if panel.open {
+                let floating_pos = panel.floating_pos;
+                let floating_size = panel.floating_size;
+                let mut actions = Vec::new();
+                let pos = floating_pos.unwrap_or((600.0, 100.0));
+                let size = floating_size.unwrap_or((320.0, 280.0));
+                let mut open = true;
+
+                let has_frame = self.preview_player.has_frame();
+                let is_playing = !self.preview_player.is_paused();
+                let video_info = self.preview_player.video_info();
+
+                let window_response = egui::Window::new("Preview Monitor")
+                    .id(egui::Id::new("preview_monitor_window"))
+                    .default_pos(egui::pos2(pos.0, pos.1))
+                    .default_size(egui::vec2(size.0, size.1))
+                    .resizable(true)
+                    .collapsible(true)
+                    .open(&mut open)
+                    .show(&self.egui_ctx, |ui| {
+                        actions = self.preview_monitor_panel.render_contents(
+                            ui,
+                            has_frame,
+                            is_playing,
+                            video_info,
+                            |ui, rect| {
+                                // Render the preview texture into the given rect
+                                if let (Some(bind_group), Some(params_buffer)) =
+                                    (self.preview_player.bind_group(), self.preview_player.params_buffer())
+                                {
+                                    // For now, just draw a placeholder rectangle
+                                    // Full GPU rendering would require more integration
+                                    ui.painter().rect_filled(
+                                        rect,
+                                        4.0,
+                                        egui::Color32::from_rgb(30, 60, 30),
+                                    );
+                                    ui.painter().text(
+                                        rect.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        "Preview Active",
+                                        egui::FontId::proportional(11.0),
+                                        egui::Color32::WHITE,
+                                    );
+                                }
+                            },
+                        );
+                    });
+
+                // Update window position for persistence
+                if let Some(resp) = &window_response {
+                    let rect = resp.response.rect;
+                    if let Some(p) = self.dock_manager.get_panel_mut(crate::ui::dock::panel_ids::PREVIEW_MONITOR) {
+                        p.floating_pos = Some((rect.left(), rect.top()));
+                        p.floating_size = Some((rect.width(), rect.height()));
+                    }
+                }
+
+                if !open {
+                    if let Some(p) = self.dock_manager.get_panel_mut(crate::ui::dock::panel_ids::PREVIEW_MONITOR) {
+                        p.open = false;
+                    }
+                }
+                actions
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
         // Apply environment resolution changes (if any) before rendering.
         self.sync_environment_from_settings();
 
@@ -1357,6 +1536,11 @@ impl App {
         // Process sources panel actions
         for action in sources_actions {
             self.handle_sources_action(action);
+        }
+
+        // Process preview monitor actions
+        for action in preview_actions {
+            self.handle_preview_action(action);
         }
 
         self.egui_state
@@ -1453,26 +1637,117 @@ impl App {
 
                             // Skip rendering if fully transparent
                             if effective_opacity > 0.0 {
-                                // Create LayerParams with full transform support
-                                let mut params = LayerParams::from_layer(
-                                    layer,
-                                    runtime.video_width,
-                                    runtime.video_height,
-                                    self.environment.width(),
-                                    self.environment.height(),
-                                );
-                                params.opacity = effective_opacity;
-                                // Write to this layer's params buffer (not shared)
-                                self.video_renderer.write_layer_params(&self.queue, params_buffer, &params);
+                                // Check if layer has active effects
+                                let active_effect_count = layer.effects.active_effects().count();
 
-                                // Render this layer with its blend mode (no clear)
-                                self.video_renderer.render_with_blend(
-                                    &mut encoder,
-                                    self.environment.texture_view(),
-                                    bind_group,
-                                    layer.blend_mode,
-                                    false,
-                                );
+                                if active_effect_count > 0 {
+                                    // --- EFFECT PROCESSING PATH ---
+                                    // Effect textures are VIDEO-SIZED so effects process at native resolution
+
+                                    // 1. Ensure effect runtime exists with VIDEO dimensions (not environment)
+                                    self.effect_manager.ensure_layer_runtime(
+                                        layer.id,
+                                        &self.device,
+                                        runtime.video_width,
+                                        runtime.video_height,
+                                        self.config.format,
+                                    );
+
+                                    // 2. Sync effect runtimes with current effect stack
+                                    self.effect_manager.sync_layer_effects(
+                                        layer.id,
+                                        &layer.effects,
+                                        &self.device,
+                                        &self.queue,
+                                        self.config.format,
+                                    );
+
+                                    // 3. Copy video texture to effect input (1:1, NO transforms)
+                                    // Use simple blit shader that does pure 1:1 copy
+                                    if let Some(video_texture) = &runtime.texture {
+                                        if let Some(effect_runtime) = self.effect_manager.get_layer_runtime(layer.id) {
+                                            effect_runtime.copy_input_texture(
+                                                &mut encoder,
+                                                &self.device,
+                                                video_texture.view(),
+                                            );
+                                        }
+                                    }
+
+                                    // 4. Process effects through the chain
+                                    let effect_params = self.effect_manager.build_params();
+                                    if let Some(effect_runtime) = self.effect_manager.get_layer_runtime_mut(layer.id) {
+                                        if let (Some(input_view), Some(output_view)) = (
+                                            effect_runtime.input_view().map(|v| v as *const _),
+                                            effect_runtime.output_view(active_effect_count).map(|v| v as *const _),
+                                        ) {
+                                            // SAFETY: We're using raw pointers to work around borrow checker,
+                                            // but the views are valid for the lifetime of this scope
+                                            unsafe {
+                                                effect_runtime.process(
+                                                    &mut encoder,
+                                                    &self.queue,
+                                                    &self.device,
+                                                    &*input_view,
+                                                    &*output_view,
+                                                    &layer.effects,
+                                                    &effect_params,
+                                                );
+                                            }
+                                        }
+                                    }
+
+                                    // 5. Composite effect output to environment with layer transforms
+                                    // Effect texture is video-sized, use same params as non-effects path
+                                    if let Some(effect_runtime) = self.effect_manager.get_layer_runtime(layer.id) {
+                                        if let Some(effect_output_view) = effect_runtime.output_view(active_effect_count) {
+                                            // Use SAME params as non-effects path
+                                            // This handles size_scale, position, rotation, etc. correctly
+                                            let mut composite_params = LayerParams::from_layer(
+                                                layer,
+                                                runtime.video_width,
+                                                runtime.video_height,
+                                                self.environment.width(),
+                                                self.environment.height(),
+                                            );
+                                            composite_params.opacity = effective_opacity;
+                                            self.video_renderer.write_layer_params(&self.queue, params_buffer, &composite_params);
+
+                                            let effect_bind_group = self.video_renderer.create_bind_group_with_view(
+                                                &self.device,
+                                                effect_output_view,
+                                                params_buffer,
+                                            );
+
+                                            self.video_renderer.render_with_blend(
+                                                &mut encoder,
+                                                self.environment.texture_view(),
+                                                &effect_bind_group,
+                                                layer.blend_mode,
+                                                false,
+                                            );
+                                        }
+                                    }
+                                } else {
+                                    // --- NO EFFECTS - DIRECT RENDERING ---
+                                    let mut params = LayerParams::from_layer(
+                                        layer,
+                                        runtime.video_width,
+                                        runtime.video_height,
+                                        self.environment.width(),
+                                        self.environment.height(),
+                                    );
+                                    params.opacity = effective_opacity;
+                                    self.video_renderer.write_layer_params(&self.queue, params_buffer, &params);
+
+                                    self.video_renderer.render_with_blend(
+                                        &mut encoder,
+                                        self.environment.texture_view(),
+                                        bind_group,
+                                        layer.blend_mode,
+                                        false,
+                                    );
+                                }
                             }
                         }
                     }
@@ -1483,6 +1758,30 @@ impl App {
         // Capture environment texture for OMT output (before we move on to present)
         if self.omt_broadcast_enabled {
             if let Some(capture) = &mut self.omt_capture {
+                capture.capture_frame(&mut encoder, self.environment.texture());
+            }
+        }
+
+        // Publish environment texture via Syphon (macOS)
+        #[cfg(target_os = "macos")]
+        if self.texture_share_enabled {
+            if let (Some(ref sharer), Some(ref queue)) =
+                (&self.texture_sharer, &self.metal_command_queue)
+            {
+                unsafe {
+                    if let Err(e) =
+                        sharer.publish_wgpu_texture(&self.device, self.environment.texture(), queue)
+                    {
+                        log::warn!("Syphon: Failed to publish frame: {}", e);
+                    }
+                }
+            }
+        }
+
+        // Capture environment texture for Spout output (Windows)
+        #[cfg(target_os = "windows")]
+        if self.texture_share_enabled {
+            if let Some(capture) = &mut self.spout_capture {
                 capture.capture_frame(&mut encoder, self.environment.texture());
             }
         }
@@ -1553,6 +1852,14 @@ impl App {
         // Process OMT capture pipeline (non-blocking)
         if self.omt_broadcast_enabled {
             if let Some(capture) = &mut self.omt_capture {
+                capture.process(&self.device);
+            }
+        }
+
+        // Process Spout capture pipeline (Windows, non-blocking)
+        #[cfg(target_os = "windows")]
+        if self.texture_share_enabled {
+            if let Some(capture) = &mut self.spout_capture {
                 capture.process(&self.device);
             }
         }
@@ -1877,7 +2184,10 @@ impl App {
         for runtime in self.pending_runtimes.values_mut() {
             let _ = runtime.try_update_texture(&self.queue);
         }
-        
+
+        // Update preview player
+        self.preview_player.update(&self.queue);
+
         // Swap pending runtimes into active once they have a frame
         let ready_layers: Vec<u32> = self.pending_runtimes
             .iter()
@@ -2296,6 +2606,150 @@ impl App {
         self.pending_omt_sender.is_some()
     }
 
+    // =========================================
+    // Syphon/Spout Texture Sharing
+    // =========================================
+
+    /// Start texture sharing via Syphon (macOS) or Spout (Windows)
+    #[cfg(target_os = "macos")]
+    pub fn start_texture_sharing(&mut self) {
+        use crate::network::TextureSharer;
+        use metal::foreign_types::ForeignType;
+        use std::ffi::c_void;
+
+        if self.texture_sharer.is_some() {
+            log::info!("Syphon: Already sharing");
+            return;
+        }
+
+        // Extract Metal device and create command queue from wgpu
+        let metal_result: Option<(*mut c_void, metal::CommandQueue)> = unsafe {
+            self.device
+                .as_hal::<wgpu_hal::api::Metal, _, _>(|metal_device| {
+                    metal_device.map(|dev| {
+                        // Get the raw Metal device
+                        let raw_device = dev.raw_device();
+                        let device_guard = raw_device.lock();
+                        let device_ptr = device_guard.as_ptr() as *mut c_void;
+
+                        // Create a command queue for Syphon
+                        let queue = device_guard.new_command_queue();
+                        (device_ptr, queue)
+                    })
+                })
+        };
+
+        let (metal_device_ptr, command_queue) = match metal_result {
+            Some((ptr, queue)) => (ptr, queue),
+            None => {
+                log::error!("Syphon: Failed to get Metal device from wgpu");
+                self.menu_bar
+                    .set_status("Syphon error: Not running on Metal backend");
+                return;
+            }
+        };
+
+        // Create the Syphon sharer
+        let mut sharer = crate::network::SyphonSharer::new();
+
+        // Set the texture dimensions to share
+        sharer.set_dimensions(self.environment.width(), self.environment.height());
+
+        // Set the Metal device handle
+        unsafe {
+            sharer.set_metal_handles(metal_device_ptr, std::ptr::null_mut());
+        }
+
+        // Start sharing with a server name
+        let name = format!(
+            "Immersive Server - {}",
+            self.current_file
+                .as_ref()
+                .and_then(|p| p.file_stem())
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "Untitled".to_string())
+        );
+
+        match sharer.start(&name) {
+            Ok(()) => {
+                self.texture_sharer = Some(sharer);
+                self.metal_command_queue = Some(command_queue);
+                self.texture_share_enabled = true;
+                log::info!("Syphon: Started sharing as '{}'", name);
+                self.menu_bar
+                    .set_status(&format!("Syphon: Sharing as '{}'", name));
+            }
+            Err(e) => {
+                log::error!("Syphon: Failed to start: {}", e);
+                self.menu_bar.set_status(&format!("Syphon error: {}", e));
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn start_texture_sharing(&mut self) {
+        if self.spout_capture.is_some() {
+            log::info!("Spout: Already sharing");
+            return;
+        }
+
+        // Create the Spout capture
+        let mut capture = crate::network::SpoutCapture::new(
+            &self.device,
+            self.environment.width(),
+            self.environment.height(),
+        );
+
+        // Start sharing with a server name
+        let name = format!(
+            "Immersive Server - {}",
+            self.current_file
+                .as_ref()
+                .and_then(|p| p.file_stem())
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "environment".to_string())
+        );
+
+        match capture.start(&name) {
+            Ok(()) => {
+                self.spout_capture = Some(capture);
+                self.texture_share_enabled = true;
+                log::info!("Spout: Started sharing as '{}'", name);
+                self.menu_bar.set_status(&format!("Spout: Sharing as '{}'", name));
+            }
+            Err(e) => {
+                log::error!("Spout: Failed to start: {}", e);
+                self.menu_bar.set_status(&format!("Spout error: {}", e));
+            }
+        }
+    }
+
+    /// Stop texture sharing
+    #[cfg(target_os = "macos")]
+    pub fn stop_texture_sharing(&mut self) {
+        use crate::network::TextureSharer;
+
+        if let Some(ref mut sharer) = self.texture_sharer {
+            sharer.stop();
+        }
+        self.texture_sharer = None;
+        self.metal_command_queue = None;
+        self.texture_share_enabled = false;
+        log::info!("Syphon: Stopped sharing");
+        self.menu_bar.set_status("Syphon: Stopped");
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn stop_texture_sharing(&mut self) {
+        if let Some(ref mut capture) = self.spout_capture {
+            capture.stop();
+        }
+        self.spout_capture = None;
+        self.texture_share_enabled = false;
+        log::info!("Spout: Stopped sharing");
+        self.menu_bar.set_status("Spout: Stopped");
+    }
+
     /// Get the number of discovered OMT sources
     pub fn omt_source_count(&self) -> usize {
         self.omt_discovery.as_ref().map(|d| d.source_count()).unwrap_or(0)
@@ -2448,6 +2902,12 @@ impl App {
                     log::error!("Failed to trigger clip: {}", e);
                     self.menu_bar.set_status(format!("Failed to trigger clip: {}", e));
                 }
+                // Select the clip in the properties panel
+                self.properties_panel.select_clip(layer_id, slot);
+                // Ensure properties panel is visible
+                if let Some(p) = self.dock_manager.get_panel_mut(crate::ui::dock::panel_ids::PROPERTIES) {
+                    p.open = true;
+                }
             }
             ClipGridAction::StopClip { layer_id } => {
                 self.stop_clip_with_fade(layer_id);
@@ -2512,6 +2972,47 @@ impl App {
             ClipGridAction::AssignOmtSource { layer_id, slot, address, name } => {
                 // Assign an OMT source to a clip slot
                 self.set_layer_omt_clip(layer_id, slot, address, name);
+            }
+            ClipGridAction::SelectClipForPreview { layer_id, slot } => {
+                // Select clip for preview without triggering it
+                // Load the clip into the preview player
+                if let Some(layer) = self.environment.layers().iter().find(|l| l.id == layer_id) {
+                    if let Some(clip) = layer.get_clip(slot) {
+                        // Set the clip info in the preview panel
+                        let source_info = match &clip.source {
+                            crate::compositor::ClipSource::File { path } => path.display().to_string(),
+                            crate::compositor::ClipSource::Omt { address, .. } => format!("OMT: {}", address),
+                        };
+                        self.preview_monitor_panel.set_preview_clip(crate::ui::PreviewClipInfo {
+                            layer_id,
+                            slot,
+                            name: clip.display_name(),
+                            source_info,
+                        });
+
+                        // Load the clip into the preview player
+                        match &clip.source {
+                            crate::compositor::ClipSource::File { path } => {
+                                if let Err(e) = self.preview_player.load(path, &self.device, &self.video_renderer) {
+                                    log::warn!("Failed to load preview: {}", e);
+                                    self.menu_bar.set_status(format!("Preview failed: {}", e));
+                                }
+                            }
+                            crate::compositor::ClipSource::Omt { .. } => {
+                                log::info!("OMT preview not yet implemented");
+                                self.menu_bar.set_status("OMT preview not yet supported".to_string());
+                            }
+                        }
+
+                        // Select in properties panel too
+                        self.properties_panel.select_clip(layer_id, slot);
+
+                        // Open preview monitor panel
+                        if let Some(p) = self.dock_manager.get_panel_mut(crate::ui::dock::panel_ids::PREVIEW_MONITOR) {
+                            p.open = true;
+                        }
+                    }
+                }
             }
         }
     }
@@ -2591,6 +3092,82 @@ impl App {
                 self.settings.thumbnail_mode = mode;
                 // Cache will be automatically cleared on next poll via set_mode()
             }
+            PropertiesAction::SetTextureShare { enabled } => {
+                self.settings.texture_share_enabled = enabled;
+                self.texture_share_enabled = enabled;
+
+                #[cfg(target_os = "macos")]
+                {
+                    if enabled {
+                        self.start_texture_sharing();
+                    } else {
+                        self.stop_texture_sharing();
+                    }
+                }
+
+                #[cfg(target_os = "windows")]
+                {
+                    if enabled {
+                        self.start_texture_sharing();
+                    } else {
+                        self.stop_texture_sharing();
+                    }
+                }
+
+                #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+                {
+                    log::warn!("Texture sharing not available on this platform");
+                }
+            }
+
+            // Effect-related actions
+            PropertiesAction::AddLayerEffect { layer_id, effect_type } => {
+                if let Some(layer) = self.environment.get_layer_mut(layer_id) {
+                    // Get default parameters for this effect type
+                    if let Some(params) = self.effect_manager.registry().default_parameters(&effect_type) {
+                        let display_name = self.effect_manager.registry()
+                            .display_name(&effect_type)
+                            .unwrap_or(&effect_type)
+                            .to_string();
+                        layer.effects.add(&effect_type, &display_name, params);
+                        log::info!("Added effect '{}' to layer {}", display_name, layer_id);
+                    }
+                }
+            }
+            PropertiesAction::RemoveLayerEffect { layer_id, effect_id } => {
+                if let Some(layer) = self.environment.get_layer_mut(layer_id) {
+                    layer.effects.remove(effect_id);
+                    log::info!("Removed effect {} from layer {}", effect_id, layer_id);
+                }
+            }
+            PropertiesAction::SetLayerEffectBypassed { layer_id, effect_id, bypassed } => {
+                if let Some(layer) = self.environment.get_layer_mut(layer_id) {
+                    if let Some(effect) = layer.effects.get_mut(effect_id) {
+                        effect.bypassed = bypassed;
+                    }
+                }
+            }
+            PropertiesAction::SetLayerEffectSoloed { layer_id, effect_id, soloed } => {
+                if let Some(layer) = self.environment.get_layer_mut(layer_id) {
+                    if soloed {
+                        layer.effects.solo(effect_id);
+                    } else {
+                        layer.effects.unsolo();
+                    }
+                }
+            }
+            PropertiesAction::SetLayerEffectParameter { layer_id, effect_id, param_name, value } => {
+                if let Some(layer) = self.environment.get_layer_mut(layer_id) {
+                    if let Some(effect) = layer.effects.get_mut(effect_id) {
+                        effect.set_parameter(&param_name, value);
+                    }
+                }
+            }
+            PropertiesAction::ReorderLayerEffect { layer_id, effect_id, new_index } => {
+                if let Some(layer) = self.environment.get_layer_mut(layer_id) {
+                    layer.effects.move_effect(effect_id, new_index);
+                }
+            }
         }
     }
 
@@ -2601,6 +3178,27 @@ impl App {
         match action {
             SourcesAction::RefreshOmtSources => {
                 self.refresh_omt_sources();
+            }
+        }
+    }
+
+    /// Handle a preview monitor panel action from the UI
+    fn handle_preview_action(&mut self, action: crate::ui::PreviewMonitorAction) {
+        use crate::ui::PreviewMonitorAction;
+
+        match action {
+            PreviewMonitorAction::TogglePlayback => {
+                self.preview_player.toggle_pause();
+            }
+            PreviewMonitorAction::RestartPreview => {
+                self.preview_player.restart();
+            }
+            PreviewMonitorAction::TriggerToLayer { layer_id, slot } => {
+                // Trigger the previewed clip to its layer (go live)
+                if let Err(e) = self.trigger_clip(layer_id, slot) {
+                    log::error!("Failed to trigger clip from preview: {}", e);
+                    self.menu_bar.set_status(format!("Failed to trigger clip: {}", e));
+                }
             }
         }
     }

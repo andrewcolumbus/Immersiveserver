@@ -6,8 +6,10 @@
 pub mod app;
 pub mod compositor;
 pub mod converter;
+pub mod effects;
 pub mod layer_runtime;
 pub mod network;
+pub mod preview_player;
 pub mod settings;
 pub mod shaders;
 pub mod ui;
@@ -15,7 +17,13 @@ pub mod video;
 
 pub use app::App;
 pub use compositor::{BlendMode, ClipCell, ClipSource, ClipTransition, DEFAULT_CLIP_SLOTS, Environment, Layer, LayerSource, Transform2D, Viewport};
+pub use effects::{
+    BpmClock, EffectDefinition, EffectInstance, EffectManager, EffectParams, EffectProcessor,
+    EffectRegistry, EffectStack, EffectStackRuntime, EffectTarget, GpuEffectRuntime, Parameter,
+    ParameterMeta, ParameterValue, ParamBuilder,
+};
 pub use layer_runtime::LayerRuntime;
+pub use preview_player::PreviewPlayer;
 pub use settings::{AppPreferences, EnvironmentSettings};
 pub use video::{DecodedFrame, LayerParams, VideoDecoder, VideoDecoderError, VideoInfo, VideoParams, VideoPlayer, VideoRenderer, VideoTexture};
 pub use network::{DiscoveredSource, OmtFrame, OmtReceiver, OmtSender, SourceDiscovery, SourceType};

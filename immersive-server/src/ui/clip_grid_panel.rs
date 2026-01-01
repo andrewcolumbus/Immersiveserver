@@ -96,6 +96,11 @@ pub enum ClipGridAction {
     SelectLayer {
         layer_id: u32,
     },
+    /// Select a clip for preview (without triggering it live)
+    SelectClipForPreview {
+        layer_id: u32,
+        slot: usize,
+    },
 }
 
 /// State for the clip grid panel
@@ -616,9 +621,23 @@ impl ClipGridPanel {
         }
 
         // Handle left-click: trigger clip, stop layer, or open file picker
+        // The bottom 18px is the "label area" - clicking there selects for preview only
         if response.clicked() {
             if cell.is_some() {
-                actions.push(ClipGridAction::TriggerClip { layer_id, slot });
+                // Check if click was in the label area (bottom 18px of cell)
+                let label_area_top = response.rect.bottom() - 18.0;
+                let click_in_label = response
+                    .interact_pointer_pos()
+                    .map(|pos| pos.y >= label_area_top)
+                    .unwrap_or(false);
+
+                if click_in_label {
+                    // Label click: select for preview only (don't trigger)
+                    actions.push(ClipGridAction::SelectClipForPreview { layer_id, slot });
+                } else {
+                    // Main cell click: trigger the clip
+                    actions.push(ClipGridAction::TriggerClip { layer_id, slot });
+                }
             } else if layer_has_active_clip {
                 // Empty cell clicked while layer is playing - stop the layer
                 actions.push(ClipGridAction::StopClip { layer_id });

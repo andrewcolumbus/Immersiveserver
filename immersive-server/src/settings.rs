@@ -91,6 +91,10 @@ pub struct EnvironmentSettings {
     #[serde(rename = "omtCaptureFps", default = "default_omt_capture_fps")]
     pub omt_capture_fps: u32,
 
+    /// Whether Syphon (macOS) / Spout (Windows) texture sharing is enabled
+    #[serde(rename = "textureShareEnabled", default)]
+    pub texture_share_enabled: bool,
+
     /// Thumbnail display mode (Fit or Fill)
     #[serde(rename = "thumbnailMode", default)]
     pub thumbnail_mode: ThumbnailMode,
@@ -119,6 +123,7 @@ impl Default for EnvironmentSettings {
             global_clip_count: default_clip_columns(),
             omt_broadcast_enabled: false,
             omt_capture_fps: default_omt_capture_fps(),
+            texture_share_enabled: false,
             thumbnail_mode: ThumbnailMode::default(),
         }
     }

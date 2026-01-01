@@ -269,7 +269,9 @@ impl LibOmtSender {
 
         let result = unsafe { omt_send(self.handle, &mut frame) };
 
-        if result != 0 {
+        // libOMT returns encoding time in microseconds on success, negative on error.
+        // Positive values (even large ones like 640000 = 640ms) indicate success.
+        if result < 0 {
             Err(format!("omt_send failed with code {}", result))
         } else {
             Ok(())

@@ -521,6 +521,41 @@ impl VideoRenderer {
         queue.write_buffer(buffer, 0, bytemuck::bytes_of(params));
     }
 
+    /// Create a bind group from an arbitrary texture view.
+    ///
+    /// This is used for compositing effect output textures back to the environment.
+    /// The texture view should be compatible with the bind group layout (2D, float, filterable).
+    ///
+    /// # Arguments
+    /// * `device` - The wgpu device
+    /// * `texture_view` - The texture view to bind
+    /// * `params_buffer` - The params buffer for GPU uniforms
+    pub fn create_bind_group_with_view(
+        &self,
+        device: &wgpu::Device,
+        texture_view: &wgpu::TextureView,
+        params_buffer: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Effect Output Bind Group"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(texture_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: params_buffer.as_entire_binding(),
+                },
+            ],
+        })
+    }
+
     /// Render video to the output texture
     /// Render video to the output texture with a specific blend mode
     ///

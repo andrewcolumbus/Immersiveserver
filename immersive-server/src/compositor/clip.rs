@@ -7,6 +7,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::effects::EffectStack;
+
 /// Default number of clip slots per layer
 pub const DEFAULT_CLIP_SLOTS: usize = 8;
 
@@ -14,7 +16,7 @@ pub const DEFAULT_CLIP_SLOTS: usize = 8;
 pub const DEFAULT_TRANSITION_DURATION_MS: u32 = 500;
 
 /// The source type for a clip
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ClipSource {
     /// Local video file
     File {
@@ -30,6 +32,63 @@ pub enum ClipSource {
     },
     // Future: NDI source
     // Ndi { source_name: String },
+}
+
+/// Helper struct for ClipSource serialization (quick-xml compatible)
+#[derive(Serialize, Deserialize)]
+struct ClipSourceHelper {
+    #[serde(rename = "type")]
+    source_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+}
+
+impl Serialize for ClipSource {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let helper = match self {
+            ClipSource::File { path } => ClipSourceHelper {
+                source_type: "File".to_string(),
+                path: Some(path.clone()),
+                address: None,
+                name: None,
+            },
+            ClipSource::Omt { address, name } => ClipSourceHelper {
+                source_type: "Omt".to_string(),
+                path: None,
+                address: Some(address.clone()),
+                name: Some(name.clone()),
+            },
+        };
+        helper.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ClipSource {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let helper = ClipSourceHelper::deserialize(deserializer)?;
+        match helper.source_type.as_str() {
+            "File" => Ok(ClipSource::File {
+                path: helper.path.unwrap_or_default(),
+            }),
+            "Omt" => Ok(ClipSource::Omt {
+                address: helper.address.unwrap_or_default(),
+                name: helper.name.unwrap_or_default(),
+            }),
+            _ => Ok(ClipSource::File {
+                path: helper.path.unwrap_or_default(),
+            }),
+        }
+    }
 }
 
 impl Default for ClipSource {
@@ -176,6 +235,10 @@ pub struct ClipCell {
 
     /// Optional user-defined label for the cell
     pub label: Option<String>,
+
+    /// Effect stack for this clip
+    #[serde(default)]
+    pub effects: EffectStack,
 }
 
 /// Helper struct for deserializing ClipCell with backwards compatibility
@@ -187,6 +250,8 @@ struct ClipCellRaw {
     source_path: PathBuf,
     #[serde(default)]
     label: Option<String>,
+    #[serde(default)]
+    effects: EffectStack,
 }
 
 impl<'de> Deserialize<'de> for ClipCell {
@@ -222,6 +287,7 @@ impl<'de> Deserialize<'de> for ClipCell {
             source,
             source_path: raw.source_path,
             label: raw.label,
+            effects: raw.effects,
         })
     }
 }
@@ -245,6 +311,7 @@ impl ClipCell {
             source: ClipSource::File { path: path.clone() },
             source_path: path,
             label: None,
+            effects: EffectStack::new(),
         }
     }
 
@@ -255,6 +322,7 @@ impl ClipCell {
             source: ClipSource::File { path: path.clone() },
             source_path: path,
             label: Some(label.into()),
+            effects: EffectStack::new(),
         }
     }
 
@@ -268,6 +336,7 @@ impl ClipCell {
             },
             source_path: PathBuf::new(), // Empty for OMT sources
             label: Some(name_str),
+            effects: EffectStack::new(),
         }
     }
 

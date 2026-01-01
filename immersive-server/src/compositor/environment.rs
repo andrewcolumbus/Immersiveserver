@@ -8,6 +8,7 @@
 //! in back-to-front order.
 
 use super::Layer;
+use crate::effects::EffectStack;
 
 /// Fixed-resolution composition canvas backed by a GPU texture.
 ///
@@ -28,6 +29,8 @@ pub struct Environment {
     layers: Vec<Layer>,
     /// Next available layer ID
     next_layer_id: u32,
+    /// Master effect stack (applied to entire composition)
+    effects: EffectStack,
 }
 
 impl Environment {
@@ -51,6 +54,7 @@ impl Environment {
             texture_view,
             layers: Vec::new(),
             next_layer_id: 1,
+            effects: EffectStack::new(),
         }
     }
 
@@ -200,6 +204,23 @@ impl Environment {
     /// Clear all layers.
     pub fn clear_layers(&mut self) {
         self.layers.clear();
+    }
+
+    // ========== Effects Management ==========
+
+    /// Get the master effect stack (applied to entire composition).
+    pub fn effects(&self) -> &EffectStack {
+        &self.effects
+    }
+
+    /// Get the master effect stack mutably.
+    pub fn effects_mut(&mut self) -> &mut EffectStack {
+        &mut self.effects
+    }
+
+    /// Set the master effect stack.
+    pub fn set_effects(&mut self, effects: EffectStack) {
+        self.effects = effects;
     }
 
     // ========== Private Helpers ==========
