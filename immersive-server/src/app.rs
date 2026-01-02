@@ -919,10 +919,12 @@ impl App {
         self.update_layer_params_for_environment();
     }
 
-    /// Sync layers from environment to settings (for saving)
+    /// Sync layers and effects from environment to settings (for saving)
     pub fn sync_layers_to_settings(&mut self) {
         let layers: Vec<_> = self.environment.layers().to_vec();
         self.settings.set_layers(&layers);
+        // Also sync environment effects
+        self.settings.effects = self.environment.effects().clone();
     }
 
     /// Restore layers from settings (after loading)
@@ -977,6 +979,12 @@ impl App {
             log::info!("No saved layers, created 4 default layers with {} clip slots each", clip_count);
         } else {
             log::info!("Restored {} layers from settings", self.environment.layer_count());
+        }
+
+        // Restore environment effects from settings
+        *self.environment.effects_mut() = self.settings.effects.clone();
+        if !self.settings.effects.is_empty() {
+            log::info!("Restored {} master effects from settings", self.settings.effects.len());
         }
     }
 
@@ -1637,96 +1645,204 @@ impl App {
 
                             // Skip rendering if fully transparent
                             if effective_opacity > 0.0 {
-                                // Check if layer has active effects
-                                let active_effect_count = layer.effects.active_effects().count();
+                                // Get clip effects for the active clip
+                                let (clip_slot, clip_effects) = layer
+                                    .active_clip
+                                    .and_then(|slot| layer.get_clip(slot).map(|c| (slot, c)))
+                                    .map(|(slot, clip)| (Some(slot), Some(&clip.effects)))
+                                    .unwrap_or((None, None));
 
-                                if active_effect_count > 0 {
+                                let clip_active_effect_count = clip_effects
+                                    .map(|e| e.active_effects().count())
+                                    .unwrap_or(0);
+
+                                // Check if layer has active effects
+                                let layer_active_effect_count = layer.effects.active_effects().count();
+
+                                // Determine what effects path to take
+                                let has_clip_effects = clip_active_effect_count > 0;
+                                let has_layer_effects = layer_active_effect_count > 0;
+                                let has_any_effects = has_clip_effects || has_layer_effects;
+
+                                if has_any_effects {
                                     // --- EFFECT PROCESSING PATH ---
                                     // Effect textures are VIDEO-SIZED so effects process at native resolution
 
-                                    // 1. Ensure effect runtime exists with VIDEO dimensions (not environment)
-                                    self.effect_manager.ensure_layer_runtime(
-                                        layer.id,
-                                        &self.device,
-                                        runtime.video_width,
-                                        runtime.video_height,
-                                        self.config.format,
-                                    );
+                                    // Track what texture to use as input for the next stage
+                                    let mut current_input_is_clip_output = false;
 
-                                    // 2. Sync effect runtimes with current effect stack
-                                    self.effect_manager.sync_layer_effects(
-                                        layer.id,
-                                        &layer.effects,
-                                        &self.device,
-                                        &self.queue,
-                                        self.config.format,
-                                    );
-
-                                    // 3. Copy video texture to effect input (1:1, NO transforms)
-                                    // Use simple blit shader that does pure 1:1 copy
-                                    if let Some(video_texture) = &runtime.texture {
-                                        if let Some(effect_runtime) = self.effect_manager.get_layer_runtime(layer.id) {
-                                            effect_runtime.copy_input_texture(
-                                                &mut encoder,
+                                    // ========== CLIP EFFECTS ==========
+                                    if has_clip_effects {
+                                        if let Some(slot) = clip_slot {
+                                            // 1. Ensure clip effect runtime exists
+                                            self.effect_manager.ensure_clip_runtime(
+                                                layer.id,
+                                                slot,
                                                 &self.device,
-                                                video_texture.view(),
+                                                runtime.video_width,
+                                                runtime.video_height,
+                                                self.config.format,
                                             );
+
+                                            // 2. Sync clip effect runtimes
+                                            if let Some(clip_effect_stack) = clip_effects {
+                                                self.effect_manager.sync_clip_effects(
+                                                    layer.id,
+                                                    slot,
+                                                    clip_effect_stack,
+                                                    &self.device,
+                                                    &self.queue,
+                                                    self.config.format,
+                                                );
+                                            }
+
+                                            // 3. Copy video texture to clip effect input
+                                            if let Some(video_texture) = &runtime.texture {
+                                                if let Some(clip_runtime) = self.effect_manager.get_clip_runtime(layer.id, slot) {
+                                                    clip_runtime.copy_input_texture(
+                                                        &mut encoder,
+                                                        &self.device,
+                                                        video_texture.view(),
+                                                    );
+                                                }
+                                            }
+
+                                            // 4. Process clip effects
+                                            let effect_params = self.effect_manager.build_params();
+                                            if let Some(clip_runtime) = self.effect_manager.get_clip_runtime_mut(layer.id, slot) {
+                                                if let (Some(input_view), Some(output_view)) = (
+                                                    clip_runtime.input_view().map(|v| v as *const _),
+                                                    clip_runtime.output_view(clip_active_effect_count).map(|v| v as *const _),
+                                                ) {
+                                                    if let Some(clip_effect_stack) = clip_effects {
+                                                        unsafe {
+                                                            clip_runtime.process(
+                                                                &mut encoder,
+                                                                &self.queue,
+                                                                &self.device,
+                                                                &*input_view,
+                                                                &*output_view,
+                                                                clip_effect_stack,
+                                                                &effect_params,
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            current_input_is_clip_output = true;
                                         }
                                     }
 
-                                    // 4. Process effects through the chain
-                                    let effect_params = self.effect_manager.build_params();
-                                    if let Some(effect_runtime) = self.effect_manager.get_layer_runtime_mut(layer.id) {
-                                        if let (Some(input_view), Some(output_view)) = (
-                                            effect_runtime.input_view().map(|v| v as *const _),
-                                            effect_runtime.output_view(active_effect_count).map(|v| v as *const _),
-                                        ) {
-                                            // SAFETY: We're using raw pointers to work around borrow checker,
-                                            // but the views are valid for the lifetime of this scope
-                                            unsafe {
-                                                effect_runtime.process(
-                                                    &mut encoder,
-                                                    &self.queue,
-                                                    &self.device,
-                                                    &*input_view,
-                                                    &*output_view,
-                                                    &layer.effects,
-                                                    &effect_params,
-                                                );
+                                    // ========== LAYER EFFECTS ==========
+                                    if has_layer_effects {
+                                        // 1. Ensure layer effect runtime exists
+                                        self.effect_manager.ensure_layer_runtime(
+                                            layer.id,
+                                            &self.device,
+                                            runtime.video_width,
+                                            runtime.video_height,
+                                            self.config.format,
+                                        );
+
+                                        // 2. Sync layer effect runtimes
+                                        self.effect_manager.sync_layer_effects(
+                                            layer.id,
+                                            &layer.effects,
+                                            &self.device,
+                                            &self.queue,
+                                            self.config.format,
+                                        );
+
+                                        // 3. Copy input to layer effect input
+                                        // Input is either clip effect output or video texture
+                                        if current_input_is_clip_output {
+                                            // Use clip effect output as input
+                                            if let Some(slot) = clip_slot {
+                                                if let Some(clip_runtime) = self.effect_manager.get_clip_runtime(layer.id, slot) {
+                                                    if let Some(clip_output) = clip_runtime.output_view(clip_active_effect_count) {
+                                                        if let Some(layer_runtime) = self.effect_manager.get_layer_runtime(layer.id) {
+                                                            layer_runtime.copy_input_texture(
+                                                                &mut encoder,
+                                                                &self.device,
+                                                                clip_output,
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            // Use video texture directly
+                                            if let Some(video_texture) = &runtime.texture {
+                                                if let Some(layer_runtime) = self.effect_manager.get_layer_runtime(layer.id) {
+                                                    layer_runtime.copy_input_texture(
+                                                        &mut encoder,
+                                                        &self.device,
+                                                        video_texture.view(),
+                                                    );
+                                                }
+                                            }
+                                        }
+
+                                        // 4. Process layer effects
+                                        let effect_params = self.effect_manager.build_params();
+                                        if let Some(layer_runtime) = self.effect_manager.get_layer_runtime_mut(layer.id) {
+                                            if let (Some(input_view), Some(output_view)) = (
+                                                layer_runtime.input_view().map(|v| v as *const _),
+                                                layer_runtime.output_view(layer_active_effect_count).map(|v| v as *const _),
+                                            ) {
+                                                unsafe {
+                                                    layer_runtime.process(
+                                                        &mut encoder,
+                                                        &self.queue,
+                                                        &self.device,
+                                                        &*input_view,
+                                                        &*output_view,
+                                                        &layer.effects,
+                                                        &effect_params,
+                                                    );
+                                                }
                                             }
                                         }
                                     }
 
-                                    // 5. Composite effect output to environment with layer transforms
-                                    // Effect texture is video-sized, use same params as non-effects path
-                                    if let Some(effect_runtime) = self.effect_manager.get_layer_runtime(layer.id) {
-                                        if let Some(effect_output_view) = effect_runtime.output_view(active_effect_count) {
-                                            // Use SAME params as non-effects path
-                                            // This handles size_scale, position, rotation, etc. correctly
-                                            let mut composite_params = LayerParams::from_layer(
-                                                layer,
-                                                runtime.video_width,
-                                                runtime.video_height,
-                                                self.environment.width(),
-                                                self.environment.height(),
-                                            );
-                                            composite_params.opacity = effective_opacity;
-                                            self.video_renderer.write_layer_params(&self.queue, params_buffer, &composite_params);
+                                    // ========== COMPOSITE TO ENVIRONMENT ==========
+                                    // Determine which output to use: layer effects output or clip effects output
+                                    let final_output_view = if has_layer_effects {
+                                        self.effect_manager.get_layer_runtime(layer.id)
+                                            .and_then(|r| r.output_view(layer_active_effect_count))
+                                    } else if has_clip_effects {
+                                        clip_slot.and_then(|slot| {
+                                            self.effect_manager.get_clip_runtime(layer.id, slot)
+                                                .and_then(|r| r.output_view(clip_active_effect_count))
+                                        })
+                                    } else {
+                                        None
+                                    };
 
-                                            let effect_bind_group = self.video_renderer.create_bind_group_with_view(
-                                                &self.device,
-                                                effect_output_view,
-                                                params_buffer,
-                                            );
+                                    if let Some(effect_output_view) = final_output_view {
+                                        let mut composite_params = LayerParams::from_layer(
+                                            layer,
+                                            runtime.video_width,
+                                            runtime.video_height,
+                                            self.environment.width(),
+                                            self.environment.height(),
+                                        );
+                                        composite_params.opacity = effective_opacity;
+                                        self.video_renderer.write_layer_params(&self.queue, params_buffer, &composite_params);
 
-                                            self.video_renderer.render_with_blend(
-                                                &mut encoder,
-                                                self.environment.texture_view(),
-                                                &effect_bind_group,
-                                                layer.blend_mode,
-                                                false,
-                                            );
-                                        }
+                                        let effect_bind_group = self.video_renderer.create_bind_group_with_view(
+                                            &self.device,
+                                            effect_output_view,
+                                            params_buffer,
+                                        );
+
+                                        self.video_renderer.render_with_blend(
+                                            &mut encoder,
+                                            self.environment.texture_view(),
+                                            &effect_bind_group,
+                                            layer.blend_mode,
+                                            false,
+                                        );
                                     }
                                 } else {
                                     // --- NO EFFECTS - DIRECT RENDERING ---
@@ -1752,6 +1868,40 @@ impl App {
                         }
                     }
                 }
+            }
+        }
+
+        // ========== ENVIRONMENT EFFECTS (Master Post-Processing) ==========
+        // Process environment effects AFTER all layers composited, BEFORE capture/output
+        {
+            let env_effects = self.environment.effects();
+            let env_active_effect_count = env_effects.active_effects().count();
+
+            if env_active_effect_count > 0 {
+                // 1. Ensure environment effect runtime exists at ENVIRONMENT resolution
+                self.effect_manager.init_environment_effects(
+                    &self.device,
+                    self.environment.width(),
+                    self.environment.height(),
+                    self.config.format,
+                );
+
+                // 2. Sync environment effect runtimes
+                self.effect_manager.sync_environment_effects(
+                    env_effects,
+                    &self.device,
+                    &self.queue,
+                    self.config.format,
+                );
+
+                // 3. Process environment effects in-place on the environment texture
+                self.effect_manager.process_environment_effects(
+                    &mut encoder,
+                    &self.device,
+                    &self.queue,
+                    self.environment.texture_view(),
+                    env_effects,
+                );
             }
         }
 
@@ -3167,6 +3317,102 @@ impl App {
                 if let Some(layer) = self.environment.get_layer_mut(layer_id) {
                     layer.effects.move_effect(effect_id, new_index);
                 }
+            }
+
+            // Clip effect actions
+            PropertiesAction::AddClipEffect { layer_id, slot, effect_type } => {
+                if let Some(layer) = self.environment.get_layer_mut(layer_id) {
+                    if let Some(clip) = layer.get_clip_mut(slot) {
+                        if let Some(params) = self.effect_manager.registry().default_parameters(&effect_type) {
+                            let display_name = self.effect_manager.registry()
+                                .display_name(&effect_type)
+                                .unwrap_or(&effect_type)
+                                .to_string();
+                            clip.effects.add(&effect_type, &display_name, params);
+                            log::info!("Added effect '{}' to clip {} on layer {}", display_name, slot, layer_id);
+                        }
+                    }
+                }
+            }
+            PropertiesAction::RemoveClipEffect { layer_id, slot, effect_id } => {
+                if let Some(layer) = self.environment.get_layer_mut(layer_id) {
+                    if let Some(clip) = layer.get_clip_mut(slot) {
+                        clip.effects.remove(effect_id);
+                        log::info!("Removed effect {} from clip {} on layer {}", effect_id, slot, layer_id);
+                    }
+                }
+            }
+            PropertiesAction::SetClipEffectBypassed { layer_id, slot, effect_id, bypassed } => {
+                if let Some(layer) = self.environment.get_layer_mut(layer_id) {
+                    if let Some(clip) = layer.get_clip_mut(slot) {
+                        if let Some(effect) = clip.effects.get_mut(effect_id) {
+                            effect.bypassed = bypassed;
+                        }
+                    }
+                }
+            }
+            PropertiesAction::SetClipEffectSoloed { layer_id, slot, effect_id, soloed } => {
+                if let Some(layer) = self.environment.get_layer_mut(layer_id) {
+                    if let Some(clip) = layer.get_clip_mut(slot) {
+                        if soloed {
+                            clip.effects.solo(effect_id);
+                        } else {
+                            clip.effects.unsolo();
+                        }
+                    }
+                }
+            }
+            PropertiesAction::SetClipEffectParameter { layer_id, slot, effect_id, param_name, value } => {
+                if let Some(layer) = self.environment.get_layer_mut(layer_id) {
+                    if let Some(clip) = layer.get_clip_mut(slot) {
+                        if let Some(effect) = clip.effects.get_mut(effect_id) {
+                            effect.set_parameter(&param_name, value);
+                        }
+                    }
+                }
+            }
+            PropertiesAction::ReorderClipEffect { layer_id, slot, effect_id, new_index } => {
+                if let Some(layer) = self.environment.get_layer_mut(layer_id) {
+                    if let Some(clip) = layer.get_clip_mut(slot) {
+                        clip.effects.move_effect(effect_id, new_index);
+                    }
+                }
+            }
+
+            // Environment effect actions
+            PropertiesAction::AddEnvironmentEffect { effect_type } => {
+                if let Some(params) = self.effect_manager.registry().default_parameters(&effect_type) {
+                    let display_name = self.effect_manager.registry()
+                        .display_name(&effect_type)
+                        .unwrap_or(&effect_type)
+                        .to_string();
+                    self.environment.effects_mut().add(&effect_type, &display_name, params);
+                    log::info!("Added master effect '{}'", display_name);
+                }
+            }
+            PropertiesAction::RemoveEnvironmentEffect { effect_id } => {
+                self.environment.effects_mut().remove(effect_id);
+                log::info!("Removed master effect {}", effect_id);
+            }
+            PropertiesAction::SetEnvironmentEffectBypassed { effect_id, bypassed } => {
+                if let Some(effect) = self.environment.effects_mut().get_mut(effect_id) {
+                    effect.bypassed = bypassed;
+                }
+            }
+            PropertiesAction::SetEnvironmentEffectSoloed { effect_id, soloed } => {
+                if soloed {
+                    self.environment.effects_mut().solo(effect_id);
+                } else {
+                    self.environment.effects_mut().unsolo();
+                }
+            }
+            PropertiesAction::SetEnvironmentEffectParameter { effect_id, param_name, value } => {
+                if let Some(effect) = self.environment.effects_mut().get_mut(effect_id) {
+                    effect.set_parameter(&param_name, value);
+                }
+            }
+            PropertiesAction::ReorderEnvironmentEffect { effect_id, new_index } => {
+                self.environment.effects_mut().move_effect(effect_id, new_index);
             }
         }
     }

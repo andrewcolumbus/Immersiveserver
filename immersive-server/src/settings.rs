@@ -9,6 +9,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::compositor::Layer;
+use crate::effects::EffectStack;
 
 /// Thumbnail display mode for clip grid cells
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -98,6 +99,10 @@ pub struct EnvironmentSettings {
     /// Thumbnail display mode (Fit or Fill)
     #[serde(rename = "thumbnailMode", default)]
     pub thumbnail_mode: ThumbnailMode,
+
+    /// Master effect stack (applied to entire composition)
+    #[serde(rename = "effects", default)]
+    pub effects: EffectStack,
 }
 
 /// Default OMT capture FPS
@@ -125,6 +130,7 @@ impl Default for EnvironmentSettings {
             omt_capture_fps: default_omt_capture_fps(),
             texture_share_enabled: false,
             thumbnail_mode: ThumbnailMode::default(),
+            effects: EffectStack::new(),
         }
     }
 }

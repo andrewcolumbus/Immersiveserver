@@ -21,6 +21,8 @@ pub struct EffectManager {
     bpm_clock: BpmClock,
     /// Per-layer effect runtimes
     layer_runtimes: HashMap<u32, EffectStackRuntime>,
+    /// Per-clip effect runtimes, keyed by (layer_id, slot_index)
+    clip_runtimes: HashMap<(u32, usize), EffectStackRuntime>,
     /// Environment effect runtime
     environment_runtime: Option<EffectStackRuntime>,
     /// Application start time for effect timing
@@ -51,6 +53,7 @@ impl EffectManager {
             registry,
             bpm_clock: BpmClock::new(120.0),
             layer_runtimes: HashMap::new(),
+            clip_runtimes: HashMap::new(),
             environment_runtime: None,
             start_time: Instant::now(),
             time: 0.0,
@@ -123,6 +126,128 @@ impl EffectManager {
         let runtime = self.layer_runtimes.entry(layer_id).or_insert_with(EffectStackRuntime::new);
         runtime.init(device, width, height, format);
     }
+
+    // ========== Clip Effect Methods ==========
+
+    /// Initialize GPU resources for a clip's effects
+    pub fn init_clip_effects(
+        &mut self,
+        layer_id: u32,
+        slot: usize,
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+    ) {
+        let runtime = self
+            .clip_runtimes
+            .entry((layer_id, slot))
+            .or_insert_with(EffectStackRuntime::new);
+        runtime.init(device, width, height, format);
+    }
+
+    /// Sync clip effect runtimes with effect stacks
+    pub fn sync_clip_effects(
+        &mut self,
+        layer_id: u32,
+        slot: usize,
+        stack: &EffectStack,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        format: wgpu::TextureFormat,
+    ) {
+        if let Some(runtime) = self.clip_runtimes.get_mut(&(layer_id, slot)) {
+            runtime.sync_with_stack(stack, &self.registry, device, queue, format);
+        }
+    }
+
+    /// Process effects for a clip
+    ///
+    /// # Arguments
+    /// * `encoder` - Command encoder
+    /// * `device` - GPU device
+    /// * `queue` - GPU queue
+    /// * `layer_id` - Layer ID containing the clip
+    /// * `slot` - Clip slot index
+    /// * `input` - Input texture view (video content)
+    /// * `output` - Output texture view (processed result)
+    /// * `stack` - Effect stack for this clip
+    ///
+    /// # Returns
+    /// `true` if effects were processed, `false` if no effects or disabled
+    pub fn process_clip_effects(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        layer_id: u32,
+        slot: usize,
+        input: &wgpu::TextureView,
+        output: &wgpu::TextureView,
+        stack: &EffectStack,
+    ) -> bool {
+        if !self.enabled || stack.is_empty() {
+            return false;
+        }
+
+        // Check if any effects are active
+        if stack.active_effects().count() == 0 {
+            return false;
+        }
+
+        let params = self.build_params();
+
+        if let Some(runtime) = self.clip_runtimes.get_mut(&(layer_id, slot)) {
+            runtime.process(encoder, queue, device, input, output, stack, &params);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Ensure clip runtime exists and is properly sized
+    pub fn ensure_clip_runtime(
+        &mut self,
+        layer_id: u32,
+        slot: usize,
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+    ) {
+        let runtime = self
+            .clip_runtimes
+            .entry((layer_id, slot))
+            .or_insert_with(EffectStackRuntime::new);
+        runtime.ensure_size(device, width, height, format);
+    }
+
+    /// Get a reference to a clip's effect stack runtime
+    pub fn get_clip_runtime(&self, layer_id: u32, slot: usize) -> Option<&EffectStackRuntime> {
+        self.clip_runtimes.get(&(layer_id, slot))
+    }
+
+    /// Get a mutable reference to a clip's effect stack runtime
+    pub fn get_clip_runtime_mut(
+        &mut self,
+        layer_id: u32,
+        slot: usize,
+    ) -> Option<&mut EffectStackRuntime> {
+        self.clip_runtimes.get_mut(&(layer_id, slot))
+    }
+
+    /// Remove effect runtime for a specific clip
+    pub fn remove_clip_runtime(&mut self, layer_id: u32, slot: usize) {
+        self.clip_runtimes.remove(&(layer_id, slot));
+    }
+
+    /// Remove all clip effect runtimes for a layer
+    pub fn remove_layer_clip_runtimes(&mut self, layer_id: u32) {
+        self.clip_runtimes
+            .retain(|(lid, _slot), _runtime| *lid != layer_id);
+    }
+
+    // ========== Environment Effect Methods ==========
 
     /// Initialize GPU resources for environment effects
     pub fn init_environment_effects(
@@ -262,6 +387,7 @@ impl EffectManager {
     /// Clear all effect runtimes
     pub fn clear(&mut self) {
         self.layer_runtimes.clear();
+        self.clip_runtimes.clear();
         self.environment_runtime = None;
     }
 
