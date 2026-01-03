@@ -230,11 +230,11 @@ impl EffectsBrowserPanel {
         // Context menu
         response.context_menu(|ui| {
             if ui.button("Add to selected layer").clicked() {
-                log::info!("Add effect {} to selected layer", effect.name);
+                tracing::info!("Add effect {} to selected layer", effect.name);
                 ui.close_menu();
             }
             if ui.button("Add to environment").clicked() {
-                log::info!("Add effect {} to environment", effect.name);
+                tracing::info!("Add effect {} to environment", effect.name);
                 ui.close_menu();
             }
         });

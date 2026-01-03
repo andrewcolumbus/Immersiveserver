@@ -68,6 +68,14 @@ impl Transform2D {
     pub fn with_uniform_scale(scale: f32) -> Self {
         Self::with_scale(scale, scale)
     }
+
+    /// Check if this is an identity transform (no change from default)
+    pub fn is_identity(&self) -> bool {
+        self.position == (0.0, 0.0)
+            && self.scale == (1.0, 1.0)
+            && self.rotation == 0.0
+            && self.anchor == (0.5, 0.5)
+    }
 }
 
 /// Source type for a layer's content.

@@ -3,6 +3,7 @@
 //! Provides the main menu bar with File and View menus.
 
 use crate::settings::EnvironmentSettings;
+use super::layout_preset::LayoutPresetManager;
 use std::path::PathBuf;
 
 /// UI state for the menu bar and panels
@@ -37,6 +38,16 @@ pub enum MenuAction {
     TogglePanel { panel_id: String },
     /// Open the HAP Converter window
     OpenHAPConverter,
+    /// Open the Preferences window
+    OpenPreferences,
+    /// Apply a layout preset by index
+    ApplyLayoutPreset { index: usize },
+    /// Save the current layout
+    SaveLayout,
+    /// Load a layout from file
+    LoadLayout,
+    /// Reset to default layout
+    ResetLayout,
 }
 
 impl Default for MenuBar {
@@ -64,6 +75,7 @@ impl MenuBar {
     /// Returns true if settings were modified
     ///
     /// `panel_states` is a list of (panel_id, title, is_open) for View menu toggles.
+    /// `layout_manager` is optional for rendering the Layout submenu.
     pub fn render(
         &mut self,
         ctx: &egui::Context,
@@ -72,6 +84,7 @@ impl MenuBar {
         fps: f64,
         frame_time_ms: f64,
         panel_states: &[(&str, &str, bool)],
+        layout_manager: Option<&LayoutPresetManager>,
     ) -> bool {
         let mut settings_changed = false;
 
@@ -111,6 +124,14 @@ impl MenuBar {
                     }
                 });
 
+                // Edit menu (for Preferences)
+                ui.menu_button("Edit", |ui| {
+                    if ui.button("Preferences...").clicked() {
+                        self.pending_menu_action = Some(MenuAction::OpenPreferences);
+                        ui.close_menu();
+                    }
+                });
+
                 // View menu
                 ui.menu_button("View", |ui| {
                     // Panel visibility toggles
@@ -131,6 +152,60 @@ impl MenuBar {
                         .changed()
                     {
                         settings_changed = true;
+                    }
+
+                    // Layout submenu
+                    if let Some(manager) = layout_manager {
+                        ui.separator();
+                        ui.menu_button("Layout", |ui| {
+                            let active_index = manager.active_preset_index();
+
+                            // Built-in presets
+                            ui.label(egui::RichText::new("Presets").weak().small());
+                            for (index, preset) in manager.builtin_presets() {
+                                let is_active = active_index == Some(index);
+                                let label = if is_active {
+                                    format!("✓ {}", preset.name)
+                                } else {
+                                    format!("   {}", preset.name)
+                                };
+                                if ui.button(&label).clicked() {
+                                    self.pending_menu_action = Some(MenuAction::ApplyLayoutPreset { index });
+                                    ui.close_menu();
+                                }
+                            }
+
+                            // User presets (if any)
+                            let user_presets: Vec<_> = manager.user_presets().collect();
+                            if !user_presets.is_empty() {
+                                ui.separator();
+                                ui.label(egui::RichText::new("Custom").weak().small());
+                                for (index, preset) in user_presets {
+                                    let is_active = active_index == Some(index);
+                                    let label = if is_active {
+                                        format!("✓ {}", preset.name)
+                                    } else {
+                                        format!("   {}", preset.name)
+                                    };
+                                    if ui.button(&label).clicked() {
+                                        self.pending_menu_action = Some(MenuAction::ApplyLayoutPreset { index });
+                                        ui.close_menu();
+                                    }
+                                }
+                            }
+
+                            ui.separator();
+
+                            if ui.button("Save Layout...").clicked() {
+                                self.pending_menu_action = Some(MenuAction::SaveLayout);
+                                ui.close_menu();
+                            }
+
+                            if ui.button("Reset Layout").clicked() {
+                                self.pending_menu_action = Some(MenuAction::ResetLayout);
+                                ui.close_menu();
+                            }
+                        });
                     }
                 });
 

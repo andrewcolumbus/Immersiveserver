@@ -36,9 +36,9 @@ impl SpoutSharer {
     /// Create a new Spout sharer.
     pub fn new() -> Self {
         if is_spout_available() {
-            log::info!("Spout: SpoutLibrary.dll available");
+            tracing::info!("Spout: SpoutLibrary.dll available");
         } else {
-            log::warn!("Spout: SpoutLibrary.dll not found - texture sharing disabled");
+            tracing::warn!("Spout: SpoutLibrary.dll not found - texture sharing disabled");
         }
 
         Self {
@@ -141,7 +141,7 @@ impl TextureSharer for SpoutSharer {
         self.pixel_buffer
             .resize((self.width * self.height * 4) as usize, 0);
 
-        log::info!(
+        tracing::info!(
             "Spout: Started sharing as '{}' ({}x{})",
             name,
             self.width,
@@ -173,7 +173,7 @@ impl TextureSharer for SpoutSharer {
             if let Some(ref spout) = self.spout {
                 spout.release_sender();
             }
-            log::info!("Spout: Stopped sharing");
+            tracing::info!("Spout: Stopped sharing");
         }
         self.active = false;
         self.name.clear();

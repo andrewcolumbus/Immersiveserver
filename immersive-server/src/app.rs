@@ -59,11 +59,13 @@ const FPS_UPDATE_INTERVAL_SECS: f64 = 1.0;
 pub struct App {
     /// Reference to the window
     window: Arc<Window>,
-    /// The wgpu surface for presenting rendered frames
+    /// Shared GPU context for multi-window support
+    gpu: Arc<crate::gpu_context::GpuContext>,
+    /// The wgpu surface for presenting rendered frames (main window)
     surface: wgpu::Surface<'static>,
-    /// The wgpu device for creating GPU resources
+    /// The wgpu device for creating GPU resources (convenience clone from gpu)
     device: wgpu::Device,
-    /// The command queue for submitting GPU work
+    /// The command queue for submitting GPU work (convenience clone from gpu)
     queue: wgpu::Queue,
     /// Surface configuration (format, size, present mode)
     config: wgpu::SurfaceConfiguration,
@@ -119,6 +121,8 @@ pub struct App {
 
     // UI state
     pub menu_bar: MenuBar,
+    /// Whether native OS menus are being used (skip egui menu bar rendering)
+    pub use_native_menu: bool,
     /// Clip grid panel for triggering clips
     pub clip_grid_panel: crate::ui::ClipGridPanel,
     /// Docking manager for detachable/resizable panels
@@ -131,14 +135,24 @@ pub struct App {
     pub effects_browser_panel: crate::ui::EffectsBrowserPanel,
     /// File browser panel for drag-and-drop of video files
     pub file_browser_panel: crate::ui::FileBrowserPanel,
+    /// Performance panel for FPS and timing metrics
+    pub performance_panel: crate::ui::PerformancePanel,
     /// Preview monitor panel for previewing clips before triggering
     pub preview_monitor_panel: crate::ui::PreviewMonitorPanel,
+    /// 3D previsualization panel
+    pub previs_panel: crate::ui::PrevisPanel,
+    /// 3D previsualization renderer
+    previs_renderer: Option<crate::previs::PrevisRenderer>,
     /// Preview player for clip preview playback
     preview_player: crate::preview_player::PreviewPlayer,
     /// Thumbnail cache for video previews in clip grid
     pub thumbnail_cache: crate::ui::ThumbnailCache,
     /// HAP Converter window
     pub converter_window: crate::converter::ConverterWindow,
+    /// Preferences window for environment settings
+    pub preferences_window: crate::ui::PreferencesWindow,
+    /// Layout preset manager for saving/restoring UI arrangements
+    pub layout_preset_manager: crate::ui::LayoutPresetManager,
 
     // Settings
     pub settings: EnvironmentSettings,
@@ -199,6 +213,26 @@ pub struct App {
     // Effects system
     /// Effect manager for processing effects on layers and environment
     effect_manager: crate::effects::EffectManager,
+
+    // Audio system (for FFT-reactive effects)
+    /// Audio manager for FFT analysis of audio sources
+    audio_manager: crate::audio::AudioManager,
+
+    // REST API server
+    /// Whether the API server is running
+    api_server_running: bool,
+    /// Shared state for API handlers
+    api_shared_state: Option<crate::api::SharedStateHandle>,
+    /// Command receiver for API commands
+    api_command_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiCommand>>,
+    /// Shutdown signal for graceful API server termination
+    api_shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
+
+    // Performance profiling
+    /// Frame profiler for CPU timing statistics
+    frame_profiler: crate::telemetry::FrameProfiler,
+    /// GPU profiler for render pass timing
+    gpu_profiler: crate::telemetry::GpuProfiler,
 }
 
 impl App {
@@ -225,17 +259,17 @@ impl App {
             .await
             .expect("Failed to find suitable GPU adapter");
 
-        log::info!("Using GPU: {}", adapter.get_info().name);
-        log::info!("Backend: {:?}", adapter.get_info().backend);
+        tracing::info!("Using GPU: {}", adapter.get_info().name);
+        tracing::info!("Backend: {:?}", adapter.get_info().backend);
 
         // Request BC texture compression for GPU-native codecs (HAP/DXV)
         let bc_texture_supported = adapter.features().contains(wgpu::Features::TEXTURE_COMPRESSION_BC);
         let mut required_features = wgpu::Features::empty();
         if bc_texture_supported {
             required_features |= wgpu::Features::TEXTURE_COMPRESSION_BC;
-            log::info!("BC texture compression enabled (for HAP/DXV support)");
+            tracing::info!("BC texture compression enabled (for HAP/DXV support)");
         } else {
-            log::warn!("BC texture compression not available - HAP/DXV will use software decode");
+            tracing::warn!("BC texture compression not available - HAP/DXV will use software decode");
         }
         
         let (device, queue) = adapter
@@ -260,10 +294,8 @@ impl App {
             .copied()
             .unwrap_or(surface_caps.formats[0]);
 
-        log::info!("Surface format: {:?}", surface_format);
+        tracing::info!("Surface format: {:?}", surface_format);
 
-        // Always use Fifo for presentation - we control frame rate ourselves
-        // Fifo just queues frames, doesn't block rendering
         // Always use Immediate mode for manual FPS control
         // Fall back to Mailbox or Fifo if Immediate is not available
         let present_mode = if surface_caps.present_modes.contains(&wgpu::PresentMode::Immediate) {
@@ -274,7 +306,7 @@ impl App {
             wgpu::PresentMode::Fifo
         };
 
-        log::info!("Present mode: {:?}", present_mode);
+        tracing::info!("Present mode: {:?}", present_mode);
 
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -302,7 +334,7 @@ impl App {
                 layer.clips = vec![None; clip_count];
                 environment.add_existing_layer(layer);
             }
-            log::info!("Created 4 default layers with {} clip slots each", clip_count);
+            tracing::info!("Created 4 default layers with {} clip slots each", clip_count);
         }
 
         // Create checkerboard background pipeline
@@ -391,11 +423,14 @@ impl App {
         // Initialize video renderer
         let video_renderer = VideoRenderer::new(&device, surface_format);
 
+        // Initialize 3D previs renderer
+        let previs_renderer = crate::previs::PrevisRenderer::new(&device);
+
         // Initialize shader hot-reload watcher
         let shader_watcher = match crate::shaders::ShaderWatcher::new() {
             Ok(watcher) => Some(watcher),
             Err(e) => {
-                log::warn!("Failed to initialize shader watcher: {:?}", e);
+                tracing::warn!("Failed to initialize shader watcher: {:?}", e);
                 None
             }
         };
@@ -403,9 +438,22 @@ impl App {
         let now = Instant::now();
         let initial_target_fps = settings.target_fps as f64;
         let texture_share_enabled = settings.texture_share_enabled;
+        let gpu_profiler = crate::telemetry::GpuProfiler::new(&device, &queue, 32);
+
+        // Create shared GPU context for multi-window support
+        // Note: instance and adapter are moved into GpuContext, device/queue are cloned for convenience
+        let gpu = Arc::new(crate::gpu_context::GpuContext::from_parts(
+            instance,
+            adapter,
+            device.clone(),
+            queue.clone(),
+            surface_format,
+            bc_texture_supported,
+        ));
 
         Self {
             window,
+            gpu,
             surface,
             device,
             queue,
@@ -432,6 +480,7 @@ impl App {
             egui_state,
             egui_renderer,
             menu_bar,
+            use_native_menu: false, // Set to true by main.rs when native menu is active
             clip_grid_panel: crate::ui::ClipGridPanel::new(),
             dock_manager: {
                 let mut dm = crate::ui::DockManager::new();
@@ -466,16 +515,30 @@ impl App {
                     "Preview Monitor",
                     crate::ui::DockZone::Floating,
                 ));
+                dm.register_panel(crate::ui::DockablePanel::new(
+                    crate::ui::dock::panel_ids::PREVIS,
+                    "3D Previs",
+                    crate::ui::DockZone::Floating,
+                ));
                 dm
             },
             properties_panel: crate::ui::PropertiesPanel::new(),
             sources_panel: crate::ui::SourcesPanel::new(),
             effects_browser_panel: crate::ui::EffectsBrowserPanel::new(),
             file_browser_panel: crate::ui::FileBrowserPanel::new(),
+            performance_panel: crate::ui::PerformancePanel::new(),
             preview_monitor_panel: crate::ui::PreviewMonitorPanel::new(),
+            previs_panel: crate::ui::PrevisPanel::new(),
+            previs_renderer: Some(previs_renderer),
             preview_player: crate::preview_player::PreviewPlayer::new(bc_texture_supported),
             thumbnail_cache: crate::ui::ThumbnailCache::new(),
             converter_window: crate::converter::ConverterWindow::new(),
+            preferences_window: crate::ui::PreferencesWindow::new(),
+            layout_preset_manager: {
+                let mut manager = crate::ui::LayoutPresetManager::new();
+                manager.load_user_presets();
+                manager
+            },
             settings,
             current_file: None,
             video_renderer,
@@ -509,7 +572,34 @@ impl App {
 
             // Effects
             effect_manager: crate::effects::EffectManager::new(),
+
+            // Audio (for FFT-reactive effects)
+            audio_manager: {
+                let mut manager = crate::audio::AudioManager::new();
+                // Try to initialize system audio, but don't fail if unavailable
+                if let Err(e) = manager.init_system_audio() {
+                    tracing::warn!("Could not initialize system audio: {}", e);
+                }
+                manager
+            },
+
+            // API server
+            api_server_running: false,
+            api_shared_state: None,
+            api_command_rx: None,
+            api_shutdown_tx: None,
+
+            // Performance profiling
+            frame_profiler: crate::telemetry::FrameProfiler::new(),
+            gpu_profiler,
         }
+    }
+
+    /// Get the shared GPU context for multi-window support.
+    ///
+    /// This can be cloned (Arc) and shared with panel windows that need GPU rendering.
+    pub fn gpu_context(&self) -> Arc<crate::gpu_context::GpuContext> {
+        Arc::clone(&self.gpu)
     }
 
     /// Create the Tokio runtime for async OMT operations
@@ -520,11 +610,11 @@ impl App {
             .build()
         {
             Ok(rt) => {
-                log::info!("OMT: Tokio runtime initialized");
+                tracing::info!("OMT: Tokio runtime initialized");
                 Some(rt)
             }
             Err(e) => {
-                log::warn!("OMT: Failed to create Tokio runtime: {}", e);
+                tracing::warn!("OMT: Failed to create Tokio runtime: {}", e);
                 None
             }
         }
@@ -536,14 +626,14 @@ impl App {
             Ok(mut discovery) => {
                 // Start browsing for sources
                 if let Err(e) = discovery.start_browsing() {
-                    log::warn!("OMT: Failed to start source discovery: {}", e);
+                    tracing::warn!("OMT: Failed to start source discovery: {}", e);
                 } else {
-                    log::info!("OMT: Source discovery started");
+                    tracing::info!("OMT: Source discovery started");
                 }
                 Some(discovery)
             }
             Err(e) => {
-                log::warn!("OMT: Discovery service unavailable: {}", e);
+                tracing::warn!("OMT: Discovery service unavailable: {}", e);
                 None
             }
         }
@@ -847,12 +937,14 @@ impl App {
             self.queue
                 .write_buffer(&self.copy_params_buffer, 0, bytemuck::bytes_of(&params));
 
-            log::debug!("Resized to {}x{}", new_size.width, new_size.height);
+            tracing::debug!("Resized to {}x{}", new_size.width, new_size.height);
         }
     }
 
     /// Start a new frame (currently a no-op; redraw pacing is handled in `main.rs`)
     pub fn begin_frame(&mut self) {
+        // Record frame timing for profiling
+        self.frame_profiler.begin_frame();
         // Redraw pacing is handled by the winit event loop in `main.rs`.
     }
 
@@ -868,7 +960,7 @@ impl App {
         if elapsed >= FPS_UPDATE_INTERVAL_SECS {
             // Calculate UI FPS (frames per second over the interval)
             self.ui_fps = self.ui_frames_since_update as f64 / elapsed;
-            
+
             // Reset counters
             self.last_ui_fps_update = now;
             self.ui_frames_since_update = 0;
@@ -979,7 +1071,7 @@ impl App {
                         
                         // Try to load the video (errors are logged but don't stop restore)
                         if let Err(e) = self.load_layer_video(layer_id, &path) {
-                            log::warn!("Failed to restore clip for layer {}: {}", layer_id, e);
+                            tracing::warn!("Failed to restore clip for layer {}: {}", layer_id, e);
                         }
                     }
                 }
@@ -994,15 +1086,15 @@ impl App {
                 layer.clips = vec![None; clip_count];
                 self.environment.add_existing_layer(layer);
             }
-            log::info!("No saved layers, created 4 default layers with {} clip slots each", clip_count);
+            tracing::info!("No saved layers, created 4 default layers with {} clip slots each", clip_count);
         } else {
-            log::info!("Restored {} layers from settings", self.environment.layer_count());
+            tracing::info!("Restored {} layers from settings", self.environment.layer_count());
         }
 
         // Restore environment effects from settings
         *self.environment.effects_mut() = self.settings.effects.clone();
         if !self.settings.effects.is_empty() {
-            log::info!("Restored {} master effects from settings", self.settings.effects.len());
+            tracing::info!("Restored {} master effects from settings", self.settings.effects.len());
         }
     }
 
@@ -1027,11 +1119,18 @@ impl App {
         // Update effect manager timing (BPM clock, frame time)
         self.effect_manager.update();
 
+        // Update audio manager (FFT analysis for audio-reactive effects)
+        self.audio_manager.update();
+
         // Poll for shader hot-reload (no-op in release builds)
         self.poll_shader_reload();
 
         // Poll for pending OMT sender start
         self.poll_pending_omt_sender();
+
+        // Process API commands and update shared state
+        self.process_api_commands();
+        self.update_api_snapshot();
 
         // Poll for completed thumbnail generations
         self.thumbnail_cache.poll(&self.egui_ctx);
@@ -1089,35 +1188,112 @@ impl App {
                 self.dock_manager.get_panel(crate::ui::dock::panel_ids::PREVIEW_MONITOR)
                     .map(|p| p.open).unwrap_or(false),
             ),
+            (
+                crate::ui::dock::panel_ids::PREVIS,
+                "3D Previs",
+                self.dock_manager.get_panel(crate::ui::dock::panel_ids::PREVIS)
+                    .map(|p| p.open).unwrap_or(false),
+            ),
+            (
+                crate::ui::dock::panel_ids::PERFORMANCE,
+                "Performance",
+                self.performance_panel.open,
+            ),
         ];
 
-        // Render menu bar with appropriate FPS
-        let settings_changed = self.menu_bar.render(
-            &self.egui_ctx,
-            &mut self.settings,
-            &self.current_file,
-            display_fps,
-            display_frame_time_ms,
-            &panel_states,
-        );
+        // Render menu bar with appropriate FPS (skip when using native OS menus)
+        let settings_changed = if self.use_native_menu {
+            // Native menus handle most UI, but still render a slim status bar
+            self.render_status_bar(&self.egui_ctx.clone(), display_fps, display_frame_time_ms);
+            false
+        } else {
+            self.menu_bar.render(
+                &self.egui_ctx,
+                &mut self.settings,
+                &self.current_file,
+                display_fps,
+                display_frame_time_ms,
+                &panel_states,
+                Some(&self.layout_preset_manager),
+            )
+        };
 
-        // Handle menu actions (e.g., toggle panel)
+        // Handle menu actions (e.g., toggle panel) - works with both native and egui menus
         if let Some(action) = self.menu_bar.take_menu_action() {
             match action {
                 crate::ui::menu_bar::MenuAction::TogglePanel { panel_id } => {
-                    self.dock_manager.toggle_panel(&panel_id);
+                    // Performance panel is a floating window, not a dockable panel
+                    if panel_id == crate::ui::dock::panel_ids::PERFORMANCE {
+                        self.performance_panel.open = !self.performance_panel.open;
+                    } else {
+                        self.dock_manager.toggle_panel(&panel_id);
+                    }
                 }
                 crate::ui::menu_bar::MenuAction::OpenHAPConverter => {
                     self.converter_window.open();
+                }
+                crate::ui::menu_bar::MenuAction::OpenPreferences => {
+                    self.preferences_window.open = true;
+                }
+                crate::ui::menu_bar::MenuAction::ApplyLayoutPreset { index } => {
+                    if self.layout_preset_manager.apply_preset(index, &mut self.dock_manager) {
+                        if let Some(preset) = self.layout_preset_manager.get_preset(index) {
+                            self.menu_bar.set_status(format!("Applied layout: {}", preset.name));
+                        }
+                    }
+                }
+                crate::ui::menu_bar::MenuAction::SaveLayout => {
+                    // For now, save with a timestamp-based name. Could add dialog later.
+                    let timestamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let name = format!("Custom Layout {}", timestamp);
+                    match self.layout_preset_manager.save_current_as_preset(&name, &self.dock_manager) {
+                        Ok(()) => {
+                            self.menu_bar.set_status(format!("Saved layout: {}", name));
+                        }
+                        Err(e) => {
+                            self.menu_bar.set_status(format!("Failed to save layout: {}", e));
+                        }
+                    }
+                }
+                crate::ui::menu_bar::MenuAction::LoadLayout => {
+                    // Currently not implemented - would open file dialog
+                    self.menu_bar.set_status("Load layout from file not yet implemented");
+                }
+                crate::ui::menu_bar::MenuAction::ResetLayout => {
+                    // Apply the Default preset (index 0)
+                    if self.layout_preset_manager.apply_preset(0, &mut self.dock_manager) {
+                        self.menu_bar.set_status("Reset to default layout");
+                    }
                 }
             }
         }
 
         // Render dock zones overlay during drag operations
         self.dock_manager.render_dock_zones(&self.egui_ctx);
-        
+
         // Render HAP Converter window
         self.converter_window.show(&self.egui_ctx);
+
+        // Render Preferences window
+        let pref_actions = self.preferences_window.render(
+            &self.egui_ctx,
+            &self.environment,
+            &self.settings,
+            self.is_omt_broadcasting(),
+            self.is_ndi_broadcasting(),
+            self.texture_share_enabled,
+            self.api_server_running,
+        );
+        for action in pref_actions {
+            self.handle_properties_action(action);
+        }
+
+        // Render Performance panel
+        let perf_metrics = self.performance_metrics();
+        self.performance_panel.render(&self.egui_ctx, &perf_metrics);
         
         // Get layer list for property panels
         let layers: Vec<_> = self.environment.layers().to_vec();
@@ -1153,7 +1329,7 @@ impl App {
                                     });
                                 });
                                 ui.separator();
-                                actions = self.properties_panel.render(ui, &self.environment, &layers, &self.settings, omt_broadcasting, ndi_broadcasting, self.texture_share_enabled, self.effect_manager.registry());
+                                actions = self.properties_panel.render(ui, &self.environment, &layers, &self.settings, omt_broadcasting, ndi_broadcasting, self.texture_share_enabled, self.api_server_running, self.effect_manager.registry(), self.effect_manager.bpm_clock(), self.effect_manager.time(), Some(&self.audio_manager));
                             });
                         actions
                     }
@@ -1192,7 +1368,7 @@ impl App {
                                     });
                                 });
                                 ui.separator();
-                                actions = self.properties_panel.render(ui, &self.environment, &layers, &self.settings, omt_broadcasting, ndi_broadcasting, self.texture_share_enabled, self.effect_manager.registry());
+                                actions = self.properties_panel.render(ui, &self.environment, &layers, &self.settings, omt_broadcasting, ndi_broadcasting, self.texture_share_enabled, self.api_server_running, self.effect_manager.registry(), self.effect_manager.bpm_clock(), self.effect_manager.time(), Some(&self.audio_manager));
                             });
 
                         // Track window dragging for dock zone snapping
@@ -1506,20 +1682,25 @@ impl App {
                             video_info,
                             |ui, rect| {
                                 // Render the preview texture into the given rect
-                                if let (Some(bind_group), Some(params_buffer)) =
-                                    (self.preview_player.bind_group(), self.preview_player.params_buffer())
-                                {
-                                    // For now, just draw a placeholder rectangle
-                                    // Full GPU rendering would require more integration
+                                if let Some(texture_id) = self.preview_player.egui_texture_id {
+                                    // Display the actual video texture
+                                    ui.painter().image(
+                                        texture_id,
+                                        rect,
+                                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                        egui::Color32::WHITE,
+                                    );
+                                } else if self.preview_player.is_loaded() {
+                                    // Texture not yet registered, show loading state
                                     ui.painter().rect_filled(
                                         rect,
                                         4.0,
-                                        egui::Color32::from_rgb(30, 60, 30),
+                                        egui::Color32::from_gray(40),
                                     );
                                     ui.painter().text(
                                         rect.center(),
                                         egui::Align2::CENTER_CENTER,
-                                        "Preview Active",
+                                        "Loading...",
                                         egui::FontId::proportional(11.0),
                                         egui::Color32::WHITE,
                                     );
@@ -1550,6 +1731,51 @@ impl App {
             Vec::new()
         };
 
+        // Render 3D previs panel (floating window)
+        let previs_actions = if let Some(panel) = self.dock_manager.get_panel(crate::ui::dock::panel_ids::PREVIS) {
+            if panel.open {
+                let floating_pos = panel.floating_pos;
+                let floating_size = panel.floating_size;
+                let mut actions = Vec::new();
+                let pos = floating_pos.unwrap_or((700.0, 100.0));
+                let size = floating_size.unwrap_or((400.0, 450.0));
+                let mut open = true;
+
+                let window_response = egui::Window::new("3D Previs")
+                    .id(egui::Id::new("previs_panel_window"))
+                    .default_pos(egui::pos2(pos.0, pos.1))
+                    .default_size(egui::vec2(size.0, size.1))
+                    .resizable(true)
+                    .collapsible(true)
+                    .open(&mut open)
+                    .show(&self.egui_ctx, |ui| {
+                        if let Some(renderer) = &mut self.previs_renderer {
+                            actions = self.previs_panel.render(ui, &self.settings.previs_settings, renderer);
+                        }
+                    });
+
+                // Update window position for persistence
+                if let Some(resp) = &window_response {
+                    let rect = resp.response.rect;
+                    if let Some(p) = self.dock_manager.get_panel_mut(crate::ui::dock::panel_ids::PREVIS) {
+                        p.floating_pos = Some((rect.left(), rect.top()));
+                        p.floating_size = Some((rect.width(), rect.height()));
+                    }
+                }
+
+                if !open {
+                    if let Some(p) = self.dock_manager.get_panel_mut(crate::ui::dock::panel_ids::PREVIS) {
+                        p.open = false;
+                    }
+                }
+                actions
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
         // Apply environment resolution changes (if any) before rendering.
         self.sync_environment_from_settings();
 
@@ -1568,6 +1794,11 @@ impl App {
         // Process preview monitor actions
         for action in preview_actions {
             self.handle_preview_action(action);
+        }
+
+        // Process previs panel actions
+        for action in previs_actions {
+            self.handle_previs_action(action);
         }
 
         self.egui_state
@@ -1625,8 +1856,10 @@ impl App {
                         if let Some(old_params_buffer) = &runtime.old_params_buffer {
                             let old_opacity = layer.opacity * (1.0 - transition_progress);
                             if old_opacity > 0.0 {
-                                let mut params = LayerParams::from_layer(
+                                // Use old clip transform for crossfade
+                                let mut params = LayerParams::from_layer_and_clip(
                                     layer,
+                                    runtime.old_clip_transform.as_ref(),
                                     runtime.old_video_width,
                                     runtime.old_video_height,
                                     self.environment.width(),
@@ -1635,7 +1868,7 @@ impl App {
                                 params.opacity = old_opacity;
                                 // Write to old layer's params buffer (not shared)
                                 self.video_renderer.write_layer_params(&self.queue, old_params_buffer, &params);
-                                
+
                                 self.video_renderer.render_with_blend(
                                     &mut encoder,
                                     self.environment.texture_view(),
@@ -1726,8 +1959,9 @@ impl App {
                                                 }
                                             }
 
-                                            // 4. Process clip effects
+                                            // 4. Process clip effects with automation (LFO/FFT)
                                             let effect_params = self.effect_manager.build_params();
+                                            let bpm_clock = self.effect_manager.bpm_clock().clone();
                                             if let Some(clip_runtime) = self.effect_manager.get_clip_runtime_mut(layer.id, slot) {
                                                 if let (Some(input_view), Some(output_view)) = (
                                                     clip_runtime.input_view().map(|v| v as *const _),
@@ -1735,7 +1969,7 @@ impl App {
                                                 ) {
                                                     if let Some(clip_effect_stack) = clip_effects {
                                                         unsafe {
-                                                            clip_runtime.process(
+                                                            clip_runtime.process_with_automation(
                                                                 &mut encoder,
                                                                 &self.queue,
                                                                 &self.device,
@@ -1743,6 +1977,8 @@ impl App {
                                                                 &*output_view,
                                                                 clip_effect_stack,
                                                                 &effect_params,
+                                                                &bpm_clock,
+                                                                Some(&self.audio_manager),
                                                             );
                                                         }
                                                     }
@@ -1802,15 +2038,16 @@ impl App {
                                             }
                                         }
 
-                                        // 4. Process layer effects
+                                        // 4. Process layer effects with automation (LFO/FFT)
                                         let effect_params = self.effect_manager.build_params();
+                                        let bpm_clock = self.effect_manager.bpm_clock().clone();
                                         if let Some(layer_runtime) = self.effect_manager.get_layer_runtime_mut(layer.id) {
                                             if let (Some(input_view), Some(output_view)) = (
                                                 layer_runtime.input_view().map(|v| v as *const _),
                                                 layer_runtime.output_view(layer_active_effect_count).map(|v| v as *const _),
                                             ) {
                                                 unsafe {
-                                                    layer_runtime.process(
+                                                    layer_runtime.process_with_automation(
                                                         &mut encoder,
                                                         &self.queue,
                                                         &self.device,
@@ -1818,6 +2055,8 @@ impl App {
                                                         &*output_view,
                                                         &layer.effects,
                                                         &effect_params,
+                                                        &bpm_clock,
+                                                        Some(&self.audio_manager),
                                                     );
                                                 }
                                             }
@@ -1839,8 +2078,13 @@ impl App {
                                     };
 
                                     if let Some(effect_output_view) = final_output_view {
-                                        let mut composite_params = LayerParams::from_layer(
+                                        // Get clip transform for current clip
+                                        let clip_transform = layer.active_clip
+                                            .and_then(|slot| layer.get_clip(slot))
+                                            .map(|clip| &clip.transform);
+                                        let mut composite_params = LayerParams::from_layer_and_clip(
                                             layer,
+                                            clip_transform,
                                             runtime.video_width,
                                             runtime.video_height,
                                             self.environment.width(),
@@ -1865,8 +2109,13 @@ impl App {
                                     }
                                 } else {
                                     // --- NO EFFECTS - DIRECT RENDERING ---
-                                    let mut params = LayerParams::from_layer(
+                                    // Get clip transform for current clip
+                                    let clip_transform = layer.active_clip
+                                        .and_then(|slot| layer.get_clip(slot))
+                                        .map(|clip| &clip.transform);
+                                    let mut params = LayerParams::from_layer_and_clip(
                                         layer,
+                                        clip_transform,
                                         runtime.video_width,
                                         runtime.video_height,
                                         self.environment.width(),
@@ -1914,12 +2163,14 @@ impl App {
                 );
 
                 // 3. Process environment effects in-place on the environment texture
-                self.effect_manager.process_environment_effects(
+                // Use automation-aware processing for FFT/LFO modulation
+                self.effect_manager.process_environment_effects_with_automation(
                     &mut encoder,
                     &self.device,
                     &self.queue,
                     self.environment.texture_view(),
                     env_effects,
+                    Some(&self.audio_manager),
                 );
             }
         }
@@ -1948,7 +2199,7 @@ impl App {
                     if let Err(e) =
                         sharer.publish_wgpu_texture(&self.device, self.environment.texture(), queue)
                     {
-                        log::warn!("Syphon: Failed to publish frame: {}", e);
+                        tracing::warn!("Syphon: Failed to publish frame: {}", e);
                     }
                 }
             }
@@ -1959,6 +2210,43 @@ impl App {
         if self.texture_share_enabled {
             if let Some(capture) = &mut self.spout_capture {
                 capture.capture_frame(&mut encoder, self.environment.texture());
+            }
+        }
+
+        // Render 3D previs scene (if enabled and panel is open)
+        if self.settings.previs_settings.enabled {
+            if let Some(panel) = self.dock_manager.get_panel(crate::ui::dock::panel_ids::PREVIS) {
+                if panel.open {
+                    if let Some(renderer) = &mut self.previs_renderer {
+                        // Ensure render target size matches panel viewport
+                        let (width, height) = self.previs_panel.viewport_size();
+                        renderer.ensure_render_target(&self.device, width, height);
+
+                        // Load camera state from settings if not currently dragging
+                        if !self.previs_panel.is_dragging() {
+                            renderer.load_camera_state(&self.settings.previs_settings);
+                        }
+
+                        // Render the 3D scene
+                        renderer.render(
+                            &mut encoder,
+                            &self.device,
+                            &self.queue,
+                            self.environment.texture_view(),
+                            &self.settings.previs_settings,
+                        );
+
+                        // Register the rendered texture with egui for display
+                        if let Some(texture) = renderer.texture() {
+                            let texture_id = self.egui_renderer.register_native_texture(
+                                &self.device,
+                                &texture.create_view(&Default::default()),
+                                wgpu::FilterMode::Linear,
+                            );
+                            self.previs_panel.texture_id = Some(texture_id);
+                        }
+                    }
+                }
             }
         }
 
@@ -2099,6 +2387,148 @@ impl App {
         self.settings.target_fps
     }
 
+    /// Render a slim status bar when using native menus
+    /// Shows FPS and status messages without the full egui menu bar
+    fn render_status_bar(&mut self, ctx: &egui::Context, fps: f64, frame_time_ms: f64) {
+        egui::TopBottomPanel::top("status_bar")
+            .exact_height(24.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if self.settings.show_fps {
+                            ui.label(
+                                egui::RichText::new(format!("{:.1} fps | {:.2}ms", fps, frame_time_ms))
+                                    .monospace()
+                                    .color(egui::Color32::from_rgb(120, 200, 120)),
+                            );
+                            ui.separator();
+                        }
+
+                        // Status message (fades after 3 seconds)
+                        if let Some((msg, time)) = &self.menu_bar.status_message {
+                            let elapsed = time.elapsed().as_secs_f32();
+                            if elapsed < 3.0 {
+                                let alpha = if elapsed > 2.0 {
+                                    ((3.0 - elapsed) * 255.0) as u8
+                                } else {
+                                    255
+                                };
+                                ui.label(
+                                    egui::RichText::new(msg)
+                                        .color(egui::Color32::from_rgba_unmultiplied(180, 180, 255, alpha)),
+                                );
+                            } else {
+                                self.menu_bar.status_message = None;
+                            }
+                        }
+                    });
+                });
+            });
+    }
+
+    /// Get panel states for native menu synchronization
+    /// Returns a Vec of (panel_id, title, is_open) tuples
+    pub fn get_panel_states(&self) -> Vec<(&str, &str, bool)> {
+        vec![
+            (
+                crate::ui::dock::panel_ids::CLIP_GRID,
+                "Clip Grid",
+                self.dock_manager
+                    .get_panel(crate::ui::dock::panel_ids::CLIP_GRID)
+                    .map(|p| p.open)
+                    .unwrap_or(false),
+            ),
+            (
+                crate::ui::dock::panel_ids::PROPERTIES,
+                "Properties",
+                self.dock_manager
+                    .get_panel(crate::ui::dock::panel_ids::PROPERTIES)
+                    .map(|p| p.open)
+                    .unwrap_or(false),
+            ),
+            (
+                crate::ui::dock::panel_ids::SOURCES,
+                "Sources",
+                self.dock_manager
+                    .get_panel(crate::ui::dock::panel_ids::SOURCES)
+                    .map(|p| p.open)
+                    .unwrap_or(false),
+            ),
+            (
+                crate::ui::dock::panel_ids::EFFECTS_BROWSER,
+                "Effects",
+                self.dock_manager
+                    .get_panel(crate::ui::dock::panel_ids::EFFECTS_BROWSER)
+                    .map(|p| p.open)
+                    .unwrap_or(false),
+            ),
+            (
+                crate::ui::dock::panel_ids::PREVIEW_MONITOR,
+                "Preview Monitor",
+                self.dock_manager
+                    .get_panel(crate::ui::dock::panel_ids::PREVIEW_MONITOR)
+                    .map(|p| p.open)
+                    .unwrap_or(false),
+            ),
+            (
+                crate::ui::dock::panel_ids::PERFORMANCE,
+                "Performance",
+                self.performance_panel.open,
+            ),
+        ]
+    }
+
+    /// Get current performance metrics
+    pub fn performance_metrics(&self) -> crate::telemetry::PerformanceMetrics {
+        use crate::telemetry::{GpuMemoryStats, PerformanceMetrics};
+
+        // Count active clips and effects
+        let mut active_clip_count = 0;
+        let mut effect_count = 0;
+
+        for layer in self.environment.layers() {
+            if layer.visible && layer.active_clip.is_some() {
+                active_clip_count += 1;
+            }
+            effect_count += layer.effects.len();
+        }
+        effect_count += self.environment.effects().len();
+
+        // Estimate GPU memory usage
+        let env_texture_bytes = (self.environment.width() as u64)
+            * (self.environment.height() as u64)
+            * 4; // RGBA
+
+        let mut layer_texture_bytes: u64 = 0;
+        for (_, runtime) in &self.layer_runtimes {
+            if runtime.texture.is_some() && runtime.has_frame {
+                // Estimate texture size: width * height * 4 bytes (RGBA)
+                layer_texture_bytes += (runtime.video_width as u64)
+                    * (runtime.video_height as u64)
+                    * 4;
+            }
+        }
+
+        let gpu_memory = GpuMemoryStats {
+            environment_texture: env_texture_bytes,
+            layer_textures: layer_texture_bytes,
+            effect_buffers: 0, // TODO: Track effect buffer usage
+            total: env_texture_bytes + layer_texture_bytes,
+        };
+
+        PerformanceMetrics {
+            frame_stats: self.frame_profiler.stats(),
+            fps: self.frame_profiler.fps(),
+            target_fps: self.settings.target_fps,
+            gpu_timings: self.gpu_profiler.last_timings().clone(),
+            gpu_total_ms: self.gpu_profiler.total_ms(),
+            layer_count: self.environment.layer_count(),
+            active_clip_count,
+            effect_count,
+            gpu_memory,
+        }
+    }
+
     pub fn cursor_position(&self) -> (f32, f32) {
         self.cursor_position
     }
@@ -2123,7 +2553,7 @@ impl App {
         // Create runtime resources
         self.load_layer_video(layer_id, path)?;
 
-        log::info!("Added layer {} with video: {:?}", layer_id, path);
+        tracing::info!("Added layer {} with video: {:?}", layer_id, path);
         Ok(layer_id)
     }
 
@@ -2135,7 +2565,7 @@ impl App {
         let player =
             VideoPlayer::open(path).map_err(|e| format!("Failed to open video: {}", e))?;
 
-        log::info!(
+        tracing::info!(
             "Layer {}: Loaded video {}x{} @ {:.2}fps, duration: {:.2}s, gpu_native: {}",
             layer_id,
             player.width(),
@@ -2151,7 +2581,7 @@ impl App {
         let use_gpu_native = player.is_hap() && self.bc_texture_supported;
         
         let video_texture = if use_gpu_native {
-            log::info!("Using GPU-native BC texture for layer {} (HAP fast path)", layer_id);
+            tracing::info!("Using GPU-native BC texture for layer {} (HAP fast path)", layer_id);
             VideoTexture::new_gpu_native(&self.device, player.width(), player.height(), player.is_bc3())
         } else {
             VideoTexture::new(&self.device, player.width(), player.height())
@@ -2183,6 +2613,7 @@ impl App {
             old_bind_group: None,
             old_video_width: 0,
             old_video_height: 0,
+            old_clip_transform: None,
             old_params_buffer: None,
             params_buffer: Some(params_buffer),
             // Fade-out state (initialized empty)
@@ -2214,7 +2645,7 @@ impl App {
         let receiver = crate::network::NdiReceiver::connect(ndi_name)
             .map_err(|e| format!("Failed to connect to NDI source: {}", e))?;
 
-        log::info!(
+        tracing::info!(
             "Layer {}: Connected to NDI source '{}'",
             layer_id,
             ndi_name
@@ -2253,6 +2684,7 @@ impl App {
             old_bind_group: None,
             old_video_width: 0,
             old_video_height: 0,
+            old_clip_transform: None,
             old_params_buffer: None,
             params_buffer: Some(params_buffer),
             // Fade-out state (initialized empty)
@@ -2282,7 +2714,7 @@ impl App {
         self.pending_runtimes.remove(&layer_id);
 
         if removed {
-            log::info!("Removed layer {}", layer_id);
+            tracing::info!("Removed layer {}", layer_id);
         }
 
         removed
@@ -2304,7 +2736,7 @@ impl App {
         layer.clips = vec![None; clip_count];
 
         self.environment.add_existing_layer(layer);
-        log::info!("Added layer {} with {} clip slots", next_id, clip_count);
+        tracing::info!("Added layer {} with {} clip slots", next_id, clip_count);
         self.menu_bar.set_status(format!("Added Layer {}", next_id));
     }
 
@@ -2312,7 +2744,7 @@ impl App {
     pub fn delete_layer(&mut self, layer_id: u32) {
         // Don't allow deleting the last layer
         if self.environment.layer_count() <= 1 {
-            log::warn!("Cannot delete the last layer");
+            tracing::warn!("Cannot delete the last layer");
             self.menu_bar.set_status("Cannot delete the last layer".to_string());
             return;
         }
@@ -2332,7 +2764,7 @@ impl App {
             layer.clips.push(None);
         }
 
-        log::info!("Added column - now {} clip slots", new_count);
+        tracing::info!("Added column - now {} clip slots", new_count);
         self.menu_bar.set_status(format!("Added column {}", new_count));
     }
 
@@ -2340,14 +2772,14 @@ impl App {
     pub fn delete_column(&mut self, column_index: usize) {
         // Don't allow deleting the last column
         if self.settings.global_clip_count <= 1 {
-            log::warn!("Cannot delete the last column");
+            tracing::warn!("Cannot delete the last column");
             self.menu_bar.set_status("Cannot delete the last column".to_string());
             return;
         }
 
         // Check if the column index is valid
         if column_index >= self.settings.global_clip_count {
-            log::warn!("Invalid column index: {}", column_index);
+            tracing::warn!("Invalid column index: {}", column_index);
             return;
         }
 
@@ -2377,7 +2809,7 @@ impl App {
         }
 
         self.settings.global_clip_count -= 1;
-        log::info!("Deleted column {} - now {} clip slots", column_index + 1, self.settings.global_clip_count);
+        tracing::info!("Deleted column {} - now {} clip slots", column_index + 1, self.settings.global_clip_count);
         self.menu_bar.set_status(format!("Deleted column {}", column_index + 1));
     }
 
@@ -2431,7 +2863,7 @@ impl App {
                 layer.active_clip = None;
                 layer.source = crate::compositor::LayerSource::None;
             }
-            log::info!("⏹️ Fade-out complete, stopped clip on layer {}", layer_id);
+            tracing::info!("⏹️ Fade-out complete, stopped clip on layer {}", layer_id);
         }
         
         // Update pending runtimes - these get priority since user is waiting
@@ -2464,6 +2896,12 @@ impl App {
                         new_runtime.old_video_height = old_runtime.video_height;
                         new_runtime.old_params_buffer = old_runtime.params_buffer.take();
                     }
+                    // Also store the old clip transform for crossfade
+                    if let Some(layer) = self.environment.get_layer(layer_id) {
+                        new_runtime.old_clip_transform = layer.active_clip
+                            .and_then(|slot| layer.get_clip(slot))
+                            .map(|clip| clip.transform.clone());
+                    }
                 }
                 
                 // Start the transition
@@ -2485,11 +2923,11 @@ impl App {
                 match crate::shaders::load_fullscreen_quad_shader() {
                     Ok(source) => {
                         if let Err(e) = self.video_renderer.rebuild_pipelines(&self.device, &source) {
-                            log::error!("❌ Shader reload failed: {}", e);
+                            tracing::error!("❌ Shader reload failed: {}", e);
                         }
                     }
                     Err(e) => {
-                        log::error!("❌ Failed to read shader file: {}", e);
+                        tracing::error!("❌ Failed to read shader file: {}", e);
                     }
                 }
             }
@@ -2578,11 +3016,11 @@ impl App {
 
                 if is_same_clip {
                     // Same clip - just restart playback (no flash!)
-                    log::info!("🔄 Restarting clip {} on layer {}", slot, layer_id);
+                    tracing::info!("🔄 Restarting clip {} on layer {}", slot, layer_id);
                     self.restart_layer_video(layer_id);
                 } else {
                     // Different clip - need to load it
-                    log::info!("🎬 Loading clip {} on layer {} with {:?} transition: {:?}",
+                    tracing::info!("🎬 Loading clip {} on layer {} with {:?} transition: {:?}",
                         slot, layer_id, transition.name(), path.display());
 
                     // Store the transition type for when the new clip is ready
@@ -2599,7 +3037,7 @@ impl App {
             }
             crate::compositor::ClipSource::Omt { address, name } => {
                 // OMT source playback not yet implemented
-                log::warn!("📡 OMT playback not yet implemented: {} ({})", name, address);
+                tracing::warn!("📡 OMT playback not yet implemented: {} ({})", name, address);
                 return Err(format!("OMT playback not yet implemented. Source: {} ({})", name, address));
             }
             crate::compositor::ClipSource::Ndi { ndi_name, .. } => {
@@ -2616,10 +3054,10 @@ impl App {
 
                 if is_same_source {
                     // Same NDI source - nothing to do (NDI streams continuously)
-                    log::info!("📺 NDI source already active on layer {}: {}", layer_id, ndi_name);
+                    tracing::info!("📺 NDI source already active on layer {}: {}", layer_id, ndi_name);
                 } else {
                     // Different source - connect to new NDI source
-                    log::info!(
+                    tracing::info!(
                         "📺 Connecting to NDI source '{}' on layer {} with {:?} transition",
                         ndi_name, layer_id, transition.name()
                     );
@@ -2657,7 +3095,7 @@ impl App {
             layer.source = crate::compositor::LayerSource::None;
         }
 
-        log::info!("⏹️ Stopped clip on layer {}", layer_id);
+        tracing::info!("⏹️ Stopped clip on layer {}", layer_id);
     }
 
     /// Stop the currently playing clip on a layer with a fade-out transition
@@ -2680,7 +3118,7 @@ impl App {
         if let Some(runtime) = self.layer_runtimes.get_mut(&layer_id) {
             if runtime.has_frame && !runtime.fade_out_active {
                 runtime.start_fade_out(std::time::Duration::from_millis(fade_duration as u64));
-                log::info!("⏹️ Starting fade-out on layer {} ({}ms)", layer_id, fade_duration);
+                tracing::info!("⏹️ Starting fade-out on layer {} ({}ms)", layer_id, fade_duration);
             } else {
                 // No frame or already fading, just stop immediately
                 self.stop_clip(layer_id);
@@ -2742,7 +3180,7 @@ impl App {
         if let Some(layer) = self.environment.get_layer_mut(layer_id) {
             let cell = crate::compositor::ClipCell::from_omt(&address, &name);
             if layer.set_clip(slot, cell) {
-                log::info!(
+                tracing::info!(
                     "📡 Assigned OMT source '{}' ({}) to layer {} slot {}",
                     name, address, layer_id, slot
                 );
@@ -2770,7 +3208,7 @@ impl App {
 
         let count = sources.len();
         self.sources_panel.set_omt_sources(sources);
-        log::info!("📡 OMT: Refreshed source list, found {} sources", count);
+        tracing::info!("📡 OMT: Refreshed source list, found {} sources", count);
         self.menu_bar.set_status(format!("Found {} OMT sources", count));
     }
 
@@ -2794,7 +3232,7 @@ impl App {
     /// can receive the environment's output. Non-blocking - spawns background thread.
     pub fn start_omt_broadcast(&mut self, name: &str, port: u16) {
         if self.omt_capture.is_some() || self.pending_omt_sender.is_some() {
-            log::info!("OMT: Broadcast already active or starting");
+            tracing::info!("OMT: Broadcast already active or starting");
             return;
         }
 
@@ -2812,11 +3250,11 @@ impl App {
 
                 match result {
                     Ok(()) => {
-                        log::info!("📡 OMT: Started sender as '{}' on port {}", name, port);
+                        tracing::info!("📡 OMT: Started sender as '{}' on port {}", name, port);
                         let _ = tx.send(Ok(sender));
                     }
                     Err(e) => {
-                        log::error!("OMT: Failed to start broadcast: {}", e);
+                        tracing::error!("OMT: Failed to start broadcast: {}", e);
                         let _ = tx.send(Err(format!("{}", e)));
                     }
                 }
@@ -2825,7 +3263,7 @@ impl App {
             self.pending_omt_sender = Some(rx);
             self.menu_bar.set_status("Starting OMT broadcast...");
         } else {
-            log::warn!("OMT: Cannot start broadcast - no Tokio runtime");
+            tracing::warn!("OMT: Cannot start broadcast - no Tokio runtime");
         }
     }
 
@@ -2843,7 +3281,7 @@ impl App {
                 if let Some(rt) = &self.tokio_runtime {
                     let w = self.environment.width();
                     let h = self.environment.height();
-                    log::info!("📡 OMT: Creating capture pipeline for {}x{}", w, h);
+                    tracing::info!("📡 OMT: Creating capture pipeline for {}x{}", w, h);
 
                     let mut capture = crate::network::OmtCapture::new(&self.device, w, h);
                     capture.set_target_fps(self.settings.omt_capture_fps);
@@ -2851,7 +3289,7 @@ impl App {
                     self.omt_capture = Some(capture);
                     self.omt_broadcast_enabled = true;
                     self.menu_bar.set_status(format!("OMT broadcast started ({}x{})", w, h));
-                    log::info!("📡 OMT: Capture pipeline started, broadcasting {}x{} on port 5970", w, h);
+                    tracing::info!("📡 OMT: Capture pipeline started, broadcasting {}x{} on port 5970", w, h);
                 }
             }
             Ok(Err(e)) => {
@@ -2880,7 +3318,7 @@ impl App {
             self.omt_capture = None;
             self.omt_sender = None;
             self.omt_broadcast_enabled = false;
-            log::info!("📡 OMT: Stopped broadcast");
+            tracing::info!("📡 OMT: Stopped broadcast");
             self.menu_bar.set_status("OMT broadcast stopped");
         }
     }
@@ -2893,6 +3331,651 @@ impl App {
     /// Check if OMT broadcast is starting (pending)
     pub fn is_omt_starting(&self) -> bool {
         self.pending_omt_sender.is_some()
+    }
+
+    // =========================================================================
+    // REST API Server Methods
+    // =========================================================================
+
+    /// Start the REST API server on the configured port
+    pub fn start_api_server(&mut self) {
+        if self.api_server_running {
+            tracing::info!("🌐 API: Server already running");
+            return;
+        }
+
+        let port = self.settings.api_port;
+
+        if let Some(rt) = &self.tokio_runtime {
+            let runtime_handle = rt.handle().clone();
+
+            // Create shared state and command channel
+            let (shared_state, command_rx) = crate::api::create_shared_state();
+            self.api_shared_state = Some(shared_state.clone());
+            self.api_command_rx = Some(command_rx);
+
+            // Create shutdown channel for graceful termination
+            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+            self.api_shutdown_tx = Some(shutdown_tx);
+
+            // Spawn the API server on a background thread (includes dashboard at /)
+            std::thread::spawn(move || {
+                runtime_handle.block_on(async {
+                    if let Err(e) = crate::api::run_server(port, shared_state, shutdown_rx).await {
+                        log::error!("🌐 API: Server error: {}", e);
+                    }
+                });
+            });
+
+            self.api_server_running = true;
+            self.menu_bar.set_status(format!("API + Dashboard on port {}", port));
+            log::info!("🌐 API + Dashboard: http://0.0.0.0:{}", port);
+        } else {
+            tracing::warn!("🌐 API: Cannot start server - no Tokio runtime");
+        }
+    }
+
+    /// Check if the API server is running
+    pub fn is_api_server_running(&self) -> bool {
+        self.api_server_running
+    }
+
+    /// Update the API shared state with current app state
+    /// Call this once per frame to keep the API snapshot up-to-date
+    pub fn update_api_snapshot(&self) {
+        if let Some(ref shared_state) = self.api_shared_state {
+            let snapshot = self.create_api_snapshot();
+            shared_state.update_snapshot(snapshot);
+        }
+    }
+
+    /// Create an API snapshot from current app state
+    fn create_api_snapshot(&self) -> crate::api::AppSnapshot {
+        use crate::api::{AppSnapshot, ClipSnapshot, LayerSnapshot, StreamingSnapshot, ViewportSnapshot};
+        use crate::compositor::ClipSource;
+
+        let layers: Vec<LayerSnapshot> = self.environment.layers().iter().map(|layer| {
+            let clips: Vec<ClipSnapshot> = layer.clips.iter().enumerate().map(|(slot, clip_opt)| {
+                if let Some(clip) = clip_opt {
+                    let (source_type, source_path) = match &clip.source {
+                        ClipSource::File { path } => (Some("file".to_string()), Some(path.display().to_string())),
+                        ClipSource::Omt { name, .. } => (Some("omt".to_string()), Some(name.clone())),
+                        ClipSource::Ndi { ndi_name, .. } => (Some("ndi".to_string()), Some(ndi_name.clone())),
+                    };
+                    ClipSnapshot {
+                        slot,
+                        source_type,
+                        source_path,
+                        label: clip.label.clone(),
+                    }
+                } else {
+                    ClipSnapshot {
+                        slot,
+                        source_type: None,
+                        source_path: None,
+                        label: None,
+                    }
+                }
+            }).collect();
+
+            LayerSnapshot {
+                id: layer.id,
+                name: layer.name.clone(),
+                visible: layer.visible,
+                opacity: layer.opacity,
+                blend_mode: layer.blend_mode,
+                position: layer.transform.position,
+                scale: layer.transform.scale,
+                rotation: layer.transform.rotation,
+                anchor: layer.transform.anchor,
+                tile_x: layer.tile_x,
+                tile_y: layer.tile_y,
+                transition: layer.transition.clone(),
+                clips,
+                active_clip: layer.active_clip,
+            }
+        }).collect();
+
+        AppSnapshot {
+            env_width: self.environment.width(),
+            env_height: self.environment.height(),
+            target_fps: self.settings.target_fps,
+            current_fps: self.ui_fps as f32,
+            frame_time_ms: if self.ui_fps > 0.0 { 1000.0 / self.ui_fps as f32 } else { 0.0 },
+            paused: false, // TODO: Track global pause state
+            layers,
+            viewport: ViewportSnapshot {
+                zoom: self.viewport.zoom(),
+                pan_x: self.viewport.offset().0,
+                pan_y: self.viewport.offset().1,
+            },
+            streaming: StreamingSnapshot {
+                omt_broadcasting: self.is_omt_broadcasting(),
+                omt_name: None, // OMT name is passed at broadcast start, not stored
+                omt_port: None, // OMT port is passed at broadcast start, not stored
+                omt_capture_fps: self.settings.omt_capture_fps,
+                ndi_broadcasting: self.is_ndi_broadcasting(),
+                ndi_name: None, // NDI name is passed at broadcast start, not stored
+                texture_sharing: self.texture_share_enabled,
+            },
+            sources: Vec::new(), // TODO: Populate discovered sources
+            file: crate::api::FileSnapshot {
+                current_path: self.current_file.as_ref().map(|p| p.display().to_string()),
+                modified: false, // TODO: Track modified state
+                recent_files: Vec::new(), // TODO: Track recent files
+            },
+            environment_effects: self.environment.effects().effects.iter().map(|effect| {
+                crate::api::EffectSnapshot {
+                    id: effect.id.to_string(),
+                    effect_type: effect.effect_type.clone(),
+                    enabled: !effect.bypassed,
+                    bypassed: effect.bypassed,
+                    solo: effect.soloed,
+                }
+            }).collect(),
+            clip_columns: self.settings.global_clip_count,
+        }
+    }
+
+    /// Process pending API commands
+    /// Call this once per frame to handle commands from the API server
+    pub fn process_api_commands(&mut self) {
+        use crate::api::ApiCommand;
+
+        // Take the receiver temporarily to avoid borrow issues
+        let mut rx = match self.api_command_rx.take() {
+            Some(rx) => rx,
+            None => return,
+        };
+
+        // Process all pending commands
+        while let Ok(cmd) = rx.try_recv() {
+            match cmd {
+                // Environment commands
+                ApiCommand::SetEnvironmentSize { width, height } => {
+                    self.environment.resize(&self.device, width, height);
+                    self.settings.environment_width = width;
+                    self.settings.environment_height = height;
+                    tracing::info!("🌐 API: Resized environment to {}x{}", width, height);
+                }
+                ApiCommand::SetTargetFps { fps } => {
+                    self.settings.target_fps = fps;
+                    tracing::info!("🌐 API: Set target FPS to {}", fps);
+                }
+
+                // Layer commands
+                ApiCommand::CreateLayer { name } => {
+                    let id = self.environment.add_layer(&name);
+                    tracing::info!("🌐 API: Created layer '{}' (id={})", name, id);
+                }
+                ApiCommand::DeleteLayer { id } => {
+                    if self.environment.remove_layer(id).is_some() {
+                        self.layer_runtimes.remove(&id);
+                        tracing::info!("🌐 API: Deleted layer {}", id);
+                    }
+                }
+                ApiCommand::UpdateLayer { id, name, visible, opacity, blend_mode } => {
+                    if let Some(layer) = self.environment.get_layer_mut(id) {
+                        if let Some(n) = name { layer.name = n; }
+                        if let Some(v) = visible { layer.visible = v; }
+                        if let Some(o) = opacity { layer.set_opacity(o); }
+                        if let Some(b) = blend_mode { layer.blend_mode = b; }
+                        tracing::debug!("🌐 API: Updated layer {}", id);
+                    }
+                }
+                ApiCommand::ReorderLayer { id, position } => {
+                    if let Some(current_idx) = self.environment.layers().iter().position(|l| l.id == id) {
+                        self.environment.move_layer(current_idx, position);
+                        tracing::info!("🌐 API: Moved layer {} to position {}", id, position);
+                    }
+                }
+
+                // Layer transform commands
+                ApiCommand::SetLayerPosition { id, x, y } => {
+                    if let Some(layer) = self.environment.get_layer_mut(id) {
+                        layer.set_position(x, y);
+                    }
+                }
+                ApiCommand::SetLayerScale { id, scale_x, scale_y } => {
+                    if let Some(layer) = self.environment.get_layer_mut(id) {
+                        layer.set_scale(scale_x, scale_y);
+                    }
+                }
+                ApiCommand::SetLayerRotation { id, rotation } => {
+                    if let Some(layer) = self.environment.get_layer_mut(id) {
+                        layer.set_rotation(rotation);
+                    }
+                }
+                ApiCommand::SetLayerTransform { id, position, scale, rotation, anchor } => {
+                    if let Some(layer) = self.environment.get_layer_mut(id) {
+                        if let Some((x, y)) = position { layer.transform.position = (x, y); }
+                        if let Some((sx, sy)) = scale { layer.transform.scale = (sx, sy); }
+                        if let Some(r) = rotation { layer.transform.rotation = r; }
+                        if let Some((ax, ay)) = anchor { layer.transform.anchor = (ax, ay); }
+                    }
+                }
+
+                // Layer property commands
+                ApiCommand::SetLayerOpacity { id, opacity } => {
+                    if let Some(layer) = self.environment.get_layer_mut(id) {
+                        layer.set_opacity(opacity);
+                    }
+                }
+                ApiCommand::SetLayerBlendMode { id, blend_mode } => {
+                    if let Some(layer) = self.environment.get_layer_mut(id) {
+                        layer.blend_mode = blend_mode;
+                    }
+                }
+                ApiCommand::SetLayerVisibility { id, visible } => {
+                    if let Some(layer) = self.environment.get_layer_mut(id) {
+                        layer.visible = visible;
+                    }
+                }
+                ApiCommand::SetLayerTiling { id, tile_x, tile_y } => {
+                    if let Some(layer) = self.environment.get_layer_mut(id) {
+                        layer.set_tiling(tile_x, tile_y);
+                    }
+                }
+                ApiCommand::SetLayerTransition { id, transition } => {
+                    if let Some(layer) = self.environment.get_layer_mut(id) {
+                        layer.transition = transition;
+                    }
+                }
+
+                // Clip commands
+                ApiCommand::SetClip { layer_id, slot, source_type, path, source_id, label } => {
+                    if let Some(layer) = self.environment.get_layer_mut(layer_id) {
+                        let cell = match source_type.as_str() {
+                            "file" => {
+                                if let Some(p) = path {
+                                    let mut cell = crate::compositor::ClipCell::new(&p);
+                                    cell.label = label;
+                                    Some(cell)
+                                } else { None }
+                            }
+                            "omt" => {
+                                if let Some(id) = source_id {
+                                    let mut cell = crate::compositor::ClipCell::from_omt(&id, &id);
+                                    cell.label = label;
+                                    Some(cell)
+                                } else { None }
+                            }
+                            "ndi" => {
+                                if let Some(id) = source_id {
+                                    let mut cell = crate::compositor::ClipCell::from_ndi(&id, None);
+                                    cell.label = label;
+                                    Some(cell)
+                                } else { None }
+                            }
+                            _ => None,
+                        };
+                        if let Some(cell) = cell {
+                            layer.set_clip(slot, cell);
+                            tracing::info!("🌐 API: Set clip at layer {} slot {}", layer_id, slot);
+                        }
+                    }
+                }
+                ApiCommand::ClearClip { layer_id, slot } => {
+                    if let Some(layer) = self.environment.get_layer_mut(layer_id) {
+                        layer.clear_clip(slot);
+                        tracing::info!("🌐 API: Cleared clip at layer {} slot {}", layer_id, slot);
+                    }
+                }
+                ApiCommand::TriggerClip { layer_id, slot } => {
+                    let _ = self.trigger_clip(layer_id, slot);
+                    tracing::info!("🌐 API: Triggered clip at layer {} slot {}", layer_id, slot);
+                }
+                ApiCommand::StopClip { layer_id } => {
+                    self.stop_clip(layer_id);
+                    tracing::info!("🌐 API: Stopped layer {}", layer_id);
+                }
+
+                // Playback commands
+                ApiCommand::PauseAll => {
+                    for runtime in self.layer_runtimes.values() {
+                        if let Some(player) = &runtime.player {
+                            player.pause();
+                        }
+                    }
+                    tracing::info!("🌐 API: Paused all layers");
+                }
+                ApiCommand::ResumeAll => {
+                    for runtime in self.layer_runtimes.values() {
+                        if let Some(player) = &runtime.player {
+                            player.resume();
+                        }
+                    }
+                    tracing::info!("🌐 API: Resumed all layers");
+                }
+                ApiCommand::TogglePause => {
+                    for runtime in self.layer_runtimes.values() {
+                        runtime.toggle_pause();
+                    }
+                    tracing::info!("🌐 API: Toggled pause");
+                }
+                ApiCommand::RestartAll => {
+                    for runtime in self.layer_runtimes.values() {
+                        runtime.restart();
+                    }
+                    tracing::info!("🌐 API: Restarted all layers");
+                }
+                ApiCommand::PauseLayer { id } => {
+                    if let Some(runtime) = self.layer_runtimes.get(&id) {
+                        if let Some(player) = &runtime.player {
+                            player.pause();
+                        }
+                    }
+                }
+                ApiCommand::ResumeLayer { id } => {
+                    if let Some(runtime) = self.layer_runtimes.get(&id) {
+                        if let Some(player) = &runtime.player {
+                            player.resume();
+                        }
+                    }
+                }
+                ApiCommand::RestartLayer { id } => {
+                    if let Some(runtime) = self.layer_runtimes.get(&id) {
+                        runtime.restart();
+                    }
+                }
+
+                // Viewport commands
+                ApiCommand::ResetViewport => {
+                    self.viewport.reset();
+                    tracing::info!("🌐 API: Reset viewport");
+                }
+                ApiCommand::SetViewportZoom { zoom } => {
+                    self.viewport.set_zoom(zoom);
+                }
+                ApiCommand::SetViewportPan { x, y } => {
+                    self.viewport.set_offset(x, y);
+                }
+
+                // Streaming commands
+                ApiCommand::StartOmtBroadcast { name, port } => {
+                    self.start_omt_broadcast(&name, port);
+                    tracing::info!("🌐 API: Started OMT broadcast '{}' on port {}", name, port);
+                }
+                ApiCommand::StopOmtBroadcast => {
+                    self.stop_omt_broadcast();
+                    tracing::info!("🌐 API: Stopped OMT broadcast");
+                }
+                ApiCommand::SetOmtCaptureFps { fps } => {
+                    self.settings.omt_capture_fps = fps;
+                    tracing::info!("🌐 API: Set OMT capture FPS to {}", fps);
+                }
+                ApiCommand::StartNdiBroadcast { name } => {
+                    self.start_ndi_broadcast(&name);
+                    tracing::info!("🌐 API: Started NDI broadcast '{}'", name);
+                }
+                ApiCommand::StopNdiBroadcast => {
+                    self.stop_ndi_broadcast();
+                    tracing::info!("🌐 API: Stopped NDI broadcast");
+                }
+                ApiCommand::StartTextureShare => {
+                    self.start_texture_sharing();
+                    tracing::info!("🌐 API: Started texture sharing");
+                }
+                ApiCommand::StopTextureShare => {
+                    self.stop_texture_sharing();
+                    tracing::info!("🌐 API: Stopped texture sharing");
+                }
+
+                // Source discovery commands
+                ApiCommand::RefreshOmtSources => {
+                    if let Some(discovery) = &mut self.omt_discovery {
+                        discovery.refresh();
+                    }
+                    tracing::debug!("🌐 API: Refreshed OMT sources");
+                }
+                ApiCommand::StartNdiDiscovery => {
+                    self.start_ndi_discovery();
+                    tracing::info!("🌐 API: Started NDI discovery");
+                }
+                ApiCommand::StopNdiDiscovery => {
+                    self.stop_ndi_discovery();
+                    tracing::info!("🌐 API: Stopped NDI discovery");
+                }
+                ApiCommand::RefreshNdiSources => {
+                    self.refresh_ndi_sources();
+                    tracing::debug!("🌐 API: Refreshed NDI sources");
+                }
+
+                ApiCommand::PasteClip { layer_id, slot } => {
+                    self.paste_clip(layer_id, slot);
+                    tracing::debug!("🌐 API: Pasted clip to layer {} slot {}", layer_id, slot);
+                }
+
+                // Grid management commands
+                ApiCommand::AddColumn => {
+                    self.add_column();
+                    tracing::info!("🌐 API: Added clip column");
+                }
+                ApiCommand::DeleteColumn { index } => {
+                    self.delete_column(index);
+                    tracing::info!("🌐 API: Deleted clip column {}", index);
+                }
+
+                // File operations
+                ApiCommand::OpenFile { path } => {
+                    let path = std::path::PathBuf::from(path);
+                    match EnvironmentSettings::load_from_file(&path) {
+                        Ok(settings) => {
+                            self.settings = settings;
+                            self.current_file = Some(path.clone());
+                            tracing::info!("🌐 API: Opened file {:?}", path);
+                        }
+                        Err(e) => {
+                            tracing::error!("🌐 API: Failed to open file: {}", e);
+                        }
+                    }
+                }
+                ApiCommand::SaveFile => {
+                    if let Some(path) = self.current_file.clone() {
+                        if let Err(e) = self.settings.save_to_file(&path) {
+                            tracing::error!("🌐 API: Failed to save file: {}", e);
+                        } else {
+                            tracing::info!("🌐 API: Saved file {:?}", path);
+                        }
+                    } else {
+                        tracing::warn!("🌐 API: No current file to save");
+                    }
+                }
+                ApiCommand::SaveFileAs { path } => {
+                    let path = std::path::PathBuf::from(path);
+                    if let Err(e) = self.settings.save_to_file(&path) {
+                        tracing::error!("🌐 API: Failed to save file as: {}", e);
+                    } else {
+                        self.current_file = Some(path.clone());
+                        tracing::info!("🌐 API: Saved file as {:?}", path);
+                    }
+                }
+
+                // Environment effects commands
+                ApiCommand::AddEnvironmentEffect { effect_type } => {
+                    if let Some(params) = self.effect_manager.registry().default_parameters(&effect_type) {
+                        let display_name = self.effect_manager.registry()
+                            .get(&effect_type)
+                            .map(|d| d.display_name().to_string())
+                            .unwrap_or_else(|| effect_type.clone());
+                        let _id = self.environment.effects_mut().add(&effect_type, &display_name, params);
+                        tracing::info!("🌐 API: Added environment effect '{}'", effect_type);
+                    }
+                }
+                ApiCommand::RemoveEnvironmentEffect { effect_id } => {
+                    if let Ok(id) = effect_id.parse::<u32>() {
+                        self.environment.effects_mut().remove(id);
+                        tracing::info!("🌐 API: Removed environment effect {}", effect_id);
+                    }
+                }
+                ApiCommand::UpdateEnvironmentEffect { effect_id, parameters } => {
+                    if let Ok(id) = effect_id.parse::<u32>() {
+                        if let Some(effect) = self.environment.effects_mut().get_mut(id) {
+                            // Update parameters from JSON
+                            if let Ok(params_map) = serde_json::from_value::<std::collections::HashMap<String, serde_json::Value>>(parameters) {
+                                for (name, json_value) in params_map {
+                                    if let Some(param) = effect.parameters.iter_mut().find(|p| p.meta.name == name) {
+                                        // Convert JSON value to ParameterValue
+                                        if let Some(v) = json_value.as_f64() {
+                                            param.value = crate::effects::ParameterValue::Float(v as f32);
+                                        } else if let Some(v) = json_value.as_i64() {
+                                            param.value = crate::effects::ParameterValue::Int(v as i32);
+                                        } else if let Some(v) = json_value.as_bool() {
+                                            param.value = crate::effects::ParameterValue::Bool(v);
+                                        }
+                                    }
+                                }
+                            }
+                            tracing::debug!("🌐 API: Updated environment effect {}", effect_id);
+                        }
+                    }
+                }
+                ApiCommand::BypassEnvironmentEffect { effect_id } => {
+                    if let Ok(id) = effect_id.parse::<u32>() {
+                        if let Some(effect) = self.environment.effects_mut().get_mut(id) {
+                            effect.bypassed = !effect.bypassed;
+                            tracing::debug!("🌐 API: Toggled bypass for environment effect {}", effect_id);
+                        }
+                    }
+                }
+                ApiCommand::SoloEnvironmentEffect { effect_id } => {
+                    tracing::warn!("🌐 API: Solo environment effect {} not yet implemented", effect_id);
+                }
+                ApiCommand::ReorderEnvironmentEffects { order: _ } => {
+                    tracing::warn!("🌐 API: Reorder environment effects not yet implemented");
+                }
+
+                // Layer effects commands
+                ApiCommand::AddLayerEffect { layer_id, effect_type } => {
+                    if let Some(layer) = self.environment.get_layer_mut(layer_id) {
+                        if let Some(params) = self.effect_manager.registry().default_parameters(&effect_type) {
+                            let display_name = self.effect_manager.registry()
+                                .get(&effect_type)
+                                .map(|d| d.display_name().to_string())
+                                .unwrap_or_else(|| effect_type.clone());
+                            let _id = layer.effects.add(&effect_type, &display_name, params);
+                            tracing::info!("🌐 API: Added layer {} effect '{}'", layer_id, effect_type);
+                        }
+                    }
+                }
+                ApiCommand::RemoveLayerEffect { layer_id, effect_id } => {
+                    if let Some(layer) = self.environment.get_layer_mut(layer_id) {
+                        if let Ok(id) = effect_id.parse::<u32>() {
+                            layer.effects.remove(id);
+                            tracing::info!("🌐 API: Removed layer {} effect {}", layer_id, effect_id);
+                        }
+                    }
+                }
+                ApiCommand::UpdateLayerEffect { layer_id, effect_id, parameters } => {
+                    if let Some(layer) = self.environment.get_layer_mut(layer_id) {
+                        if let Ok(id) = effect_id.parse::<u32>() {
+                            if let Some(effect) = layer.effects.get_mut(id) {
+                                if let Ok(params_map) = serde_json::from_value::<std::collections::HashMap<String, serde_json::Value>>(parameters) {
+                                    for (name, json_value) in params_map {
+                                        if let Some(param) = effect.parameters.iter_mut().find(|p| p.meta.name == name) {
+                                            if let Some(v) = json_value.as_f64() {
+                                                param.value = crate::effects::ParameterValue::Float(v as f32);
+                                            } else if let Some(v) = json_value.as_i64() {
+                                                param.value = crate::effects::ParameterValue::Int(v as i32);
+                                            } else if let Some(v) = json_value.as_bool() {
+                                                param.value = crate::effects::ParameterValue::Bool(v);
+                                            }
+                                        }
+                                    }
+                                }
+                                tracing::debug!("🌐 API: Updated layer {} effect {}", layer_id, effect_id);
+                            }
+                        }
+                    }
+                }
+                ApiCommand::BypassLayerEffect { layer_id, effect_id } => {
+                    if let Some(layer) = self.environment.get_layer_mut(layer_id) {
+                        if let Ok(id) = effect_id.parse::<u32>() {
+                            if let Some(effect) = layer.effects.get_mut(id) {
+                                effect.bypassed = !effect.bypassed;
+                                tracing::debug!("🌐 API: Toggled bypass for layer {} effect {}", layer_id, effect_id);
+                            }
+                        }
+                    }
+                }
+                ApiCommand::SoloLayerEffect { layer_id, effect_id } => {
+                    tracing::warn!("🌐 API: Solo layer {} effect {} not yet implemented", layer_id, effect_id);
+                }
+                ApiCommand::ReorderLayerEffects { layer_id, order: _ } => {
+                    tracing::warn!("🌐 API: Reorder layer {} effects not yet implemented", layer_id);
+                }
+
+                // Clip effects commands
+                ApiCommand::AddClipEffect { layer_id, slot, effect_type } => {
+                    if let Some(layer) = self.environment.get_layer_mut(layer_id) {
+                        if let Some(Some(clip)) = layer.clips.get_mut(slot) {
+                            if let Some(params) = self.effect_manager.registry().default_parameters(&effect_type) {
+                                let display_name = self.effect_manager.registry()
+                                    .get(&effect_type)
+                                    .map(|d| d.display_name().to_string())
+                                    .unwrap_or_else(|| effect_type.clone());
+                                let _id = clip.effects.add(&effect_type, &display_name, params);
+                                tracing::info!("🌐 API: Added clip effect '{}' to layer {} slot {}", effect_type, layer_id, slot);
+                            }
+                        }
+                    }
+                }
+                ApiCommand::RemoveClipEffect { layer_id, slot, effect_id } => {
+                    if let Some(layer) = self.environment.get_layer_mut(layer_id) {
+                        if let Some(Some(clip)) = layer.clips.get_mut(slot) {
+                            if let Ok(id) = effect_id.parse::<u32>() {
+                                clip.effects.remove(id);
+                                tracing::info!("🌐 API: Removed clip effect {} from layer {} slot {}", effect_id, layer_id, slot);
+                            }
+                        }
+                    }
+                }
+                ApiCommand::UpdateClipEffect { layer_id, slot, effect_id, parameters } => {
+                    if let Some(layer) = self.environment.get_layer_mut(layer_id) {
+                        if let Some(Some(clip)) = layer.clips.get_mut(slot) {
+                            if let Ok(id) = effect_id.parse::<u32>() {
+                                if let Some(effect) = clip.effects.get_mut(id) {
+                                    if let Ok(params_map) = serde_json::from_value::<std::collections::HashMap<String, serde_json::Value>>(parameters) {
+                                        for (name, json_value) in params_map {
+                                            if let Some(param) = effect.parameters.iter_mut().find(|p| p.meta.name == name) {
+                                                if let Some(v) = json_value.as_f64() {
+                                                    param.value = crate::effects::ParameterValue::Float(v as f32);
+                                                } else if let Some(v) = json_value.as_i64() {
+                                                    param.value = crate::effects::ParameterValue::Int(v as i32);
+                                                } else if let Some(v) = json_value.as_bool() {
+                                                    param.value = crate::effects::ParameterValue::Bool(v);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    tracing::debug!("🌐 API: Updated clip effect {} at layer {} slot {}", effect_id, layer_id, slot);
+                                }
+                            }
+                        }
+                    }
+                }
+                ApiCommand::BypassClipEffect { layer_id, slot, effect_id } => {
+                    if let Some(layer) = self.environment.get_layer_mut(layer_id) {
+                        if let Some(Some(clip)) = layer.clips.get_mut(slot) {
+                            if let Ok(id) = effect_id.parse::<u32>() {
+                                if let Some(effect) = clip.effects.get_mut(id) {
+                                    effect.bypassed = !effect.bypassed;
+                                    tracing::debug!("🌐 API: Toggled bypass for clip effect {} at layer {} slot {}", effect_id, layer_id, slot);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Catch-all for unimplemented commands
+                _ => {
+                    tracing::warn!("🌐 API: Unimplemented command received: {:?}", cmd);
+                }
+            }
+        }
+
+        // Put the receiver back
+        self.api_command_rx = Some(rx);
     }
 
     // =========================================================================
@@ -2910,7 +3993,7 @@ impl App {
         if let Some(layer) = self.environment.get_layer_mut(layer_id) {
             let cell = crate::compositor::ClipCell::from_ndi(&ndi_name, url_address);
             if layer.set_clip(slot, cell) {
-                log::info!(
+                tracing::info!(
                     "📺 Assigned NDI source '{}' to layer {} slot {}",
                     ndi_name, layer_id, slot
                 );
@@ -2932,12 +4015,12 @@ impl App {
         if let Some(discovery) = &mut self.omt_discovery {
             match discovery.start_ndi_discovery() {
                 Ok(()) => {
-                    log::info!("📺 NDI: Discovery started");
+                    tracing::info!("📺 NDI: Discovery started");
                     self.sources_panel.set_ndi_discovery_enabled(true);
                     self.menu_bar.set_status("NDI discovery started");
                 }
                 Err(e) => {
-                    log::error!("📺 NDI: Failed to start discovery: {}", e);
+                    tracing::error!("📺 NDI: Failed to start discovery: {}", e);
                     self.menu_bar.set_status(format!("NDI discovery failed: {}", e));
                 }
             }
@@ -2948,7 +4031,7 @@ impl App {
     pub fn stop_ndi_discovery(&mut self) {
         if let Some(discovery) = &mut self.omt_discovery {
             discovery.stop_ndi_discovery();
-            log::info!("📺 NDI: Discovery stopped");
+            tracing::info!("📺 NDI: Discovery stopped");
             self.sources_panel.set_ndi_discovery_enabled(false);
             self.sources_panel.set_ndi_sources(Vec::new());
             self.menu_bar.set_status("NDI discovery stopped");
@@ -2984,27 +4067,27 @@ impl App {
     /// Start NDI broadcast
     pub fn start_ndi_broadcast(&mut self, name: &str) {
         if self.ndi_capture.is_some() {
-            log::info!("NDI: Broadcast already active");
+            tracing::info!("NDI: Broadcast already active");
             return;
         }
 
-        // Create NDI sender
-        match crate::network::NdiSender::new(name) {
+        // Create NDI sender with environment's target FPS (synced to render loop)
+        let env_fps = self.settings.target_fps;
+        match crate::network::NdiSender::new(name, env_fps) {
             Ok(sender) => {
                 let w = self.environment.width();
                 let h = self.environment.height();
-                log::info!("📺 NDI: Creating capture pipeline for {}x{}", w, h);
+                tracing::info!("📺 NDI: Creating capture pipeline for {}x{} @ {}fps", w, h, env_fps);
 
                 let mut capture = crate::network::NdiCapture::new(&self.device, w, h);
-                capture.set_target_fps(self.settings.ndi_capture_fps);
                 capture.start_sender_thread(sender);
                 self.ndi_capture = Some(capture);
                 self.ndi_broadcast_enabled = true;
                 self.menu_bar.set_status(format!("NDI broadcast started ({}x{})", w, h));
-                log::info!("📺 NDI: Capture pipeline started, broadcasting {}x{}", w, h);
+                tracing::info!("📺 NDI: Capture pipeline started, broadcasting {}x{}", w, h);
             }
             Err(e) => {
-                log::error!("NDI: Failed to create sender: {}", e);
+                tracing::error!("NDI: Failed to create sender: {}", e);
                 self.ndi_broadcast_enabled = false;
                 self.settings.ndi_broadcast_enabled = false;
                 self.menu_bar.set_status(format!("NDI broadcast failed: {}", e));
@@ -3019,7 +4102,7 @@ impl App {
             self.ndi_capture = None;
             self.ndi_sender = None;
             self.ndi_broadcast_enabled = false;
-            log::info!("📺 NDI: Stopped broadcast");
+            tracing::info!("📺 NDI: Stopped broadcast");
             self.menu_bar.set_status("NDI broadcast stopped");
         }
     }
@@ -3041,7 +4124,7 @@ impl App {
         use std::ffi::c_void;
 
         if self.texture_sharer.is_some() {
-            log::info!("Syphon: Already sharing");
+            tracing::info!("Syphon: Already sharing");
             return;
         }
 
@@ -3065,7 +4148,7 @@ impl App {
         let (metal_device_ptr, command_queue) = match metal_result {
             Some((ptr, queue)) => (ptr, queue),
             None => {
-                log::error!("Syphon: Failed to get Metal device from wgpu");
+                tracing::error!("Syphon: Failed to get Metal device from wgpu");
                 self.menu_bar
                     .set_status("Syphon error: Not running on Metal backend");
                 return;
@@ -3098,12 +4181,12 @@ impl App {
                 self.texture_sharer = Some(sharer);
                 self.metal_command_queue = Some(command_queue);
                 self.texture_share_enabled = true;
-                log::info!("Syphon: Started sharing as '{}'", name);
+                tracing::info!("Syphon: Started sharing as '{}'", name);
                 self.menu_bar
                     .set_status(&format!("Syphon: Sharing as '{}'", name));
             }
             Err(e) => {
-                log::error!("Syphon: Failed to start: {}", e);
+                tracing::error!("Syphon: Failed to start: {}", e);
                 self.menu_bar.set_status(&format!("Syphon error: {}", e));
             }
         }
@@ -3112,7 +4195,7 @@ impl App {
     #[cfg(target_os = "windows")]
     pub fn start_texture_sharing(&mut self) {
         if self.spout_capture.is_some() {
-            log::info!("Spout: Already sharing");
+            tracing::info!("Spout: Already sharing");
             return;
         }
 
@@ -3137,11 +4220,11 @@ impl App {
             Ok(()) => {
                 self.spout_capture = Some(capture);
                 self.texture_share_enabled = true;
-                log::info!("Spout: Started sharing as '{}'", name);
+                tracing::info!("Spout: Started sharing as '{}'", name);
                 self.menu_bar.set_status(&format!("Spout: Sharing as '{}'", name));
             }
             Err(e) => {
-                log::error!("Spout: Failed to start: {}", e);
+                tracing::error!("Spout: Failed to start: {}", e);
                 self.menu_bar.set_status(&format!("Spout error: {}", e));
             }
         }
@@ -3158,7 +4241,7 @@ impl App {
         self.texture_sharer = None;
         self.metal_command_queue = None;
         self.texture_share_enabled = false;
-        log::info!("Syphon: Stopped sharing");
+        tracing::info!("Syphon: Stopped sharing");
         self.menu_bar.set_status("Syphon: Stopped");
     }
 
@@ -3169,7 +4252,7 @@ impl App {
         }
         self.spout_capture = None;
         self.texture_share_enabled = false;
-        log::info!("Spout: Stopped sharing");
+        tracing::info!("Spout: Stopped sharing");
         self.menu_bar.set_status("Spout: Stopped");
     }
 
@@ -3196,7 +4279,7 @@ impl App {
         if let Some(layer) = self.environment.get_layer(layer_id) {
             if let Some(clip) = layer.get_clip(slot) {
                 self.clip_grid_panel.copy_clip(clip.clone());
-                log::info!("📋 Copied clip from layer {} slot {}", layer_id, slot);
+                tracing::info!("📋 Copied clip from layer {} slot {}", layer_id, slot);
                 self.menu_bar.set_status(format!("Copied clip: {}", clip.display_name()));
             }
         }
@@ -3207,7 +4290,7 @@ impl App {
         if let Some(clip) = self.clip_grid_panel.get_clipboard().cloned() {
             if let Some(layer) = self.environment.get_layer_mut(layer_id) {
                 layer.set_clip(slot, clip.clone());
-                log::info!("📋 Pasted clip to layer {} slot {}", layer_id, slot);
+                tracing::info!("📋 Pasted clip to layer {} slot {}", layer_id, slot);
                 self.menu_bar.set_status(format!("Pasted clip: {}", clip.display_name()));
             }
         }
@@ -3222,7 +4305,7 @@ impl App {
         // Get the source layer data
         let (new_layer, active_clip_path) = {
             let Some(source_layer) = self.environment.get_layer(layer_id) else {
-                log::warn!("Cannot clone layer {}: not found", layer_id);
+                tracing::warn!("Cannot clone layer {}: not found", layer_id);
                 return;
             };
 
@@ -3262,7 +4345,7 @@ impl App {
         // If the original was playing, load the same video on the clone
         if let Some(path) = active_clip_path {
             if let Err(e) = self.load_layer_video(new_id, &path) {
-                log::warn!("Failed to load video for cloned layer: {}", e);
+                tracing::warn!("Failed to load video for cloned layer: {}", e);
             } else {
                 // Mark the first clip slot as active if it matches
                 if let Some(layer) = self.environment.get_layer_mut(new_id) {
@@ -3280,7 +4363,7 @@ impl App {
             }
         }
 
-        log::info!("📋 Cloned layer {} -> {} ({})", layer_id, new_id, new_name);
+        tracing::info!("📋 Cloned layer {} -> {} ({})", layer_id, new_id, new_name);
         self.menu_bar.set_status(format!("Cloned layer: {}", new_name));
     }
 
@@ -3292,7 +4375,7 @@ impl App {
     ) {
         if let Some(layer) = self.environment.get_layer_mut(layer_id) {
             layer.transition = transition;
-            log::info!(
+            tracing::info!(
                 "Set transition for layer {} to {:?}",
                 layer_id,
                 transition.name()
@@ -3322,7 +4405,7 @@ impl App {
         match action {
             ClipGridAction::TriggerClip { layer_id, slot } => {
                 if let Err(e) = self.trigger_clip(layer_id, slot) {
-                    log::error!("Failed to trigger clip: {}", e);
+                    tracing::error!("Failed to trigger clip: {}", e);
                     self.menu_bar.set_status(format!("Failed to trigger clip: {}", e));
                 }
                 // Select the clip in the properties panel
@@ -3348,7 +4431,7 @@ impl App {
                     .and_then(|s| s.to_str())
                     .map(|s| s.to_string());
                 if self.set_layer_clip(layer_id, slot, path, label) {
-                    log::info!("Assigned clip to layer {} at slot {} via drag-drop", layer_id, slot);
+                    tracing::info!("Assigned clip to layer {} at slot {} via drag-drop", layer_id, slot);
                     self.menu_bar.set_status(format!("Assigned clip to slot {}", slot + 1));
                 }
             }
@@ -3418,20 +4501,36 @@ impl App {
                             source_info,
                         });
 
+                        // Free old preview texture from egui before loading new one
+                        if let Some(old_texture_id) = self.preview_player.egui_texture_id.take() {
+                            self.egui_renderer.free_texture(&old_texture_id);
+                        }
+
                         // Load the clip into the preview player
                         match &clip.source {
                             crate::compositor::ClipSource::File { path } => {
                                 if let Err(e) = self.preview_player.load(path, &self.device, &self.video_renderer) {
-                                    log::warn!("Failed to load preview: {}", e);
+                                    tracing::warn!("Failed to load preview: {}", e);
                                     self.menu_bar.set_status(format!("Preview failed: {}", e));
+                                } else {
+                                    // Register the preview texture with egui for display
+                                    if let Some(texture_view) = self.preview_player.texture_view() {
+                                        let texture_id = self.egui_renderer.register_native_texture(
+                                            &self.device,
+                                            texture_view,
+                                            wgpu::FilterMode::Linear,
+                                        );
+                                        self.preview_player.egui_texture_id = Some(texture_id);
+                                        tracing::info!("Preview texture registered with egui");
+                                    }
                                 }
                             }
                             crate::compositor::ClipSource::Omt { .. } => {
-                                log::info!("OMT preview not yet implemented");
+                                tracing::info!("OMT preview not yet implemented");
                                 self.menu_bar.set_status("OMT preview not yet supported".to_string());
                             }
                             crate::compositor::ClipSource::Ndi { .. } => {
-                                log::info!("NDI preview not yet implemented");
+                                tracing::info!("NDI preview not yet implemented");
                                 self.menu_bar.set_status("NDI preview not yet supported".to_string());
                             }
                         }
@@ -3529,11 +4628,9 @@ impl App {
                     self.stop_ndi_broadcast();
                 }
             }
-            PropertiesAction::SetNdiCaptureFps { fps } => {
-                self.settings.ndi_capture_fps = fps;
-                if let Some(ref mut capture) = self.ndi_capture {
-                    capture.set_target_fps(fps);
-                }
+            PropertiesAction::SetNdiCaptureFps { fps: _ } => {
+                // NDI capture is now synced to environment FPS (target_fps).
+                // This setting is ignored - NDI sends every rendered frame.
             }
             PropertiesAction::SetThumbnailMode { mode } => {
                 self.settings.thumbnail_mode = mode;
@@ -3563,7 +4660,19 @@ impl App {
 
                 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
                 {
-                    log::warn!("Texture sharing not available on this platform");
+                    tracing::warn!("Texture sharing not available on this platform");
+                }
+            }
+            PropertiesAction::SetApiServer { enabled } => {
+                self.settings.api_server_enabled = enabled;
+                if enabled && !self.api_server_running {
+                    self.start_api_server();
+                }
+                // Note: We don't stop the server when disabled - it requires app restart
+                // This is because the server runs in a background thread and graceful shutdown
+                // would add complexity. The setting will take effect on next app start.
+                if !enabled && self.api_server_running {
+                    self.menu_bar.set_status("API server will stop on restart");
                 }
             }
 
@@ -3577,14 +4686,14 @@ impl App {
                             .unwrap_or(&effect_type)
                             .to_string();
                         layer.effects.add(&effect_type, &display_name, params);
-                        log::info!("Added effect '{}' to layer {}", display_name, layer_id);
+                        tracing::info!("Added effect '{}' to layer {}", display_name, layer_id);
                     }
                 }
             }
             PropertiesAction::RemoveLayerEffect { layer_id, effect_id } => {
                 if let Some(layer) = self.environment.get_layer_mut(layer_id) {
                     layer.effects.remove(effect_id);
-                    log::info!("Removed effect {} from layer {}", effect_id, layer_id);
+                    tracing::info!("Removed effect {} from layer {}", effect_id, layer_id);
                 }
             }
             PropertiesAction::SetLayerEffectBypassed { layer_id, effect_id, bypassed } => {
@@ -3626,7 +4735,7 @@ impl App {
                                 .unwrap_or(&effect_type)
                                 .to_string();
                             clip.effects.add(&effect_type, &display_name, params);
-                            log::info!("Added effect '{}' to clip {} on layer {}", display_name, slot, layer_id);
+                            tracing::info!("Added effect '{}' to clip {} on layer {}", display_name, slot, layer_id);
                         }
                     }
                 }
@@ -3635,7 +4744,7 @@ impl App {
                 if let Some(layer) = self.environment.get_layer_mut(layer_id) {
                     if let Some(clip) = layer.get_clip_mut(slot) {
                         clip.effects.remove(effect_id);
-                        log::info!("Removed effect {} from clip {} on layer {}", effect_id, slot, layer_id);
+                        tracing::info!("Removed effect {} from clip {} on layer {}", effect_id, slot, layer_id);
                     }
                 }
             }
@@ -3684,12 +4793,12 @@ impl App {
                         .unwrap_or(&effect_type)
                         .to_string();
                     self.environment.effects_mut().add(&effect_type, &display_name, params);
-                    log::info!("Added master effect '{}'", display_name);
+                    tracing::info!("Added master effect '{}'", display_name);
                 }
             }
             PropertiesAction::RemoveEnvironmentEffect { effect_id } => {
                 self.environment.effects_mut().remove(effect_id);
-                log::info!("Removed master effect {}", effect_id);
+                tracing::info!("Removed master effect {}", effect_id);
             }
             PropertiesAction::SetEnvironmentEffectBypassed { effect_id, bypassed } => {
                 if let Some(effect) = self.environment.effects_mut().get_mut(effect_id) {
@@ -3732,6 +4841,78 @@ impl App {
                     effect.expanded = expanded;
                 }
             }
+            PropertiesAction::SetLayerEffectParameterAutomation { layer_id, effect_id, param_name, automation } => {
+                if let Some(layer) = self.environment.get_layer_mut(layer_id) {
+                    if let Some(effect) = layer.effects.get_mut(effect_id) {
+                        if let Some(param) = effect.get_parameter_mut(&param_name) {
+                            param.automation = automation;
+                        }
+                    }
+                }
+            }
+            PropertiesAction::SetClipEffectParameterAutomation { layer_id, slot, effect_id, param_name, automation } => {
+                if let Some(layer) = self.environment.get_layer_mut(layer_id) {
+                    if let Some(clip) = layer.get_clip_mut(slot) {
+                        if let Some(effect) = clip.effects.get_mut(effect_id) {
+                            if let Some(param) = effect.get_parameter_mut(&param_name) {
+                                param.automation = automation;
+                            }
+                        }
+                    }
+                }
+            }
+            PropertiesAction::SetEnvironmentEffectParameterAutomation { effect_id, param_name, automation } => {
+                if let Some(effect) = self.environment.effects_mut().get_mut(effect_id) {
+                    if let Some(param) = effect.get_parameter_mut(&param_name) {
+                        param.automation = automation;
+                    }
+                }
+            }
+            // Clip transform actions
+            PropertiesAction::SetClipPosition { layer_id, slot, x, y } => {
+                if let Some(layer) = self.environment.get_layer_mut(layer_id) {
+                    if let Some(clip) = layer.get_clip_mut(slot) {
+                        clip.transform.position = (x, y);
+                    }
+                }
+            }
+            PropertiesAction::SetClipScale { layer_id, slot, scale_x, scale_y } => {
+                if let Some(layer) = self.environment.get_layer_mut(layer_id) {
+                    if let Some(clip) = layer.get_clip_mut(slot) {
+                        clip.transform.scale = (scale_x, scale_y);
+                    }
+                }
+            }
+            PropertiesAction::SetClipRotation { layer_id, slot, degrees } => {
+                if let Some(layer) = self.environment.get_layer_mut(layer_id) {
+                    if let Some(clip) = layer.get_clip_mut(slot) {
+                        clip.transform.rotation = degrees.to_radians();
+                    }
+                }
+            }
+
+            // Clip transport actions
+            PropertiesAction::ToggleClipPlayback { layer_id } => {
+                if let Some(runtime) = self.layer_runtimes.get(&layer_id) {
+                    if let Some(player) = &runtime.player {
+                        player.toggle_pause();
+                    }
+                }
+            }
+            PropertiesAction::RestartClip { layer_id } => {
+                if let Some(runtime) = self.layer_runtimes.get(&layer_id) {
+                    if let Some(player) = &runtime.player {
+                        player.restart();
+                    }
+                }
+            }
+            PropertiesAction::PreviewClip { layer_id, slot } => {
+                // Trigger the same action as right-click preview in clip grid
+                self.handle_clip_action(crate::ui::ClipGridAction::SelectClipForPreview {
+                    layer_id,
+                    slot,
+                });
+            }
         }
     }
 
@@ -3769,8 +4950,78 @@ impl App {
             PreviewMonitorAction::TriggerToLayer { layer_id, slot } => {
                 // Trigger the previewed clip to its layer (go live)
                 if let Err(e) = self.trigger_clip(layer_id, slot) {
-                    log::error!("Failed to trigger clip from preview: {}", e);
+                    tracing::error!("Failed to trigger clip from preview: {}", e);
                     self.menu_bar.set_status(format!("Failed to trigger clip: {}", e));
+                }
+            }
+        }
+    }
+
+    /// Handle a previs panel action from the UI
+    fn handle_previs_action(&mut self, action: crate::ui::PrevisAction) {
+        use crate::ui::{PrevisAction, WallId};
+
+        match action {
+            PrevisAction::SetSurfaceType(surface_type) => {
+                self.settings.previs_settings.surface_type = surface_type;
+            }
+            PrevisAction::SetEnabled(enabled) => {
+                self.settings.previs_settings.enabled = enabled;
+            }
+            PrevisAction::SetCircleRadius(radius) => {
+                self.settings.previs_settings.circle_radius = radius;
+            }
+            PrevisAction::SetCircleSegments(segments) => {
+                self.settings.previs_settings.circle_segments = segments;
+            }
+            PrevisAction::SetWallEnabled(wall_id, enabled) => {
+                let wall = match wall_id {
+                    WallId::Front => &mut self.settings.previs_settings.wall_front,
+                    WallId::Back => &mut self.settings.previs_settings.wall_back,
+                    WallId::Left => &mut self.settings.previs_settings.wall_left,
+                    WallId::Right => &mut self.settings.previs_settings.wall_right,
+                };
+                wall.enabled = enabled;
+            }
+            PrevisAction::SetWallWidth(wall_id, width) => {
+                let wall = match wall_id {
+                    WallId::Front => &mut self.settings.previs_settings.wall_front,
+                    WallId::Back => &mut self.settings.previs_settings.wall_back,
+                    WallId::Left => &mut self.settings.previs_settings.wall_left,
+                    WallId::Right => &mut self.settings.previs_settings.wall_right,
+                };
+                wall.width = width;
+            }
+            PrevisAction::SetWallHeight(wall_id, height) => {
+                let wall = match wall_id {
+                    WallId::Front => &mut self.settings.previs_settings.wall_front,
+                    WallId::Back => &mut self.settings.previs_settings.wall_back,
+                    WallId::Left => &mut self.settings.previs_settings.wall_left,
+                    WallId::Right => &mut self.settings.previs_settings.wall_right,
+                };
+                wall.height = height;
+            }
+            PrevisAction::SetDomeRadius(radius) => {
+                self.settings.previs_settings.dome_radius = radius;
+            }
+            PrevisAction::SetDomeSegmentsH(segments) => {
+                self.settings.previs_settings.dome_segments_horizontal = segments;
+            }
+            PrevisAction::SetDomeSegmentsV(segments) => {
+                self.settings.previs_settings.dome_segments_vertical = segments;
+            }
+            PrevisAction::SaveCameraState { yaw, pitch, distance } => {
+                self.settings.previs_settings.camera_yaw = yaw;
+                self.settings.previs_settings.camera_pitch = pitch;
+                self.settings.previs_settings.camera_distance = distance;
+            }
+            PrevisAction::ResetCamera => {
+                if let Some(renderer) = &mut self.previs_renderer {
+                    renderer.camera_mut().reset();
+                    // Update settings with default values
+                    self.settings.previs_settings.camera_yaw = 0.0;
+                    self.settings.previs_settings.camera_pitch = 0.3;
+                    self.settings.previs_settings.camera_distance = 10.0;
                 }
             }
         }
@@ -3786,15 +5037,15 @@ impl App {
                 .map(|s| s.to_string());
             
             if self.set_layer_clip(layer_id, slot, path.clone(), label) {
-                log::info!("Assigned clip to layer {} at slot {}", layer_id, slot);
+                tracing::info!("Assigned clip to layer {} at slot {}", layer_id, slot);
                 self.menu_bar.set_status(format!("Assigned clip to slot {}", slot + 1));
             } else {
-                log::error!("Failed to assign clip to layer {} at slot {}", layer_id, slot);
+                tracing::error!("Failed to assign clip to layer {} at slot {}", layer_id, slot);
             }
         } else {
             // No pending assignment - this is a regular video load (legacy)
             if let Err(e) = self.load_video(&path) {
-                log::error!("Failed to load video: {}", e);
+                tracing::error!("Failed to load video: {}", e);
                 self.menu_bar.set_status(format!("Failed: {}", e));
             }
         }

@@ -72,7 +72,19 @@ impl Viewport {
     pub fn zoom(&self) -> f32 {
         self.zoom
     }
-    
+
+    /// Set zoom level directly (for API control)
+    pub fn set_zoom(&mut self, zoom: f32) {
+        self.zoom = zoom.clamp(0.1, 8.0);
+        self.velocity = (0.0, 0.0); // Stop any ongoing animation
+    }
+
+    /// Set offset directly (for API control)
+    pub fn set_offset(&mut self, x: f32, y: f32) {
+        self.offset = (x, y);
+        self.velocity = (0.0, 0.0); // Stop any ongoing animation
+    }
+
     /// Reset viewport to fit-to-window state
     pub fn reset(&mut self) {
         self.offset = (0.0, 0.0);

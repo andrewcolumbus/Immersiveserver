@@ -6,6 +6,7 @@
 
 use std::time::{Duration, Instant};
 
+use crate::compositor::layer::Transform2D;
 use crate::compositor::ClipTransition;
 use crate::network::NdiReceiver;
 use crate::video::{VideoPlayer, VideoTexture};
@@ -53,6 +54,8 @@ pub struct LayerRuntime {
     /// Old video dimensions for crossfade rendering
     pub old_video_width: u32,
     pub old_video_height: u32,
+    /// Old clip transform for crossfade (kept during transition)
+    pub old_clip_transform: Option<Transform2D>,
     /// Old params buffer for crossfade (kept during transition)
     pub old_params_buffer: Option<wgpu::Buffer>,
 
@@ -89,6 +92,7 @@ impl LayerRuntime {
             old_bind_group: None,
             old_video_width: 0,
             old_video_height: 0,
+            old_clip_transform: None,
             old_params_buffer: None,
             params_buffer: None,
             // Fade-out state
@@ -145,7 +149,7 @@ impl LayerRuntime {
             if let Some(frame) = player.take_frame() {
                 // Check if texture format matches frame format
                 if frame.is_gpu_native != texture.is_gpu_native() {
-                    log::warn!(
+                    tracing::warn!(
                         "Texture format mismatch: frame is_gpu_native={}, texture is_gpu_native={}",
                         frame.is_gpu_native,
                         texture.is_gpu_native()
@@ -173,7 +177,7 @@ impl LayerRuntime {
                 if ndi_frame.width != self.video_width || ndi_frame.height != self.video_height {
                     self.video_width = ndi_frame.width;
                     self.video_height = ndi_frame.height;
-                    log::info!(
+                    tracing::info!(
                         "NDI frame resolution updated: {}x{}",
                         ndi_frame.width,
                         ndi_frame.height
@@ -214,6 +218,7 @@ impl LayerRuntime {
         self.old_bind_group = None;
         self.old_video_width = 0;
         self.old_video_height = 0;
+        self.old_clip_transform = None;
         self.old_params_buffer = None;
         self.params_buffer = None;
         // Clear fade-out state
@@ -264,6 +269,7 @@ impl LayerRuntime {
         self.old_bind_group = None;
         self.old_video_width = 0;
         self.old_video_height = 0;
+        self.old_clip_transform = None;
         self.old_params_buffer = None;
     }
 

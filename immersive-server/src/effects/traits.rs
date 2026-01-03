@@ -145,6 +145,122 @@ impl EffectParams {
         }
         offset
     }
+
+    /// Pack parameters with automation evaluation
+    ///
+    /// For parameters with automation (LFO, FFT, etc.), evaluates the automation
+    /// and uses the modulated value. Otherwise uses the static value.
+    ///
+    /// # Arguments
+    /// * `parameters` - List of parameters to pack
+    /// * `clock` - BPM clock for LFO/Beat automation
+    /// * `audio_manager` - Audio manager for FFT automation (can be None if no FFT used)
+    pub fn pack_parameters_with_automation(
+        &mut self,
+        parameters: &[Parameter],
+        clock: &super::automation::BpmClock,
+        audio_manager: Option<&crate::audio::AudioManager>,
+    ) -> usize {
+        let mut offset = 0;
+        for param in parameters {
+            // Get the evaluated value (with automation if present)
+            let evaluated = self.evaluate_param_value(param, clock, audio_manager);
+
+            match &param.value {
+                ParameterValue::Float(_) => {
+                    self.set_float(offset, evaluated);
+                    offset += 1;
+                }
+                ParameterValue::Int(_) => {
+                    self.set_float(offset, evaluated);
+                    offset += 1;
+                }
+                ParameterValue::Bool(_) => {
+                    // For bool, automation returns 0.0-1.0, threshold at 0.5
+                    self.set_bool(offset, evaluated > 0.5);
+                    offset += 1;
+                }
+                ParameterValue::Vec2(v) => {
+                    // Vec2 automation modulates first component only for now
+                    self.set_vec2(offset, [evaluated, v[1]]);
+                    offset += 2;
+                }
+                ParameterValue::Vec3(v) => {
+                    // Vec3 automation modulates first component only for now
+                    self.set_vec3(offset, [evaluated, v[1], v[2]]);
+                    offset += 3;
+                }
+                ParameterValue::Color(v) => {
+                    // Color automation modulates all RGB equally (brightness)
+                    if param.automation.is_some() {
+                        let base = param.value.as_f32();
+                        let factor = if base > 0.0 { evaluated / base } else { evaluated };
+                        self.set_color(offset, [
+                            (v[0] * factor).min(1.0),
+                            (v[1] * factor).min(1.0),
+                            (v[2] * factor).min(1.0),
+                            v[3],
+                        ]);
+                    } else {
+                        self.set_color(offset, *v);
+                    }
+                    offset += 4;
+                }
+                ParameterValue::Enum { .. } => {
+                    self.set_float(offset, evaluated);
+                    offset += 1;
+                }
+                ParameterValue::String(_) => {
+                    // String parameters are not passed to shaders
+                }
+            }
+            if offset >= self.params.len() {
+                break;
+            }
+        }
+        offset
+    }
+
+    /// Evaluate a single parameter's value with automation
+    fn evaluate_param_value(
+        &self,
+        param: &Parameter,
+        clock: &super::automation::BpmClock,
+        audio_manager: Option<&crate::audio::AudioManager>,
+    ) -> f32 {
+        use super::types::AutomationSource;
+
+        let base_value = param.value.as_f32();
+        let min = param.meta.min.unwrap_or(0.0);
+        let max = param.meta.max.unwrap_or(1.0);
+        let range = max - min;
+
+        match &param.automation {
+            None => base_value,
+            Some(AutomationSource::Lfo(lfo)) => {
+                // Evaluate LFO and modulate around base value
+                let lfo_value = lfo.evaluate(clock, self.time);
+                (base_value + lfo_value * range * 0.5).clamp(min, max)
+            }
+            Some(AutomationSource::Beat(_beat)) => {
+                // Beat automation needs envelope state tracking
+                // For now, return base value (full envelope support requires state)
+                base_value
+            }
+            Some(AutomationSource::Fft(fft)) => {
+                if let Some(manager) = audio_manager {
+                    // Get raw FFT value with gain applied
+                    let raw = manager.get_band_value(fft.band);
+                    let gained = (raw * fft.gain).min(1.0);
+
+                    // Map FFT value to parameter range
+                    min + gained * range
+                } else {
+                    base_value
+                }
+            }
+        }
+    }
 }
 
 /// Trait for effect definitions (factory pattern)

@@ -1,0 +1,62 @@
+[package]
+name = "projmap-calibrator"
+version = "0.1.0"
+edition = "2021"
+description = "Projection mapping calibration tool with structured light and edge blending"
+
+[dependencies]
+# Graphics
+wgpu = "24"
+winit = "0.30"
+
+# GUI
+egui = "0.31"
+egui-wgpu = "0.31"
+egui-winit = "0.31"
+
+# Image processing
+image = "0.25"
+
+# Async runtime for NDI receiver
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+pollster = "0.4"
+
+# Zero-copy byte buffers (for NDI frames)
+bytes = "1.5"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+quick-xml = { version = "0.37", features = ["serialize"] }
+
+# Binary serialization for calibration files
+bincode = "1.3"
+lz4_flex = "0.11"
+
+# Utilities
+bytemuck = { version = "1", features = ["derive"] }
+log = "0.4"
+env_logger = "0.11"
+
+# File dialogs
+rfd = "0.14"
+
+# File watching (for shader hot-reload)
+notify = "7"
+
+# Platform directories
+dirs = "6"
+
+# OpenCV for computer vision (homography, camera calibration)
+# Note: Requires OpenCV 4.x installed via Homebrew: brew install opencv
+# Enable with: cargo build --features opencv
+opencv = { version = "0.92", default-features = false, features = ["clang-runtime", "calib3d", "imgproc"], optional = true }
+
+# macOS-specific dependencies for Metal access
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+
+[features]
+default = ["opencv"]
+opencv = ["dep:opencv"]

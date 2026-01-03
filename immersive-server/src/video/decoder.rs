@@ -179,7 +179,7 @@ impl VideoDecoder {
             // HAP/DXV codec - GPU-native format, no decode acceleration needed
             // These frames are DXT/BC compressed and upload directly to GPU
             let codec_type = if is_hap { "HAP" } else { "DXV" };
-            log::info!("Detected {} codec: {} - GPU-native texture format (no decode needed)", codec_type, codec_name);
+            tracing::info!("Detected {} codec: {} - GPU-native texture format (no decode needed)", codec_type, codec_name);
             let context = ffmpeg_next::codec::context::Context::from_parameters(parameters)?;
             let decoder = context.decoder().video().map_err(|e| {
                 VideoDecoderError::DecoderCreationFailed(format!("Failed to create {} decoder: {}", codec_type, e))
@@ -188,7 +188,7 @@ impl VideoDecoder {
         } else if try_hwaccel {
             Self::try_create_hwaccel_decoder(&video_stream, &codec_name)
                 .unwrap_or_else(|e| {
-                    log::warn!("Hardware acceleration failed: {}. Falling back to software decode.", e);
+                    tracing::warn!("Hardware acceleration failed: {}. Falling back to software decode.", e);
                     let context = ffmpeg_next::codec::context::Context::from_parameters(parameters)
                         .expect("Failed to create codec context");
                     (context.decoder().video().expect("Failed to create software decoder"), HwAccelMethod::None)
@@ -205,7 +205,7 @@ impl VideoDecoder {
         let width = decoder.width();
         let height = decoder.height();
 
-        log::info!(
+        tracing::info!(
             "Opened video: {}x{} @ {:.2}fps, duration: {:.2}s, codec: {}, hwaccel: {}",
             width,
             height,
@@ -262,11 +262,11 @@ impl VideoDecoder {
         for method in hwaccel_methods {
             match Self::create_hwaccel_decoder_with_method(stream, codec_name, method) {
                 Ok(decoder) => {
-                    log::info!("✓ Hardware acceleration enabled: {}", method);
+                    tracing::info!("✓ Hardware acceleration enabled: {}", method);
                     return Ok((decoder, method));
                 }
                 Err(e) => {
-                    log::debug!("Hardware acceleration {} not available: {}", method, e);
+                    tracing::debug!("Hardware acceleration {} not available: {}", method, e);
                 }
             }
         }
@@ -310,7 +310,7 @@ impl VideoDecoder {
 
         // Try hardware decoder
         if let Some(hw_name) = hw_decoder_name {
-            log::debug!("Attempting {} decoder with {} hwaccel", hw_name, hwaccel_name);
+            tracing::debug!("Attempting {} decoder with {} hwaccel", hw_name, hwaccel_name);
             
             // Create decoder from stream parameters - this is the safe way
             let parameters = stream.parameters();
@@ -333,13 +333,13 @@ impl VideoDecoder {
             );
 
             if is_hw_format {
-                log::info!("Decoder using hardware pixel format: {:?}", pix_fmt);
+                tracing::info!("Decoder using hardware pixel format: {:?}", pix_fmt);
                 return Ok(decoder);
             } else {
                 // The decoder was created successfully - FFmpeg may still be using hwaccel
                 // internally even if the output format isn't a "hardware" format.
                 // Modern FFmpeg often auto-transfers hw frames to system memory.
-                log::debug!("Decoder created with format {:?}, hwaccel {} available", pix_fmt, hwaccel_name);
+                tracing::debug!("Decoder created with format {:?}, hwaccel {} available", pix_fmt, hwaccel_name);
                 return Ok(decoder);
             }
         }
@@ -391,7 +391,7 @@ impl VideoDecoder {
                             return Ok(Some(frame));
                         } else {
                             // HAP parsing failed - this shouldn't happen for valid HAP files
-                            log::warn!("HAP packet parsing failed for frame {}", self.frame_index);
+                            tracing::warn!("HAP packet parsing failed for frame {}", self.frame_index);
                             continue;
                         }
                     }
@@ -425,7 +425,7 @@ impl VideoDecoder {
                                 0,
                             );
                             if ret < 0 {
-                                log::warn!("Failed to transfer hwframe to system memory");
+                                tracing::warn!("Failed to transfer hwframe to system memory");
                                 decoded_frame
                             } else {
                                 sw_frame

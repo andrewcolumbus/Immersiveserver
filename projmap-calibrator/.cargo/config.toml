@@ -1,0 +1,21 @@
+# Cargo configuration for projmap-calibrator
+# NDI SDK paths for macOS
+# OpenCV paths (via Homebrew)
+
+[env]
+# NDI SDK runtime library path
+DYLD_LIBRARY_PATH = "/Library/NDI SDK for Apple/lib/macOS"
+# OpenCV pkg-config path
+PKG_CONFIG_PATH = "/opt/homebrew/opt/opencv/lib/pkgconfig"
+
+[target.aarch64-apple-darwin]
+rustflags = [
+    "-L", "/Library/NDI SDK for Apple/lib/macOS",
+    "-L", "/opt/homebrew/opt/opencv/lib",
+]
+
+[target.x86_64-apple-darwin]
+rustflags = [
+    "-L", "/Library/NDI SDK for Apple/lib/macOS",
+    "-L", "/opt/homebrew/opt/opencv/lib",
+]

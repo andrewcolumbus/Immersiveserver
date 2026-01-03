@@ -16,14 +16,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bytes::Bytes;
 
 use super::NdiSender;
 
-/// Default target frame rate for NDI capture (30fps to reduce CPU load).
-const DEFAULT_CAPTURE_FPS: u32 = 30;
 
 /// Number of staging buffers for async capture pipeline.
 const NUM_STAGING_BUFFERS: usize = 3;
@@ -91,26 +89,19 @@ pub struct NdiCapture {
     /// Reusable buffer for unpacking row-padded data.
     /// Avoids per-frame heap allocation.
     unpack_buffer: Vec<u8>,
-
-    /// Target capture frame rate.
-    target_fps: u32,
-    /// Minimum interval between captures.
-    min_capture_interval: Duration,
-    /// Last capture time for frame rate throttling.
-    last_capture_time: Instant,
 }
 
 impl NdiCapture {
     /// Create a new NdiCapture for the given environment dimensions.
+    ///
+    /// Captures every frame rendered - no internal throttling.
+    /// NDI SDK handles frame pacing via clock_video.
     pub fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
         let (staging_buffers, bytes_per_row, unpadded_bytes_per_row) =
             Self::create_staging_buffers(device, width, height);
 
         // Pre-allocate unpack buffer for row-padding removal
         let unpack_buffer = Vec::with_capacity((width * height * 4) as usize);
-
-        let target_fps = DEFAULT_CAPTURE_FPS;
-        let min_capture_interval = Duration::from_secs_f64(1.0 / target_fps as f64);
 
         Self {
             staging_buffers,
@@ -125,9 +116,6 @@ impl NdiCapture {
             frame_count: 0,
             frames_skipped: 0,
             unpack_buffer,
-            target_fps,
-            min_capture_interval,
-            last_capture_time: Instant::now(),
         }
     }
 
@@ -171,13 +159,16 @@ impl NdiCapture {
             return;
         }
 
-        let (frame_tx, frame_rx) = mpsc::sync_channel::<NdiCapturedFrame>(8);
+        // Reduced buffer capacity (was 8) - with clock_video enabled,
+        // NDI SDK handles pacing so we don't need deep buffers.
+        // Smaller buffer = lower latency variance.
+        let (frame_tx, frame_rx) = mpsc::sync_channel::<NdiCapturedFrame>(2);
         let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
 
         let handle = thread::Builder::new()
             .name("ndi-sender".into())
             .spawn(move || {
-                log::info!("NDI: Sender thread started");
+                tracing::info!("NDI: Sender thread started");
 
                 // Keep previous frame alive for async send (NDI holds reference until next send)
                 let mut _prev_frame: Option<NdiCapturedFrame> = None;
@@ -185,7 +176,7 @@ impl NdiCapture {
                 loop {
                     // Check for shutdown signal (non-blocking)
                     if shutdown_rx.try_recv().is_ok() {
-                        log::info!("NDI: Sender thread shutting down");
+                        tracing::info!("NDI: Sender thread shutting down");
                         break;
                     }
 
@@ -204,7 +195,7 @@ impl NdiCapture {
                                     let count = sender.frame_count();
                                     if count == 1 || count % 300 == 0 {
                                         let connections = sender.connection_count();
-                                        log::info!(
+                                        tracing::info!(
                                             "📺 NDI: Sent {} frames ({}x{}), {} receivers connected",
                                             count,
                                             frame.width,
@@ -214,7 +205,7 @@ impl NdiCapture {
                                     }
                                 }
                                 Err(e) => {
-                                    log::warn!("NDI: Failed to send frame: {}", e);
+                                    tracing::warn!("NDI: Failed to send frame: {}", e);
                                 }
                             }
 
@@ -223,14 +214,14 @@ impl NdiCapture {
                         }
                         Err(mpsc::RecvTimeoutError::Timeout) => continue,
                         Err(mpsc::RecvTimeoutError::Disconnected) => {
-                            log::info!("NDI: Frame channel disconnected");
+                            tracing::info!("NDI: Frame channel disconnected");
                             break;
                         }
                     }
                 }
 
                 // Sender is dropped here, cleaning up NDI resources
-                log::info!("NDI: Sender thread stopped");
+                tracing::info!("NDI: Sender thread stopped");
             })
             .expect("Failed to spawn NDI sender thread");
 
@@ -260,18 +251,13 @@ impl NdiCapture {
     /// Queue a copy from the environment texture to a staging buffer.
     ///
     /// Call this after rendering to the environment but before queue.submit().
-    /// Returns true if a capture was queued, false if skipped (throttled or pipeline full).
+    /// Captures every frame - no throttling. NDI SDK handles frame pacing via clock_video.
+    /// Returns true if a capture was queued, false if skipped (pipeline full).
     pub fn capture_frame(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         env_texture: &wgpu::Texture,
     ) -> bool {
-        // Frame rate throttling - skip if we're capturing too fast
-        let now = Instant::now();
-        if now.duration_since(self.last_capture_time) < self.min_capture_interval {
-            return false; // Don't count as skipped, just throttled
-        }
-
         // Adaptive skip: if 2+ buffers are pending, skip to reduce GPU pressure
         let pending_count = self
             .staging_buffers
@@ -318,20 +304,7 @@ impl NdiCapture {
 
         staging.state = BufferState::Pending;
         self.next_capture_buffer = (self.next_capture_buffer + 1) % NUM_STAGING_BUFFERS;
-        self.last_capture_time = now;
         true
-    }
-
-    /// Set the target capture frame rate.
-    pub fn set_target_fps(&mut self, fps: u32) {
-        self.target_fps = fps.max(1).min(60);
-        self.min_capture_interval = Duration::from_secs_f64(1.0 / self.target_fps as f64);
-        log::info!("NDI: Capture target FPS set to {}", self.target_fps);
-    }
-
-    /// Get the current target capture frame rate.
-    pub fn target_fps(&self) -> u32 {
-        self.target_fps
     }
 
     /// Process the capture pipeline - call this each frame after queue.submit().
@@ -390,18 +363,26 @@ impl NdiCapture {
                     }
                     drop(data);
 
-                    // Send to background thread (non-blocking)
-                    // Bytes::copy_from_slice does one copy; Bytes is then zero-copy shared
+                    // Send to background thread.
+                    // Bytes::copy_from_slice does one copy; Bytes is then zero-copy shared.
+                    // With clock_video enabled and small buffer (2 frames), NDI SDK handles
+                    // pacing so try_send rarely fails. When it does, we drop rather than block.
                     if let Some(tx) = &self.frame_tx {
                         let frame = NdiCapturedFrame {
                             width: self.width,
                             height: self.height,
                             data: Bytes::copy_from_slice(&self.unpack_buffer),
                         };
-                        if tx.try_send(frame).is_err() {
-                            log::debug!("NDI: Frame dropped (sender busy)");
-                        } else {
-                            self.frame_count += 1;
+                        match tx.try_send(frame) {
+                            Ok(()) => {
+                                self.frame_count += 1;
+                            }
+                            Err(mpsc::TrySendError::Full(_)) => {
+                                tracing::debug!("NDI: Frame dropped (buffer full)");
+                            }
+                            Err(mpsc::TrySendError::Disconnected(_)) => {
+                                tracing::warn!("NDI: Sender thread disconnected");
+                            }
                         }
                     }
 
@@ -422,7 +403,7 @@ impl NdiCapture {
             return;
         }
 
-        log::info!("NDI: Resizing capture buffers to {}x{}", width, height);
+        tracing::info!("NDI: Resizing capture buffers to {}x{}", width, height);
 
         // Unmap any mapped buffers first
         for staging in &mut self.staging_buffers {

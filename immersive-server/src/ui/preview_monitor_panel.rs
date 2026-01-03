@@ -176,10 +176,67 @@ impl PreviewMonitorPanel {
             );
         }
 
-        ui.add_space(8.0);
+        ui.add_space(4.0);
 
-        // Video info
-        if let Some(info) = video_info {
+        // Timeline / Progress bar
+        if let Some(ref info) = video_info {
+            let duration = info.duration;
+            let position = info.position;
+            let progress = if duration > 0.0 {
+                (position / duration).clamp(0.0, 1.0) as f32
+            } else {
+                0.0
+            };
+
+            // Time display: current / total
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format_time(position))
+                        .small()
+                        .monospace(),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new(format_time(duration))
+                            .small()
+                            .monospace()
+                            .weak(),
+                    );
+                });
+            });
+
+            // Progress bar
+            let available_width = ui.available_width();
+            let bar_height = 6.0;
+            let (rect, _response) = ui.allocate_exact_size(
+                egui::vec2(available_width, bar_height),
+                egui::Sense::hover(),
+            );
+
+            // Background
+            ui.painter().rect_filled(
+                rect,
+                2.0,
+                egui::Color32::from_gray(40),
+            );
+
+            // Progress fill
+            let fill_width = rect.width() * progress;
+            if fill_width > 0.0 {
+                let fill_rect = egui::Rect::from_min_size(
+                    rect.min,
+                    egui::vec2(fill_width, bar_height),
+                );
+                ui.painter().rect_filled(
+                    fill_rect,
+                    2.0,
+                    egui::Color32::from_rgb(80, 160, 80),
+                );
+            }
+
+            ui.add_space(4.0);
+
+            // Video info line
             ui.horizontal(|ui| {
                 ui.label(
                     egui::RichText::new(format!(
@@ -189,38 +246,32 @@ impl PreviewMonitorPanel {
                     .small()
                     .weak(),
                 );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        egui::RichText::new(format!("{:.1}s", info.duration))
-                            .small()
-                            .weak(),
-                    );
-                });
             });
         }
 
-        ui.add_space(4.0);
+        ui.add_space(6.0);
 
         // Transport controls
         ui.horizontal(|ui| {
             let enabled = self.current_clip.is_some();
 
-            // Play/Pause button
-            let play_pause_text = if is_playing { "||" } else { ">" };
-            if ui
-                .add_enabled(enabled, egui::Button::new(play_pause_text).min_size(egui::vec2(32.0, 24.0)))
-                .clicked()
-            {
-                actions.push(PreviewMonitorAction::TogglePlayback);
-            }
-
             // Restart button
             if ui
-                .add_enabled(enabled, egui::Button::new("|<").min_size(egui::vec2(32.0, 24.0)))
-                .on_hover_text("Restart")
+                .add_enabled(enabled, egui::Button::new("⏮").min_size(egui::vec2(28.0, 24.0)))
+                .on_hover_text("Restart from beginning")
                 .clicked()
             {
                 actions.push(PreviewMonitorAction::RestartPreview);
+            }
+
+            // Play/Pause button
+            let play_pause_icon = if is_playing { "⏸" } else { "▶" };
+            if ui
+                .add_enabled(enabled, egui::Button::new(play_pause_icon).min_size(egui::vec2(32.0, 24.0)))
+                .on_hover_text(if is_playing { "Pause" } else { "Play" })
+                .clicked()
+            {
+                actions.push(PreviewMonitorAction::TogglePlayback);
             }
 
             ui.add_space(8.0);
@@ -233,9 +284,9 @@ impl PreviewMonitorPanel {
                 if ui
                     .add_enabled(
                         enabled && has_frame,
-                        egui::Button::new("GO LIVE")
+                        egui::Button::new("▶ GO LIVE")
                             .fill(egui::Color32::from_rgb(40, 120, 40))
-                            .min_size(egui::vec2(70.0, 24.0)),
+                            .min_size(egui::vec2(80.0, 24.0)),
                     )
                     .on_hover_text("Trigger this clip to its layer")
                     .clicked()
@@ -247,4 +298,11 @@ impl PreviewMonitorPanel {
 
         actions
     }
+}
+
+/// Format time in MM:SS.f format
+fn format_time(seconds: f64) -> String {
+    let mins = (seconds / 60.0).floor() as u32;
+    let secs = seconds % 60.0;
+    format!("{:02}:{:05.2}", mins, secs)
 }

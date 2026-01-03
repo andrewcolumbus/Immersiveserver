@@ -27,6 +27,11 @@ pollster = "0.4"
 log = "0.4"
 env_logger = "0.11"
 
+# Telemetry
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt", "time"] }
+tracing-appender = "0.2"
+
 # Serialization
 serde = { version = "1", features = ["derive"] }
 quick-xml = { version = "0.37", features = ["serialize"] }
@@ -35,6 +40,7 @@ quick-xml = { version = "0.37", features = ["serialize"] }
 bytemuck = { version = "1", features = ["derive"] }
 dirs = "6"
 rand = "0.9"
+glam = "0.29"  # 3D math for previs
 
 # File watching (for shader hot-reload)
 notify = "7"
@@ -53,11 +59,27 @@ aqueduct = { path = "../external_libraries/Aqueduct (Rust OMT)", default-feature
 # mDNS for OMT service discovery
 mdns-sd = "0.10"
 
+# REST API server
+axum = { version = "0.7", features = ["ws"] }
+tower = "0.5"
+tower-http = { version = "0.5", features = ["cors"] }
+serde_json = "1"
+futures-util = { version = "0.3", features = ["sink"] }
+
 # Hostname detection for mDNS registration
 hostname = "0.4"
 
 # Image loading for effect textures
 image = "0.25"
+
+# Native OS menu bars (macOS/Windows)
+muda = "0.17"
+
+# Audio input/output
+cpal = "0.15"
+
+# FFT analysis for audio-reactive effects
+rustfft = "6.2"
 
 # Syphon/Spout texture sharing (platform-specific)
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -65,6 +87,7 @@ objc2 = "0.6"
 objc2-foundation = "0.3"
 objc2-metal = "0.3"
 objc2-quartz-core = "0.3"
+objc2-app-kit = "0.3"
 block2 = "0.6"
 # For accessing underlying Metal device/texture from wgpu
 wgpu-hal = { version = "24", features = ["metal"] }

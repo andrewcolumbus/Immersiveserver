@@ -25,6 +25,8 @@ pub struct EffectManager {
     clip_runtimes: HashMap<(u32, usize), EffectStackRuntime>,
     /// Environment effect runtime
     environment_runtime: Option<EffectStackRuntime>,
+    /// Preview clip effect runtime (separate from live clip runtimes)
+    preview_runtime: Option<EffectStackRuntime>,
     /// Application start time for effect timing
     start_time: Instant,
     /// Current frame time
@@ -55,6 +57,7 @@ impl EffectManager {
             layer_runtimes: HashMap::new(),
             clip_runtimes: HashMap::new(),
             environment_runtime: None,
+            preview_runtime: None,
             start_time: Instant::now(),
             time: 0.0,
             delta_time: 0.0,
@@ -161,7 +164,7 @@ impl EffectManager {
         }
     }
 
-    /// Process effects for a clip
+    /// Process effects for a clip (without automation)
     ///
     /// # Arguments
     /// * `encoder` - Command encoder
@@ -186,6 +189,36 @@ impl EffectManager {
         output: &wgpu::TextureView,
         stack: &EffectStack,
     ) -> bool {
+        self.process_clip_effects_with_automation(encoder, device, queue, layer_id, slot, input, output, stack, None)
+    }
+
+    /// Process effects for a clip with automation support
+    ///
+    /// # Arguments
+    /// * `encoder` - Command encoder
+    /// * `device` - GPU device
+    /// * `queue` - GPU queue
+    /// * `layer_id` - Layer ID containing the clip
+    /// * `slot` - Clip slot index
+    /// * `input` - Input texture view (video content)
+    /// * `output` - Output texture view (processed result)
+    /// * `stack` - Effect stack for this clip
+    /// * `audio_manager` - Audio manager for FFT automation
+    ///
+    /// # Returns
+    /// `true` if effects were processed, `false` if no effects or disabled
+    pub fn process_clip_effects_with_automation(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        layer_id: u32,
+        slot: usize,
+        input: &wgpu::TextureView,
+        output: &wgpu::TextureView,
+        stack: &EffectStack,
+        audio_manager: Option<&crate::audio::AudioManager>,
+    ) -> bool {
         if !self.enabled || stack.is_empty() {
             return false;
         }
@@ -198,7 +231,7 @@ impl EffectManager {
         let params = self.build_params();
 
         if let Some(runtime) = self.clip_runtimes.get_mut(&(layer_id, slot)) {
-            runtime.process(encoder, queue, device, input, output, stack, &params);
+            runtime.process_with_automation(encoder, queue, device, input, output, stack, &params, &self.bpm_clock, audio_manager);
             true
         } else {
             false
@@ -245,6 +278,48 @@ impl EffectManager {
     pub fn remove_layer_clip_runtimes(&mut self, layer_id: u32) {
         self.clip_runtimes
             .retain(|(lid, _slot), _runtime| *lid != layer_id);
+    }
+
+    // ========== Preview Effect Methods ==========
+
+    /// Ensure preview runtime exists and is properly sized
+    pub fn ensure_preview_runtime(
+        &mut self,
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+    ) {
+        let runtime = self.preview_runtime.get_or_insert_with(EffectStackRuntime::new);
+        runtime.ensure_size(device, width, height, format);
+    }
+
+    /// Get a mutable reference to the preview runtime
+    pub fn get_preview_runtime_mut(&mut self) -> Option<&mut EffectStackRuntime> {
+        self.preview_runtime.as_mut()
+    }
+
+    /// Get a reference to the preview runtime
+    pub fn get_preview_runtime(&self) -> Option<&EffectStackRuntime> {
+        self.preview_runtime.as_ref()
+    }
+
+    /// Sync preview effect runtime with an effect stack
+    pub fn sync_preview_effects(
+        &mut self,
+        stack: &EffectStack,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        format: wgpu::TextureFormat,
+    ) {
+        if let Some(runtime) = self.preview_runtime.as_mut() {
+            runtime.sync_with_stack(stack, &self.registry, device, queue, format);
+        }
+    }
+
+    /// Clear the preview runtime
+    pub fn clear_preview_runtime(&mut self) {
+        self.preview_runtime = None;
     }
 
     // ========== Environment Effect Methods ==========
@@ -298,7 +373,7 @@ impl EffectManager {
         )
     }
 
-    /// Process effects for a layer
+    /// Process effects for a layer (without automation)
     ///
     /// # Arguments
     /// * `encoder` - Command encoder
@@ -321,6 +396,34 @@ impl EffectManager {
         output: &wgpu::TextureView,
         stack: &EffectStack,
     ) -> bool {
+        self.process_layer_effects_with_automation(encoder, device, queue, layer_id, input, output, stack, None)
+    }
+
+    /// Process effects for a layer with automation support
+    ///
+    /// # Arguments
+    /// * `encoder` - Command encoder
+    /// * `device` - GPU device
+    /// * `queue` - GPU queue
+    /// * `layer_id` - Layer ID
+    /// * `input` - Input texture view (layer content)
+    /// * `output` - Output texture view (processed result)
+    /// * `stack` - Effect stack for this layer
+    /// * `audio_manager` - Audio manager for FFT automation
+    ///
+    /// # Returns
+    /// `true` if effects were processed, `false` if no effects or disabled
+    pub fn process_layer_effects_with_automation(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        layer_id: u32,
+        input: &wgpu::TextureView,
+        output: &wgpu::TextureView,
+        stack: &EffectStack,
+        audio_manager: Option<&crate::audio::AudioManager>,
+    ) -> bool {
         if !self.enabled || stack.is_empty() {
             return false;
         }
@@ -333,14 +436,14 @@ impl EffectManager {
         let params = self.build_params();
 
         if let Some(runtime) = self.layer_runtimes.get_mut(&layer_id) {
-            runtime.process(encoder, queue, device, input, output, stack, &params);
+            runtime.process_with_automation(encoder, queue, device, input, output, stack, &params, &self.bpm_clock, audio_manager);
             true
         } else {
             false
         }
     }
 
-    /// Process environment effects (master effects)
+    /// Process environment effects (master effects, without automation)
     ///
     /// # Arguments
     /// * `encoder` - Command encoder
@@ -359,6 +462,30 @@ impl EffectManager {
         texture: &wgpu::TextureView,
         stack: &EffectStack,
     ) -> bool {
+        self.process_environment_effects_with_automation(encoder, device, queue, texture, stack, None)
+    }
+
+    /// Process environment effects with automation support
+    ///
+    /// # Arguments
+    /// * `encoder` - Command encoder
+    /// * `device` - GPU device
+    /// * `queue` - GPU queue
+    /// * `texture` - Environment texture view (both input and output)
+    /// * `stack` - Environment effect stack
+    /// * `audio_manager` - Audio manager for FFT automation
+    ///
+    /// # Returns
+    /// `true` if effects were processed, `false` if no effects or disabled
+    pub fn process_environment_effects_with_automation(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        texture: &wgpu::TextureView,
+        stack: &EffectStack,
+        audio_manager: Option<&crate::audio::AudioManager>,
+    ) -> bool {
         if !self.enabled || stack.is_empty() {
             return false;
         }
@@ -372,7 +499,7 @@ impl EffectManager {
 
         if let Some(runtime) = &mut self.environment_runtime {
             // For environment effects, we process in-place using ping-pong
-            runtime.process(encoder, queue, device, texture, texture, stack, &params);
+            runtime.process_with_automation(encoder, queue, device, texture, texture, stack, &params, &self.bpm_clock, audio_manager);
             true
         } else {
             false

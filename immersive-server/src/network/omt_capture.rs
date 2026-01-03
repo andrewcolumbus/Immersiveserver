@@ -185,12 +185,12 @@ impl OmtCapture {
         let handle = thread::Builder::new()
             .name("omt-sender".into())
             .spawn(move || {
-                log::info!("OMT: Sender thread started");
+                tracing::info!("OMT: Sender thread started");
 
                 loop {
                     // Check for shutdown signal (non-blocking)
                     if shutdown_rx.try_recv().is_ok() {
-                        log::info!("OMT: Sender thread shutting down");
+                        tracing::info!("OMT: Sender thread shutting down");
                         break;
                     }
 
@@ -210,24 +210,24 @@ impl OmtCapture {
                                 Ok(()) => {
                                     let count = sender.frame_count();
                                     if count == 1 || count % 300 == 0 {
-                                        log::info!("📡 OMT: Sent {} frames ({}x{})", count, frame.width, frame.height);
+                                        tracing::info!("📡 OMT: Sent {} frames ({}x{})", count, frame.width, frame.height);
                                     }
                                 }
                                 Err(e) => {
-                                    log::warn!("OMT: Failed to send frame: {}", e);
+                                    tracing::warn!("OMT: Failed to send frame: {}", e);
                                 }
                             }
                         }
                         Err(mpsc::RecvTimeoutError::Timeout) => continue,
                         Err(mpsc::RecvTimeoutError::Disconnected) => {
-                            log::info!("OMT: Frame channel disconnected");
+                            tracing::info!("OMT: Frame channel disconnected");
                             break;
                         }
                     }
                 }
 
                 sender.stop();
-                log::info!("OMT: Sender thread stopped");
+                tracing::info!("OMT: Sender thread stopped");
             })
             .expect("Failed to spawn OMT sender thread");
 
@@ -321,7 +321,7 @@ impl OmtCapture {
     pub fn set_target_fps(&mut self, fps: u32) {
         self.target_fps = fps.max(1).min(60);
         self.min_capture_interval = Duration::from_secs_f64(1.0 / self.target_fps as f64);
-        log::info!("OMT: Capture target FPS set to {}", self.target_fps);
+        tracing::info!("OMT: Capture target FPS set to {}", self.target_fps);
     }
 
     /// Get the current target capture frame rate.
@@ -394,7 +394,7 @@ impl OmtCapture {
                             data: Bytes::copy_from_slice(&self.unpack_buffer),
                         };
                         if tx.try_send(frame).is_err() {
-                            log::debug!("OMT: Frame dropped (sender busy)");
+                            tracing::debug!("OMT: Frame dropped (sender busy)");
                         } else {
                             self.frame_count += 1;
                         }
@@ -417,7 +417,7 @@ impl OmtCapture {
             return;
         }
 
-        log::info!("OMT: Resizing capture buffers to {}x{}", width, height);
+        tracing::info!("OMT: Resizing capture buffers to {}x{}", width, height);
 
         // Unmap any mapped buffers first
         for staging in &mut self.staging_buffers {

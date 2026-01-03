@@ -4,6 +4,7 @@
 //! They are separate from runtime GPU resources, following the
 //! Layer/LayerRuntime pattern used elsewhere in the codebase.
 
+use crate::audio::AudioBand;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Parameter value types supported by effects
@@ -493,6 +494,43 @@ impl Default for BeatSource {
     }
 }
 
+/// FFT audio automation source
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FftSource {
+    /// Which frequency band to track
+    pub band: AudioBand,
+    /// Sensitivity multiplier (0.0-2.0)
+    pub gain: f32,
+    /// Smoothing factor (0.0 = instant, 1.0 = very smooth)
+    pub smoothing: f32,
+    /// Attack time in ms (how fast value rises)
+    pub attack_ms: f32,
+    /// Release time in ms (how fast value falls)
+    pub release_ms: f32,
+}
+
+impl Default for FftSource {
+    fn default() -> Self {
+        Self {
+            band: AudioBand::Low,
+            gain: 1.0,
+            smoothing: 0.3,
+            attack_ms: 10.0,
+            release_ms: 100.0,
+        }
+    }
+}
+
+impl FftSource {
+    /// Create with a specific band
+    pub fn with_band(band: AudioBand) -> Self {
+        Self {
+            band,
+            ..Default::default()
+        }
+    }
+}
+
 /// All automation source types
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AutomationSource {
@@ -500,7 +538,8 @@ pub enum AutomationSource {
     Lfo(LfoSource),
     /// Beat-triggered envelope
     Beat(BeatSource),
-    // Future: Audio { band: AudioBand, sensitivity: f32 }
+    /// FFT audio reactivity
+    Fft(FftSource),
     // Future: Midi { channel: u8, cc: u8 }
     // Future: Osc { address: String }
 }

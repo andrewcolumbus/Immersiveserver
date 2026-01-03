@@ -1,11 +1,12 @@
 //! Automation system for effect parameters
 //!
-//! Provides BPM clock, LFO generation, and beat-triggered envelopes
-//! for automating effect parameters.
+//! Provides BPM clock, LFO generation, beat-triggered envelopes,
+//! and FFT audio-reactive automation for effect parameters.
 
 use std::time::Instant;
 
-use super::types::{AutomationSource, BeatSource, BeatTrigger, LfoShape, LfoSource, Parameter};
+use super::types::{AutomationSource, BeatSource, BeatTrigger, FftSource, LfoShape, LfoSource, Parameter};
+use crate::audio::AudioManager;
 
 /// Global BPM clock for synchronizing automation
 #[derive(Debug, Clone)]
@@ -368,6 +369,57 @@ impl BeatEnvelopeState {
     }
 }
 
+/// FFT envelope state for attack/release smoothing
+#[derive(Debug, Clone, Default)]
+pub struct FftEnvelopeState {
+    /// Current smoothed value (0-1)
+    current_value: f32,
+    /// Target value from FFT
+    target_value: f32,
+}
+
+impl FftEnvelopeState {
+    /// Create new FFT envelope state
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Update the envelope with new FFT value
+    pub fn update(&mut self, source: &FftSource, fft_value: f32, delta_time: f32) {
+        // Apply gain
+        self.target_value = (fft_value * source.gain).min(1.0);
+
+        // Apply attack/release envelope
+        let time_constant = if self.target_value > self.current_value {
+            source.attack_ms / 1000.0
+        } else {
+            source.release_ms / 1000.0
+        };
+
+        if time_constant > 0.001 {
+            // Exponential smoothing
+            let factor = 1.0 - (-delta_time / time_constant).exp();
+            self.current_value += (self.target_value - self.current_value) * factor;
+        } else {
+            self.current_value = self.target_value;
+        }
+
+        // Clamp to valid range
+        self.current_value = self.current_value.clamp(0.0, 1.0);
+    }
+
+    /// Get the current envelope value (0-1)
+    pub fn value(&self) -> f32 {
+        self.current_value
+    }
+
+    /// Reset the envelope state
+    pub fn reset(&mut self) {
+        self.current_value = 0.0;
+        self.target_value = 0.0;
+    }
+}
+
 /// Evaluate automation for a parameter
 ///
 /// Returns the automated value, or the base value if no automation
@@ -396,6 +448,64 @@ pub fn evaluate_parameter(
                 let min = param.meta.min.unwrap_or(0.0);
                 let max = param.meta.max.unwrap_or(1.0);
                 // Envelope modulates from min to max
+                min + state.value() * (max - min)
+            } else {
+                base_value
+            }
+        }
+        Some(AutomationSource::Fft(_)) => {
+            // FFT automation requires audio manager - use evaluate_parameter_with_audio
+            base_value
+        }
+    }
+}
+
+/// Evaluate automation for a parameter with audio manager support
+///
+/// This variant supports FFT audio automation in addition to LFO and Beat
+pub fn evaluate_parameter_with_audio(
+    param: &Parameter,
+    clock: &BpmClock,
+    time: f32,
+    beat_envelope_state: Option<&mut BeatEnvelopeState>,
+    fft_envelope_state: Option<&mut FftEnvelopeState>,
+    audio_manager: Option<&AudioManager>,
+    delta_time: f32,
+) -> f32 {
+    let base_value = param.value.as_f32();
+
+    match &param.automation {
+        None => base_value,
+        Some(AutomationSource::Lfo(lfo)) => {
+            let lfo_value = lfo.evaluate(clock, time);
+            // Modulate around base value
+            let min = param.meta.min.unwrap_or(0.0);
+            let max = param.meta.max.unwrap_or(1.0);
+            let range = max - min;
+            (base_value + lfo_value * range * 0.5).clamp(min, max)
+        }
+        Some(AutomationSource::Beat(beat)) => {
+            if let Some(state) = beat_envelope_state {
+                state.update(beat, clock, delta_time);
+                let min = param.meta.min.unwrap_or(0.0);
+                let max = param.meta.max.unwrap_or(1.0);
+                // Envelope modulates from min to max
+                min + state.value() * (max - min)
+            } else {
+                base_value
+            }
+        }
+        Some(AutomationSource::Fft(fft)) => {
+            if let (Some(state), Some(manager)) = (fft_envelope_state, audio_manager) {
+                // Get raw FFT value from audio manager
+                let raw_value = manager.get_band_value(fft.band);
+
+                // Update envelope with smoothing
+                state.update(fft, raw_value, delta_time);
+
+                // Map envelope value to parameter range
+                let min = param.meta.min.unwrap_or(0.0);
+                let max = param.meta.max.unwrap_or(1.0);
                 min + state.value() * (max - min)
             } else {
                 base_value

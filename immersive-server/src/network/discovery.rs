@@ -119,7 +119,7 @@ impl SourceDiscovery {
             return Ok(());
         }
 
-        log::info!("SourceDiscovery: Starting libOMT discovery");
+        tracing::info!("SourceDiscovery: Starting libOMT discovery");
         self.running = true;
 
         // Do an initial refresh
@@ -137,7 +137,7 @@ impl SourceDiscovery {
             return Ok(()); // Already started
         }
 
-        log::info!("SourceDiscovery: Starting NDI discovery");
+        tracing::info!("SourceDiscovery: Starting NDI discovery");
 
         // Create NDI finder with default settings
         let create_settings = NDIlib_find_create_t::default();
@@ -152,14 +152,14 @@ impl SourceDiscovery {
         self.ndi_finder = Some(finder);
         self.ndi_enabled = true;
 
-        log::info!("SourceDiscovery: NDI finder created successfully");
+        tracing::info!("SourceDiscovery: NDI finder created successfully");
         Ok(())
     }
 
     /// Stop NDI source discovery.
     pub fn stop_ndi_discovery(&mut self) {
         if let Some(finder) = self.ndi_finder.take() {
-            log::info!("SourceDiscovery: Stopping NDI discovery");
+            tracing::info!("SourceDiscovery: Stopping NDI discovery");
             unsafe { NDIlib_find_destroy(finder) };
         }
         self.ndi_enabled = false;
@@ -206,7 +206,7 @@ impl SourceDiscovery {
                     .unwrap_or(true);
 
                 if is_new {
-                    log::info!("SourceDiscovery: Found OMT source '{}'", source.name);
+                    tracing::info!("SourceDiscovery: Found OMT source '{}'", source.name);
                 }
 
                 new_sources.insert(source.id.clone(), source);
@@ -271,7 +271,7 @@ impl SourceDiscovery {
                         .unwrap_or(true);
 
                     if is_new {
-                        log::info!("SourceDiscovery: Found NDI source '{}'", source.name);
+                        tracing::info!("SourceDiscovery: Found NDI source '{}'", source.name);
                     }
 
                     new_sources.insert(source.id.clone(), source);
@@ -283,7 +283,7 @@ impl SourceDiscovery {
         if let Ok(old_sources) = self.sources.read() {
             for (id, old_source) in old_sources.iter() {
                 if !new_sources.contains_key(id) {
-                    log::info!(
+                    tracing::info!(
                         "SourceDiscovery: {} source removed: {}",
                         old_source.source_type,
                         old_source.name
@@ -318,7 +318,7 @@ impl SourceDiscovery {
     /// Stop browsing for sources.
     pub fn stop_browsing(&mut self) {
         self.running = false;
-        log::info!("SourceDiscovery: Stopped browsing");
+        tracing::info!("SourceDiscovery: Stopped browsing");
     }
 
     /// Get all currently discovered sources.

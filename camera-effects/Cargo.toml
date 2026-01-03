@@ -1,0 +1,64 @@
+[package]
+name = "camera-effects"
+version = "0.1.0"
+edition = "2021"
+description = "Camera effects app with ML-powered visual effects and Syphon/Spout output"
+
+[dependencies]
+# Graphics
+wgpu = "24"
+winit = "0.30"
+
+# GUI
+egui = "0.31"
+egui-wgpu = "0.31"
+egui-winit = "0.31"
+
+# Camera capture (cross-platform)
+nokhwa = { version = "0.10", features = ["input-native"] }
+
+# ML inference via ONNX Runtime
+ort = { version = "2.0.0-rc.9", features = ["load-dynamic"] }
+ndarray = "0.16"
+
+# Async runtime
+pollster = "0.4"
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Utilities
+bytemuck = { version = "1", features = ["derive"] }
+rand = "0.9"
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+image = "0.25"
+
+# Syphon (macOS)
+[target.'cfg(target_os = "macos")'.dependencies]
+ort = { version = "2.0.0-rc.9", features = ["load-dynamic", "coreml"] }
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-metal = "0.3"
+objc2-quartz-core = "0.3"
+block2 = "0.6"
+wgpu-hal = { version = "24", features = ["metal"] }
+metal = "0.31"
+
+# Spout (Windows)
+[target.'cfg(target_os = "windows")'.dependencies]
+ort = { version = "2.0.0-rc.9", features = ["load-dynamic", "directml"] }
+windows = { version = "0.58", features = [
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+] }
+libloading = "0.8"
+wgpu-hal = { version = "24", features = ["dx12"] }

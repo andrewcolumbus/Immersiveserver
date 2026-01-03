@@ -3,8 +3,9 @@
 //! A tabbed panel for editing properties of the environment, layers, and clips.
 //! Includes transform controls, tiling (multiplexing), effects, and other settings.
 
+use crate::audio::AudioBand;
 use crate::compositor::{BlendMode, ClipTransition, Environment, Layer};
-use crate::effects::{EffectRegistry, EffectStack, ParameterValue};
+use crate::effects::{AutomationSource, EffectRegistry, EffectStack, FftSource, LfoSource, LfoShape, BeatSource, BeatTrigger, ParameterValue};
 use crate::settings::{EnvironmentSettings, ThumbnailMode};
 use crate::ui::effects_browser_panel::DraggableEffect;
 
@@ -55,6 +56,8 @@ pub enum PropertiesAction {
     SetNdiCaptureFps { fps: u32 },
     /// Syphon/Spout texture sharing toggle changed
     SetTextureShare { enabled: bool },
+    /// REST API server toggle changed
+    SetApiServer { enabled: bool },
     /// Thumbnail mode changed
     SetThumbnailMode { mode: ThumbnailMode },
 
@@ -105,10 +108,49 @@ pub enum PropertiesAction {
     ReorderEnvironmentEffect { effect_id: u32, new_index: usize },
     /// Toggle environment effect expanded/collapsed state
     SetEnvironmentEffectExpanded { effect_id: u32, expanded: bool },
+
+    // Parameter automation actions
+    /// Set automation for layer effect parameter
+    SetLayerEffectParameterAutomation {
+        layer_id: u32,
+        effect_id: u32,
+        param_name: String,
+        automation: Option<AutomationSource>,
+    },
+    /// Set automation for clip effect parameter
+    SetClipEffectParameterAutomation {
+        layer_id: u32,
+        slot: usize,
+        effect_id: u32,
+        param_name: String,
+        automation: Option<AutomationSource>,
+    },
+    /// Set automation for environment effect parameter
+    SetEnvironmentEffectParameterAutomation {
+        effect_id: u32,
+        param_name: String,
+        automation: Option<AutomationSource>,
+    },
+
+    // Clip transform actions
+    /// Clip position changed
+    SetClipPosition { layer_id: u32, slot: usize, x: f32, y: f32 },
+    /// Clip scale changed
+    SetClipScale { layer_id: u32, slot: usize, scale_x: f32, scale_y: f32 },
+    /// Clip rotation changed
+    SetClipRotation { layer_id: u32, slot: usize, degrees: f32 },
+
+    // Clip transport actions (for active/playing clips)
+    /// Toggle clip playback (pause/resume)
+    ToggleClipPlayback { layer_id: u32 },
+    /// Restart clip from beginning
+    RestartClip { layer_id: u32 },
+    /// Preview this clip in the preview monitor
+    PreviewClip { layer_id: u32, slot: usize },
 }
 
 /// Context for rendering effect stacks (determines which PropertiesAction variants to emit)
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum EffectContext {
     /// Effects on a layer
     Layer { layer_id: u32 },
@@ -128,15 +170,6 @@ pub struct PropertiesPanel {
     pub selected_clip_slot: Option<usize>,
     /// Whether the panel is open
     pub open: bool,
-    /// Temporary values for editing (to avoid per-frame updates)
-    env_width_text: String,
-    env_height_text: String,
-    /// Whether resolution confirmation dialog is open
-    show_resolution_confirm: bool,
-    /// Pending resolution to apply after confirmation
-    pending_resolution: Option<(u32, u32)>,
-    /// Temporary FPS value for slider editing
-    temp_fps: u32,
 }
 
 impl Default for PropertiesPanel {
@@ -153,11 +186,6 @@ impl PropertiesPanel {
             selected_layer_id: None,
             selected_clip_slot: None,
             open: true,
-            env_width_text: String::new(),
-            env_height_text: String::new(),
-            show_resolution_confirm: false,
-            pending_resolution: None,
-            temp_fps: 60,
         }
     }
 
@@ -193,7 +221,12 @@ impl PropertiesPanel {
         omt_broadcasting: bool,
         ndi_broadcasting: bool,
         texture_sharing_active: bool,
+        api_server_running: bool,
         effect_registry: &EffectRegistry,
+        // Automation evaluation context (for real-time modulation visualization)
+        bpm_clock: &crate::effects::BpmClock,
+        effect_time: f32,
+        audio_manager: Option<&crate::audio::AudioManager>,
     ) -> Vec<PropertiesAction> {
         let mut actions = Vec::new();
 
@@ -227,13 +260,13 @@ impl PropertiesPanel {
             .show(ui, |ui| {
                 match self.active_tab {
                     PropertiesTab::Environment => {
-                        self.render_environment_tab(ui, environment, settings, omt_broadcasting, ndi_broadcasting, texture_sharing_active, effect_registry, &mut actions);
+                        self.render_environment_tab(ui, environment, settings, omt_broadcasting, ndi_broadcasting, texture_sharing_active, api_server_running, effect_registry, &mut actions, bpm_clock, effect_time, audio_manager);
                     }
                     PropertiesTab::Layer => {
-                        self.render_layer_tab(ui, layers, effect_registry, &mut actions);
+                        self.render_layer_tab(ui, layers, effect_registry, &mut actions, bpm_clock, effect_time, audio_manager);
                     }
                     PropertiesTab::Clip => {
-                        self.render_clip_tab(ui, layers, effect_registry, &mut actions);
+                        self.render_clip_tab(ui, layers, effect_registry, &mut actions, bpm_clock, effect_time, audio_manager);
                     }
                 }
             });
@@ -241,355 +274,55 @@ impl PropertiesPanel {
         actions
     }
 
-    /// Render the Environment tab
+    /// Render the Environment tab (Master Effects only - other settings moved to Preferences)
     fn render_environment_tab(
         &mut self,
         ui: &mut egui::Ui,
         environment: &Environment,
-        settings: &EnvironmentSettings,
-        omt_broadcasting: bool,
-        ndi_broadcasting: bool,
-        texture_sharing_active: bool,
+        _settings: &EnvironmentSettings,
+        _omt_broadcasting: bool,
+        _ndi_broadcasting: bool,
+        _texture_sharing_active: bool,
+        _api_server_running: bool,
         effect_registry: &EffectRegistry,
         actions: &mut Vec<PropertiesAction>,
+        bpm_clock: &crate::effects::BpmClock,
+        effect_time: f32,
+        audio_manager: Option<&crate::audio::AudioManager>,
     ) {
-        ui.heading("Environment");
-        ui.add_space(8.0);
-
-        // Resolution section
-        ui.label("Resolution");
-        ui.add_space(4.0);
-
-        // Initialize text fields if empty
-        if self.env_width_text.is_empty() {
-            self.env_width_text = environment.width().to_string();
-        }
-        if self.env_height_text.is_empty() {
-            self.env_height_text = environment.height().to_string();
-        }
-
-        // Current resolution
-        let current_width = environment.width();
-        let current_height = environment.height();
-
-        ui.horizontal(|ui| {
-            ui.label("Width:");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.env_width_text)
-                    .desired_width(60.0)
-                    .hint_text("1920"),
-            );
-        });
-
-        ui.horizontal(|ui| {
-            ui.label("Height:");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.env_height_text)
-                    .desired_width(60.0)
-                    .hint_text("1080"),
-            );
-        });
-
-        // Parse pending values
-        let pending_width = self.env_width_text.parse::<u32>().ok();
-        let pending_height = self.env_height_text.parse::<u32>().ok();
-        let has_pending_change = match (pending_width, pending_height) {
-            (Some(w), Some(h)) => w != current_width || h != current_height,
-            _ => false,
-        };
-
-        // Show warning if resolution differs
-        if has_pending_change {
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new(format!(
-                        "Pending: {}×{} (current: {}×{})",
-                        pending_width.unwrap_or(0),
-                        pending_height.unwrap_or(0),
-                        current_width,
-                        current_height
-                    ))
-                    .color(egui::Color32::YELLOW)
-                    .small(),
-                );
-            });
-        }
-
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            let apply_enabled = has_pending_change && pending_width.is_some() && pending_height.is_some();
-            if ui.add_enabled(apply_enabled, egui::Button::new("Apply Resolution")).clicked() {
-                if let (Some(w), Some(h)) = (pending_width, pending_height) {
-                    if w > 0 && h > 0 {
-                        self.pending_resolution = Some((w, h));
-                        self.show_resolution_confirm = true;
-                    }
-                }
-            }
-            if ui.button("Reset").clicked() {
-                self.env_width_text = current_width.to_string();
-                self.env_height_text = current_height.to_string();
-            }
-        });
-
-        // Confirmation dialog
-        if self.show_resolution_confirm {
-            if let Some((w, h)) = self.pending_resolution {
-                egui::Window::new("Confirm Resolution Change")
-                    .collapsible(false)
-                    .resizable(false)
-                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                    .show(ui.ctx(), |ui| {
-                        ui.label(format!(
-                            "Change resolution from {}×{} to {}×{}?",
-                            current_width, current_height, w, h
-                        ));
-                        ui.add_space(4.0);
-                        ui.label(
-                            egui::RichText::new("This may affect performance with large resolutions.")
-                                .small()
-                                .color(egui::Color32::GRAY),
-                        );
-                        ui.add_space(8.0);
-                        ui.horizontal(|ui| {
-                            if ui.button("Apply").clicked() {
-                                actions.push(PropertiesAction::SetEnvironmentSize { width: w, height: h });
-                                self.show_resolution_confirm = false;
-                                self.pending_resolution = None;
-                            }
-                            if ui.button("Cancel").clicked() {
-                                self.show_resolution_confirm = false;
-                                self.pending_resolution = None;
-                                // Reset text fields to current values
-                                self.env_width_text = current_width.to_string();
-                                self.env_height_text = current_height.to_string();
-                            }
-                        });
-                    });
-            }
-        }
-
-        // Common presets (just update text fields, user must click Apply)
-        ui.add_space(8.0);
-        ui.label("Presets (click to select, then Apply):");
-        ui.horizontal_wrapped(|ui| {
-            if ui.small_button("1920×1080").clicked() {
-                self.env_width_text = "1920".to_string();
-                self.env_height_text = "1080".to_string();
-            }
-            if ui.small_button("3840×2160").clicked() {
-                self.env_width_text = "3840".to_string();
-                self.env_height_text = "2160".to_string();
-            }
-            if ui.small_button("1920×1200").clicked() {
-                self.env_width_text = "1920".to_string();
-                self.env_height_text = "1200".to_string();
-            }
-        });
-
-        ui.add_space(16.0);
-        ui.separator();
-
-        // Frame Rate section
-        ui.add_space(8.0);
-        ui.heading("Frame Rate");
-        ui.add_space(4.0);
-
-        // Sync temp_fps from settings if it drifted
-        if self.temp_fps != settings.target_fps {
-            self.temp_fps = settings.target_fps;
-        }
-
-        // FPS slider
-        ui.horizontal(|ui| {
-            ui.label("Target FPS:");
-            let response = ui.add(
-                egui::Slider::new(&mut self.temp_fps, 24..=240)
-                    .suffix(" fps")
-                    .clamping(egui::SliderClamping::Always),
-            );
-            if response.changed() {
-                actions.push(PropertiesAction::SetTargetFPS { fps: self.temp_fps });
-            }
-        });
-
-        // FPS presets
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Presets:");
-            for &fps in &[24u32, 30, 60, 120, 144, 240] {
-                if ui.small_button(format!("{}", fps)).clicked() {
-                    self.temp_fps = fps;
-                    actions.push(PropertiesAction::SetTargetFPS { fps });
-                }
-            }
-        });
-
+        ui.heading("Master Effects");
         ui.add_space(4.0);
         ui.label(
-            egui::RichText::new(format!("Targeting {} fps", self.temp_fps))
+            egui::RichText::new("Effects applied to the entire composition")
                 .small()
                 .weak(),
         );
-
         ui.add_space(8.0);
 
-        // Show FPS checkbox
-        let mut show_fps = settings.show_fps;
-        if ui.checkbox(&mut show_fps, "Show FPS in menu bar").changed() {
-            actions.push(PropertiesAction::SetShowFPS { show: show_fps });
-        }
+        self.render_effect_stack_generic(ui, EffectContext::Environment, environment.effects(), effect_registry, actions, bpm_clock, effect_time, audio_manager);
 
         ui.add_space(16.0);
         ui.separator();
-
-        // Clip Grid section
         ui.add_space(8.0);
-        ui.heading("Clip Grid");
-        ui.add_space(4.0);
 
-        ui.horizontal(|ui| {
-            ui.label("Thumbnail Mode:");
-            let mut current_mode = settings.thumbnail_mode;
-            egui::ComboBox::from_id_salt("thumbnail_mode")
-                .selected_text(current_mode.display_name())
-                .show_ui(ui, |ui| {
-                    if ui.selectable_value(&mut current_mode, ThumbnailMode::Fit, ThumbnailMode::Fit.display_name()).changed() {
-                        actions.push(PropertiesAction::SetThumbnailMode { mode: ThumbnailMode::Fit });
-                    }
-                    if ui.selectable_value(&mut current_mode, ThumbnailMode::Fill, ThumbnailMode::Fill.display_name()).changed() {
-                        actions.push(PropertiesAction::SetThumbnailMode { mode: ThumbnailMode::Fill });
-                    }
-                });
-        });
-
-        ui.add_space(16.0);
-        ui.separator();
-
-        // OMT Broadcast section
-        ui.add_space(8.0);
-        ui.heading("OMT Broadcast");
-        ui.add_space(4.0);
-
-        let mut broadcast_enabled = settings.omt_broadcast_enabled;
-        if ui.checkbox(&mut broadcast_enabled, "Broadcast Output via OMT").changed() {
-            actions.push(PropertiesAction::SetOmtBroadcast { enabled: broadcast_enabled });
-        }
-
-        if omt_broadcasting {
-            ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new("Broadcasting...")
-                    .small()
-                    .color(egui::Color32::GREEN),
-            );
-        }
-
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            ui.label("Capture FPS:");
-            let mut fps = settings.omt_capture_fps;
-            let slider = egui::Slider::new(&mut fps, 10..=60)
-                .suffix(" fps")
-                .clamping(egui::SliderClamping::Always);
-            if ui.add(slider).changed() {
-                actions.push(PropertiesAction::SetOmtCaptureFps { fps });
-            }
-        });
-
-        ui.add_space(16.0);
-        ui.separator();
-
-        // NDI Broadcast section
-        ui.add_space(8.0);
-        ui.heading("NDI Broadcast");
-        ui.add_space(4.0);
-
-        let mut ndi_enabled = settings.ndi_broadcast_enabled;
-        if ui.checkbox(&mut ndi_enabled, "Broadcast Output via NDI").changed() {
-            actions.push(PropertiesAction::SetNdiBroadcast { enabled: ndi_enabled });
-        }
-
-        if ndi_broadcasting {
-            ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new("Broadcasting...")
-                    .small()
-                    .color(egui::Color32::from_rgb(100, 149, 237)), // Cornflower blue for NDI
-            );
-        }
-
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            ui.label("Capture FPS:");
-            let mut fps = settings.ndi_capture_fps;
-            let slider = egui::Slider::new(&mut fps, 10..=60)
-                .suffix(" fps")
-                .clamping(egui::SliderClamping::Always);
-            if ui.add(slider).changed() {
-                actions.push(PropertiesAction::SetNdiCaptureFps { fps });
-            }
-        });
-
-        ui.add_space(16.0);
-        ui.separator();
-
-        // Syphon/Spout Texture Sharing section
-        ui.add_space(8.0);
+        // Info about where other settings moved
+        ui.label(
+            egui::RichText::new("Other environment settings have moved to Preferences")
+                .small()
+                .weak(),
+        );
         #[cfg(target_os = "macos")]
-        let tech_name = "Syphon";
-        #[cfg(target_os = "windows")]
-        let tech_name = "Spout";
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        let tech_name = "Texture Share";
-
-        ui.heading(format!("{} Output", tech_name));
-        ui.add_space(4.0);
-
-        let mut share_enabled = settings.texture_share_enabled;
-        if ui
-            .checkbox(&mut share_enabled, format!("Share via {}", tech_name))
-            .changed()
-        {
-            actions.push(PropertiesAction::SetTextureShare {
-                enabled: share_enabled,
-            });
-        }
-
-        if texture_sharing_active {
-            ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new("Sharing...")
-                    .small()
-                    .color(egui::Color32::GREEN),
-            );
-        }
-
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        {
-            ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new("Not available on this platform")
-                    .small()
-                    .color(egui::Color32::GRAY),
-            );
-        }
-
-        ui.add_space(16.0);
-        ui.separator();
-
-        // Layer count info
-        ui.add_space(8.0);
-        ui.label(format!("Layers: {}", environment.layer_count()));
-
-        // ========== MASTER EFFECTS ==========
-        ui.add_space(16.0);
-        ui.separator();
-        ui.add_space(8.0);
-        ui.heading("Master Effects");
-        ui.add_space(8.0);
-
-        self.render_effect_stack_generic(ui, EffectContext::Environment, environment.effects(), effect_registry, actions);
+        ui.label(
+            egui::RichText::new("Immersive Server → Preferences (⌘,)")
+                .small()
+                .weak(),
+        );
+        #[cfg(not(target_os = "macos"))]
+        ui.label(
+            egui::RichText::new("Edit → Preferences")
+                .small()
+                .weak(),
+        );
     }
 
     /// Render the Layer tab
@@ -599,6 +332,9 @@ impl PropertiesPanel {
         layers: &[Layer],
         effect_registry: &EffectRegistry,
         actions: &mut Vec<PropertiesAction>,
+        bpm_clock: &crate::effects::BpmClock,
+        effect_time: f32,
+        audio_manager: Option<&crate::audio::AudioManager>,
     ) {
         // Layer selector
         ui.horizontal(|ui| {
@@ -954,19 +690,23 @@ impl PropertiesPanel {
         ui.heading("Effects");
         ui.add_space(8.0);
 
-        self.render_effect_stack_generic(ui, EffectContext::Layer { layer_id }, &layer.effects, effect_registry, actions);
+        self.render_effect_stack_generic(ui, EffectContext::Layer { layer_id }, &layer.effects, effect_registry, actions, bpm_clock, effect_time, audio_manager);
     }
 
     /// Render an effect stack for any context (layer, clip, or environment)
     ///
     /// Clean design with collapsible effect sections and aligned parameter rows.
     fn render_effect_stack_generic(
-        &self,
+        &mut self,
         ui: &mut egui::Ui,
         context: EffectContext,
         effects: &EffectStack,
         effect_registry: &EffectRegistry,
         actions: &mut Vec<PropertiesAction>,
+        // Automation evaluation context
+        bpm_clock: &crate::effects::BpmClock,
+        effect_time: f32,
+        audio_manager: Option<&crate::audio::AudioManager>,
     ) {
         // Check if a DraggableEffect is specifically being dragged
         let is_dragging_effect = egui::DragAndDrop::payload::<DraggableEffect>(ui.ctx()).is_some();
@@ -1092,7 +832,7 @@ impl PropertiesPanel {
                             // Render parameters if expanded and not bypassed
                             if effect.expanded && !effect.bypassed {
                                 for param in &effect.parameters {
-                                    self.render_effect_parameter_generic(ui, context, effect.id, param, actions);
+                                    self.render_effect_parameter_generic(ui, context, effect.id, param, actions, bpm_clock, effect_time, audio_manager);
                                 }
                             }
 
@@ -1133,18 +873,74 @@ impl PropertiesPanel {
 
     /// Render a single effect parameter with clean aligned layout
     ///
-    /// Layout: [Label (right-aligned, fixed width)] [Value] [Slider]
+    /// Layout: [Gear icon] [Label (right-aligned, fixed width)] [Value] [Slider]
+    /// When automation is active, shows real-time modulated value marker on slider.
     fn render_effect_parameter_generic(
-        &self,
+        &mut self,
         ui: &mut egui::Ui,
         context: EffectContext,
         effect_id: u32,
         param: &crate::effects::Parameter,
         actions: &mut Vec<PropertiesAction>,
+        // Automation evaluation context (reserved for future real-time modulation visualization)
+        _bpm_clock: &crate::effects::BpmClock,
+        _effect_time: f32,
+        _audio_manager: Option<&crate::audio::AudioManager>,
     ) {
-        const LABEL_WIDTH: f32 = 80.0;
+        const GEAR_WIDTH: f32 = 20.0;
+        const LABEL_WIDTH: f32 = 76.0; // Reduced from 80 to accommodate gear
 
         ui.horizontal(|ui| {
+            // Gear icon for modulation
+            let gear_color = match &param.automation {
+                Some(AutomationSource::Lfo(_)) => egui::Color32::from_rgb(255, 200, 50), // Gold for LFO
+                Some(AutomationSource::Beat(_)) => egui::Color32::from_rgb(50, 200, 255), // Cyan for Beat
+                Some(AutomationSource::Fft(_)) => egui::Color32::from_rgb(255, 80, 200), // Magenta for FFT
+                None => egui::Color32::from_gray(100), // Gray when inactive
+            };
+
+            // Create a unique popup ID for this parameter
+            let popup_id = ui.make_persistent_id(format!("mod_popup_{}_{}", effect_id, &param.meta.name));
+
+            // Gear button with popup
+            let gear_response = ui.allocate_ui_with_layout(
+                egui::vec2(GEAR_WIDTH, ui.spacing().interact_size.y),
+                egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+                |ui| {
+                    let response = ui.add(
+                        egui::Button::new(
+                            egui::RichText::new("\u{2699}") // Unicode gear: ⚙
+                                .size(12.0)
+                                .color(gear_color)
+                        )
+                        .frame(false)
+                        .min_size(egui::vec2(16.0, 16.0))
+                    );
+
+                    // Hover tooltip
+                    let tooltip = match &param.automation {
+                        Some(AutomationSource::Lfo(_)) => "LFO modulation active (click to edit)",
+                        Some(AutomationSource::Beat(_)) => "Beat modulation active (click to edit)",
+                        Some(AutomationSource::Fft(_)) => "FFT modulation active (click to edit)",
+                        None => "Click to add modulation",
+                    };
+                    response.clone().on_hover_text(tooltip);
+
+                    // Left-click to open modulation popup
+                    if response.clicked() {
+                        ui.memory_mut(|mem| mem.toggle_popup(popup_id));
+                    }
+
+                    response
+                },
+            ).inner;
+
+            // Render popup below the gear icon
+            egui::popup_below_widget(ui, popup_id, &gear_response, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+                ui.set_min_width(180.0);
+                self.render_modulation_menu(ui, context, effect_id, param, actions);
+            });
+
             // Fixed-width right-aligned label
             ui.allocate_ui_with_layout(
                 egui::vec2(LABEL_WIDTH, ui.spacing().interact_size.y),
@@ -1162,23 +958,59 @@ impl PropertiesPanel {
                     let min = param.meta.min.unwrap_or(0.0);
                     let max = param.meta.max.unwrap_or(1.0);
 
-                    // Value display with +/- would be nice, but slider is cleaner
-                    // Show value as text
+                    // Value display
                     ui.label(
                         egui::RichText::new(format!("{:.1}", val))
                             .color(egui::Color32::from_gray(200))
                             .monospace()
                     );
 
-                    // Slider takes remaining width
-                    let response = ui.add(
-                        egui::Slider::new(&mut val, min..=max)
-                            .show_value(false)
-                            .clamping(egui::SliderClamping::Always)
+                    // Custom slider with visible track
+                    let slider_width = ui.available_width() - 20.0; // Leave room for × button
+                    let (rect, response) = ui.allocate_exact_size(
+                        egui::vec2(slider_width, 18.0),
+                        egui::Sense::click_and_drag()
                     );
 
-                    if response.changed() {
-                        self.push_param_action(actions, context, effect_id, param.meta.name.clone(), ParameterValue::Float(val));
+                    if ui.is_rect_visible(rect) {
+                        let painter = ui.painter();
+
+                        // Draw track (the line)
+                        let track_y = rect.center().y;
+                        let track_left = rect.left() + 6.0;
+                        let track_right = rect.right() - 6.0;
+                        painter.line_segment(
+                            [egui::pos2(track_left, track_y), egui::pos2(track_right, track_y)],
+                            egui::Stroke::new(2.0, egui::Color32::from_gray(60))
+                        );
+
+                        // Draw filled portion (left of handle)
+                        let norm = (val - min) / (max - min);
+                        let handle_x = track_left + norm * (track_right - track_left);
+                        painter.line_segment(
+                            [egui::pos2(track_left, track_y), egui::pos2(handle_x, track_y)],
+                            egui::Stroke::new(2.0, egui::Color32::from_gray(120))
+                        );
+
+                        // Draw handle (circle)
+                        let handle_color = if response.dragged() || response.hovered() {
+                            egui::Color32::WHITE
+                        } else {
+                            egui::Color32::from_gray(200)
+                        };
+                        painter.circle_filled(egui::pos2(handle_x, track_y), 6.0, handle_color);
+                        painter.circle_stroke(egui::pos2(handle_x, track_y), 6.0, egui::Stroke::new(1.0, egui::Color32::from_gray(80)));
+                    }
+
+                    // Handle drag interaction
+                    if response.dragged() {
+                        if let Some(pos) = response.interact_pointer_pos() {
+                            let track_left = rect.left() + 6.0;
+                            let track_right = rect.right() - 6.0;
+                            let norm = ((pos.x - track_left) / (track_right - track_left)).clamp(0.0, 1.0);
+                            val = min + norm * (max - min);
+                            self.push_param_action(actions, context, effect_id, param.meta.name.clone(), ParameterValue::Float(val));
+                        }
                     }
 
                     // Right-click to reset to default
@@ -1190,6 +1022,13 @@ impl PropertiesPanel {
                             ui.close_menu();
                         }
                     });
+
+                    // × button to remove modulation (always visible when automation active)
+                    if param.automation.is_some() {
+                        if ui.small_button("×").on_hover_text("Remove modulation").clicked() {
+                            self.push_automation_action(actions, context, effect_id, param.meta.name.clone(), None);
+                        }
+                    }
                 }
                 ParameterValue::Int(value) => {
                     let mut val = *value;
@@ -1324,7 +1163,11 @@ impl PropertiesPanel {
                     ui.label(egui::RichText::new("—").color(egui::Color32::from_gray(100)));
                 }
             }
+
         });
+
+        // Inline modulation controls when automation is active
+        self.render_inline_modulation_controls(ui, context, effect_id, param, actions, GEAR_WIDTH + LABEL_WIDTH + 8.0);
     }
 
     // Helper methods for generating context-specific actions
@@ -1427,6 +1270,429 @@ impl PropertiesPanel {
         }
     }
 
+    fn push_automation_action(&self, actions: &mut Vec<PropertiesAction>, context: EffectContext, effect_id: u32, param_name: String, automation: Option<AutomationSource>) {
+        match context {
+            EffectContext::Layer { layer_id } => {
+                actions.push(PropertiesAction::SetLayerEffectParameterAutomation { layer_id, effect_id, param_name, automation });
+            }
+            EffectContext::Clip { layer_id, slot } => {
+                actions.push(PropertiesAction::SetClipEffectParameterAutomation { layer_id, slot, effect_id, param_name, automation });
+            }
+            EffectContext::Environment => {
+                actions.push(PropertiesAction::SetEnvironmentEffectParameterAutomation { effect_id, param_name, automation });
+            }
+        }
+    }
+
+    /// Render the modulation menu for a parameter
+    fn render_modulation_menu(
+        &mut self,
+        ui: &mut egui::Ui,
+        context: EffectContext,
+        effect_id: u32,
+        param: &crate::effects::Parameter,
+        actions: &mut Vec<PropertiesAction>,
+    ) {
+        ui.set_min_width(120.0);
+
+        // Simple type selection - no presets
+        // Active type shown with checkmark, clicking switches type or clears
+
+        let is_lfo = matches!(&param.automation, Some(AutomationSource::Lfo(_)));
+        let is_beat = matches!(&param.automation, Some(AutomationSource::Beat(_)));
+        let is_fft = matches!(&param.automation, Some(AutomationSource::Fft(_)));
+
+        // None option
+        if ui.selectable_label(param.automation.is_none(), "None").clicked() {
+            self.push_automation_action(actions, context, effect_id, param.meta.name.clone(), None);
+        }
+
+        ui.separator();
+
+        // LFO option
+        let lfo_label = egui::RichText::new("LFO").color(egui::Color32::from_rgb(255, 200, 50));
+        if ui.selectable_label(is_lfo, lfo_label).clicked() {
+            if !is_lfo {
+                self.push_automation_action(actions, context, effect_id, param.meta.name.clone(), Some(AutomationSource::Lfo(LfoSource::default())));
+            }
+        }
+
+        // Beat option
+        let beat_label = egui::RichText::new("Beat").color(egui::Color32::from_rgb(50, 200, 255));
+        if ui.selectable_label(is_beat, beat_label).clicked() {
+            if !is_beat {
+                self.push_automation_action(actions, context, effect_id, param.meta.name.clone(), Some(AutomationSource::Beat(BeatSource::default())));
+            }
+        }
+
+        // FFT option
+        let fft_label = egui::RichText::new("FFT").color(egui::Color32::from_rgb(255, 80, 200));
+        if ui.selectable_label(is_fft, fft_label).clicked() {
+            if !is_fft {
+                self.push_automation_action(actions, context, effect_id, param.meta.name.clone(), Some(AutomationSource::Fft(FftSource::default())));
+            }
+        }
+    }
+
+    /// Render inline modulation controls below a parameter slider
+    fn render_inline_modulation_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        context: EffectContext,
+        effect_id: u32,
+        param: &crate::effects::Parameter,
+        actions: &mut Vec<PropertiesAction>,
+        indent: f32,
+    ) {
+        let Some(automation) = &param.automation else { return };
+
+        match automation {
+            AutomationSource::Lfo(lfo) => {
+                let mut lfo = lfo.clone();
+                let default_lfo = LfoSource::default();
+                let mut changed = false;
+
+                // Row 1: Shape, Sync, Rate
+                ui.horizontal(|ui| {
+                    ui.add_space(indent);
+                    ui.label(egui::RichText::new("LFO").small().color(egui::Color32::from_rgb(255, 200, 50)));
+                    ui.separator();
+
+                    // Shape
+                    let shape_response = egui::ComboBox::from_id_salt(format!("lfo_shape_{}_{}", effect_id, &param.meta.name))
+                        .selected_text(lfo.shape.name())
+                        .width(70.0)
+                        .show_ui(ui, |ui| {
+                            for shape in LfoShape::all() {
+                                if ui.selectable_value(&mut lfo.shape, *shape, shape.name()).changed() {
+                                    changed = true;
+                                }
+                            }
+                        });
+                    shape_response.response.context_menu(|ui| {
+                        if ui.button("Reset to Default").clicked() {
+                            lfo.shape = default_lfo.shape;
+                            changed = true;
+                            ui.close_menu();
+                        }
+                    });
+
+                    ui.separator();
+
+                    // Sync checkbox
+                    let sync_response = ui.checkbox(&mut lfo.sync_to_bpm, "Sync");
+                    if sync_response.changed() {
+                        changed = true;
+                    }
+                    sync_response.context_menu(|ui| {
+                        if ui.button("Reset to Default").clicked() {
+                            lfo.sync_to_bpm = default_lfo.sync_to_bpm;
+                            changed = true;
+                            ui.close_menu();
+                        }
+                    });
+
+                    ui.separator();
+
+                    // Rate
+                    if lfo.sync_to_bpm {
+                        ui.label(egui::RichText::new("Rate:").small());
+                        let rate_response = ui.add(egui::DragValue::new(&mut lfo.beats).speed(0.1).range(0.25..=16.0).suffix("b"));
+                        if rate_response.changed() {
+                            changed = true;
+                        }
+                        rate_response.context_menu(|ui| {
+                            if ui.button("Reset to Default").clicked() {
+                                lfo.beats = default_lfo.beats;
+                                changed = true;
+                                ui.close_menu();
+                            }
+                        });
+                    } else {
+                        ui.label(egui::RichText::new("Rate:").small());
+                        let rate_response = ui.add(egui::DragValue::new(&mut lfo.frequency).speed(0.01).range(0.01..=20.0).suffix("Hz"));
+                        if rate_response.changed() {
+                            changed = true;
+                        }
+                        rate_response.context_menu(|ui| {
+                            if ui.button("Reset to Default").clicked() {
+                                lfo.frequency = default_lfo.frequency;
+                                changed = true;
+                                ui.close_menu();
+                            }
+                        });
+                    }
+
+                    ui.separator();
+
+                    // Depth
+                    ui.label(egui::RichText::new("Depth:").small());
+                    let depth_response = ui.add(egui::DragValue::new(&mut lfo.amplitude).speed(0.01).range(0.0..=1.0));
+                    if depth_response.changed() {
+                        changed = true;
+                    }
+                    depth_response.context_menu(|ui| {
+                        if ui.button("Reset to Default").clicked() {
+                            lfo.amplitude = default_lfo.amplitude;
+                            changed = true;
+                            ui.close_menu();
+                        }
+                    });
+
+                    ui.separator();
+
+                    // Phase
+                    ui.label(egui::RichText::new("Phase:").small());
+                    let phase_response = ui.add(egui::DragValue::new(&mut lfo.phase).speed(0.01).range(0.0..=1.0));
+                    if phase_response.changed() {
+                        changed = true;
+                    }
+                    phase_response.context_menu(|ui| {
+                        if ui.button("Reset to Default").clicked() {
+                            lfo.phase = default_lfo.phase;
+                            changed = true;
+                            ui.close_menu();
+                        }
+                    });
+
+                    ui.separator();
+
+                    // Remove button
+                    if ui.small_button("×").on_hover_text("Remove modulation").clicked() {
+                        self.push_automation_action(actions, context, effect_id, param.meta.name.clone(), None);
+                    }
+                });
+
+                if changed {
+                    self.push_automation_action(actions, context, effect_id, param.meta.name.clone(), Some(AutomationSource::Lfo(lfo)));
+                }
+            }
+
+            AutomationSource::Beat(beat) => {
+                let mut beat = beat.clone();
+                let default_beat = BeatSource::default();
+                let mut changed = false;
+
+                ui.horizontal(|ui| {
+                    ui.add_space(indent);
+                    ui.label(egui::RichText::new("Beat").small().color(egui::Color32::from_rgb(50, 200, 255)));
+                    ui.separator();
+
+                    // Trigger
+                    ui.label(egui::RichText::new("@").small());
+                    let trigger_response = egui::ComboBox::from_id_salt(format!("beat_trigger_{}_{}", effect_id, &param.meta.name))
+                        .selected_text(beat.trigger_on.name())
+                        .width(60.0)
+                        .show_ui(ui, |ui| {
+                            for trigger in BeatTrigger::all() {
+                                if ui.selectable_value(&mut beat.trigger_on, *trigger, trigger.name()).changed() {
+                                    changed = true;
+                                }
+                            }
+                        });
+                    trigger_response.response.context_menu(|ui| {
+                        if ui.button("Reset to Default").clicked() {
+                            beat.trigger_on = default_beat.trigger_on;
+                            changed = true;
+                            ui.close_menu();
+                        }
+                    });
+
+                    ui.separator();
+
+                    // Attack
+                    ui.label(egui::RichText::new("Atk:").small());
+                    let atk_response = ui.add(egui::DragValue::new(&mut beat.attack_ms).speed(1.0).range(0.0..=500.0).suffix("ms"));
+                    if atk_response.changed() {
+                        changed = true;
+                    }
+                    atk_response.context_menu(|ui| {
+                        if ui.button("Reset to Default").clicked() {
+                            beat.attack_ms = default_beat.attack_ms;
+                            changed = true;
+                            ui.close_menu();
+                        }
+                    });
+
+                    ui.separator();
+
+                    // Decay
+                    ui.label(egui::RichText::new("Dec:").small());
+                    let dec_response = ui.add(egui::DragValue::new(&mut beat.decay_ms).speed(10.0).range(0.0..=2000.0).suffix("ms"));
+                    if dec_response.changed() {
+                        changed = true;
+                    }
+                    dec_response.context_menu(|ui| {
+                        if ui.button("Reset to Default").clicked() {
+                            beat.decay_ms = default_beat.decay_ms;
+                            changed = true;
+                            ui.close_menu();
+                        }
+                    });
+
+                    ui.separator();
+
+                    // Sustain
+                    ui.label(egui::RichText::new("Sus:").small());
+                    let sus_response = ui.add(egui::DragValue::new(&mut beat.sustain).speed(0.01).range(0.0..=1.0));
+                    if sus_response.changed() {
+                        changed = true;
+                    }
+                    sus_response.context_menu(|ui| {
+                        if ui.button("Reset to Default").clicked() {
+                            beat.sustain = default_beat.sustain;
+                            changed = true;
+                            ui.close_menu();
+                        }
+                    });
+
+                    ui.separator();
+
+                    // Release
+                    ui.label(egui::RichText::new("Rel:").small());
+                    let rel_response = ui.add(egui::DragValue::new(&mut beat.release_ms).speed(10.0).range(0.0..=2000.0).suffix("ms"));
+                    if rel_response.changed() {
+                        changed = true;
+                    }
+                    rel_response.context_menu(|ui| {
+                        if ui.button("Reset to Default").clicked() {
+                            beat.release_ms = default_beat.release_ms;
+                            changed = true;
+                            ui.close_menu();
+                        }
+                    });
+
+                    ui.separator();
+
+                    // Remove button
+                    if ui.small_button("×").on_hover_text("Remove modulation").clicked() {
+                        self.push_automation_action(actions, context, effect_id, param.meta.name.clone(), None);
+                    }
+                });
+
+                if changed {
+                    self.push_automation_action(actions, context, effect_id, param.meta.name.clone(), Some(AutomationSource::Beat(beat)));
+                }
+            }
+
+            AutomationSource::Fft(fft) => {
+                let mut fft = fft.clone();
+                let default_fft = FftSource::default();
+                let mut changed = false;
+
+                ui.horizontal(|ui| {
+                    ui.add_space(indent);
+                    ui.label(egui::RichText::new("FFT").small().color(egui::Color32::from_rgb(255, 80, 200)));
+                    ui.separator();
+
+                    // Band
+                    let band_response = egui::ComboBox::from_id_salt(format!("fft_band_{}_{}", effect_id, &param.meta.name))
+                        .selected_text(match fft.band {
+                            AudioBand::Low => "Low",
+                            AudioBand::Mid => "Mid",
+                            AudioBand::High => "High",
+                            AudioBand::Full => "Full",
+                        })
+                        .width(50.0)
+                        .show_ui(ui, |ui| {
+                            for (band, name) in [
+                                (AudioBand::Low, "Low"),
+                                (AudioBand::Mid, "Mid"),
+                                (AudioBand::High, "High"),
+                                (AudioBand::Full, "Full"),
+                            ] {
+                                if ui.selectable_value(&mut fft.band, band, name).changed() {
+                                    changed = true;
+                                }
+                            }
+                        });
+                    band_response.response.context_menu(|ui| {
+                        if ui.button("Reset to Default").clicked() {
+                            fft.band = default_fft.band;
+                            changed = true;
+                            ui.close_menu();
+                        }
+                    });
+
+                    ui.separator();
+
+                    // Gain
+                    ui.label(egui::RichText::new("Gain:").small());
+                    let gain_response = ui.add(egui::DragValue::new(&mut fft.gain).speed(0.01).range(0.0..=4.0));
+                    if gain_response.changed() {
+                        changed = true;
+                    }
+                    gain_response.context_menu(|ui| {
+                        if ui.button("Reset to Default").clicked() {
+                            fft.gain = default_fft.gain;
+                            changed = true;
+                            ui.close_menu();
+                        }
+                    });
+
+                    ui.separator();
+
+                    // Smoothing
+                    ui.label(egui::RichText::new("Smooth:").small());
+                    let smooth_response = ui.add(egui::DragValue::new(&mut fft.smoothing).speed(0.01).range(0.0..=1.0));
+                    if smooth_response.changed() {
+                        changed = true;
+                    }
+                    smooth_response.context_menu(|ui| {
+                        if ui.button("Reset to Default").clicked() {
+                            fft.smoothing = default_fft.smoothing;
+                            changed = true;
+                            ui.close_menu();
+                        }
+                    });
+
+                    ui.separator();
+
+                    // Attack
+                    ui.label(egui::RichText::new("Atk:").small());
+                    let atk_response = ui.add(egui::DragValue::new(&mut fft.attack_ms).speed(1.0).range(0.0..=500.0).suffix("ms"));
+                    if atk_response.changed() {
+                        changed = true;
+                    }
+                    atk_response.context_menu(|ui| {
+                        if ui.button("Reset to Default").clicked() {
+                            fft.attack_ms = default_fft.attack_ms;
+                            changed = true;
+                            ui.close_menu();
+                        }
+                    });
+
+                    ui.separator();
+
+                    // Release
+                    ui.label(egui::RichText::new("Rel:").small());
+                    let rel_response = ui.add(egui::DragValue::new(&mut fft.release_ms).speed(10.0).range(0.0..=2000.0).suffix("ms"));
+                    if rel_response.changed() {
+                        changed = true;
+                    }
+                    rel_response.context_menu(|ui| {
+                        if ui.button("Reset to Default").clicked() {
+                            fft.release_ms = default_fft.release_ms;
+                            changed = true;
+                            ui.close_menu();
+                        }
+                    });
+
+                    ui.separator();
+
+                    // Remove button
+                    if ui.small_button("×").on_hover_text("Remove modulation").clicked() {
+                        self.push_automation_action(actions, context, effect_id, param.meta.name.clone(), None);
+                    }
+                });
+
+                if changed {
+                    self.push_automation_action(actions, context, effect_id, param.meta.name.clone(), Some(AutomationSource::Fft(fft)));
+                }
+            }
+        }
+    }
+
     /// Render the Clip tab
     fn render_clip_tab(
         &mut self,
@@ -1434,6 +1700,10 @@ impl PropertiesPanel {
         layers: &[Layer],
         effect_registry: &EffectRegistry,
         actions: &mut Vec<PropertiesAction>,
+        // Automation evaluation context
+        bpm_clock: &crate::effects::BpmClock,
+        effect_time: f32,
+        audio_manager: Option<&crate::audio::AudioManager>,
     ) {
         // Get selected layer
         let Some(layer_id) = self.selected_layer_id else {
@@ -1491,13 +1761,185 @@ impl PropertiesPanel {
         ui.add_space(16.0);
         ui.separator();
 
-        // Transport controls placeholder
+        // Transport controls
         ui.add_space(8.0);
         ui.heading("Transport");
         ui.add_space(8.0);
 
         ui.horizontal(|ui| {
-            ui.label("(Transport controls will be implemented in a future update)");
+            // Preview button - works for any selected clip
+            if ui
+                .button("👁 Preview")
+                .on_hover_text("Preview this clip in the Preview Monitor")
+                .clicked()
+            {
+                actions.push(PropertiesAction::PreviewClip { layer_id, slot });
+            }
+
+            ui.add_space(8.0);
+
+            // These controls only work if this clip is currently playing
+            ui.add_enabled_ui(is_playing, |ui| {
+                // Restart button
+                if ui
+                    .button("⏮")
+                    .on_hover_text("Restart clip from beginning")
+                    .clicked()
+                {
+                    actions.push(PropertiesAction::RestartClip { layer_id });
+                }
+
+                // Play/Pause button
+                if ui
+                    .button("⏸")
+                    .on_hover_text("Pause/Resume playback")
+                    .clicked()
+                {
+                    actions.push(PropertiesAction::ToggleClipPlayback { layer_id });
+                }
+            });
+        });
+
+        if !is_playing {
+            ui.label(
+                egui::RichText::new("Playback controls available when clip is playing")
+                    .small()
+                    .weak(),
+            );
+        }
+
+        // ========== CLIP TRANSFORM ==========
+        ui.add_space(16.0);
+        ui.separator();
+        ui.add_space(8.0);
+        ui.heading("Clip Transform");
+        ui.add_space(8.0);
+
+        // Position
+        let mut pos_x = clip.transform.position.0;
+        let mut pos_y = clip.transform.position.1;
+        ui.horizontal(|ui| {
+            ui.label("Position X:");
+            let response = ui.add(egui::DragValue::new(&mut pos_x).speed(1.0));
+            if response.changed() {
+                actions.push(PropertiesAction::SetClipPosition {
+                    layer_id,
+                    slot,
+                    x: pos_x,
+                    y: pos_y,
+                });
+            }
+            response.context_menu(|ui| {
+                if ui.button("Reset to 0").clicked() {
+                    actions.push(PropertiesAction::SetClipPosition { layer_id, slot, x: 0.0, y: pos_y });
+                    ui.close_menu();
+                }
+            });
+        });
+        ui.horizontal(|ui| {
+            ui.label("Position Y:");
+            let response = ui.add(egui::DragValue::new(&mut pos_y).speed(1.0));
+            if response.changed() {
+                actions.push(PropertiesAction::SetClipPosition {
+                    layer_id,
+                    slot,
+                    x: pos_x,
+                    y: pos_y,
+                });
+            }
+            response.context_menu(|ui| {
+                if ui.button("Reset to 0").clicked() {
+                    actions.push(PropertiesAction::SetClipPosition { layer_id, slot, x: pos_x, y: 0.0 });
+                    ui.close_menu();
+                }
+            });
+        });
+
+        ui.add_space(4.0);
+
+        // Scale
+        let mut scale_x = clip.transform.scale.0 * 100.0;
+        let mut scale_y = clip.transform.scale.1 * 100.0;
+        let mut uniform_scale = scale_x;
+        ui.horizontal(|ui| {
+            ui.label("Scale:");
+            let response_uniform = ui.add(
+                egui::DragValue::new(&mut uniform_scale)
+                    .speed(1.0)
+                    .suffix("%")
+                    .range(1.0..=1000.0),
+            );
+            if response_uniform.changed() {
+                actions.push(PropertiesAction::SetClipScale {
+                    layer_id,
+                    slot,
+                    scale_x: uniform_scale / 100.0,
+                    scale_y: uniform_scale / 100.0,
+                });
+            }
+            response_uniform.context_menu(|ui| {
+                if ui.button("Reset to 100%").clicked() {
+                    actions.push(PropertiesAction::SetClipScale { layer_id, slot, scale_x: 1.0, scale_y: 1.0 });
+                    ui.close_menu();
+                }
+            });
+            ui.add_space(8.0);
+            let response_x = ui.add(
+                egui::DragValue::new(&mut scale_x)
+                    .speed(1.0)
+                    .suffix("%")
+                    .range(1.0..=1000.0),
+            );
+            if response_x.changed() {
+                actions.push(PropertiesAction::SetClipScale {
+                    layer_id,
+                    slot,
+                    scale_x: scale_x / 100.0,
+                    scale_y: scale_y / 100.0,
+                });
+            }
+            ui.label("×");
+            let response_y = ui.add(
+                egui::DragValue::new(&mut scale_y)
+                    .speed(1.0)
+                    .suffix("%")
+                    .range(1.0..=1000.0),
+            );
+            if response_y.changed() {
+                actions.push(PropertiesAction::SetClipScale {
+                    layer_id,
+                    slot,
+                    scale_x: scale_x / 100.0,
+                    scale_y: scale_y / 100.0,
+                });
+            }
+        });
+
+        ui.add_space(4.0);
+
+        // Rotation
+        let mut rotation_deg = clip.transform.rotation.to_degrees();
+        ui.horizontal(|ui| {
+            ui.label("Rotation:");
+            let response = ui.add(
+                egui::DragValue::new(&mut rotation_deg)
+                    .speed(1.0)
+                    .suffix("°")
+                    .range(-360.0..=360.0),
+            );
+            if response.changed() {
+                actions.push(PropertiesAction::SetClipRotation {
+                    layer_id,
+                    slot,
+                    degrees: rotation_deg,
+                });
+            }
+            response.context_menu(|ui| {
+                if ui.button("Reset to 0°").clicked() {
+                    actions.push(PropertiesAction::SetClipRotation { layer_id, slot, degrees: 0.0 });
+                    ui.close_menu();
+                }
+            });
         });
 
         // ========== CLIP EFFECTS ==========
@@ -1507,7 +1949,7 @@ impl PropertiesPanel {
         ui.heading("Clip Effects");
         ui.add_space(8.0);
 
-        self.render_effect_stack_generic(ui, EffectContext::Clip { layer_id, slot }, &clip.effects, effect_registry, actions);
+        self.render_effect_stack_generic(ui, EffectContext::Clip { layer_id, slot }, &clip.effects, effect_registry, actions, bpm_clock, effect_time, audio_manager);
     }
 }
 

@@ -98,7 +98,7 @@ impl ThumbnailCache {
         let mut decoder = match VideoDecoder::open(path) {
             Ok(d) => d,
             Err(e) => {
-                log::debug!("Failed to open video for thumbnail {}: {}", key, e);
+                tracing::debug!("Failed to open video for thumbnail {}: {}", key, e);
                 return None;
             }
         };
@@ -115,19 +115,19 @@ impl ThumbnailCache {
         let frame = match decoder.seek_and_decode_frame_rgba(seek_time) {
             Ok(f) => f,
             Err(e) => {
-                log::debug!("Failed to decode frame for thumbnail {}: {}", key, e);
+                tracing::debug!("Failed to decode frame for thumbnail {}: {}", key, e);
                 return None;
             }
         };
 
         // Resize to thumbnail size based on mode
-        log::debug!(
+        tracing::debug!(
             "Generating thumbnail for {} (source: {}x{}, mode={:?})",
             key, frame.width, frame.height, mode
         );
         let (resized_pixels, thumb_w, thumb_h) =
             Self::resize_frame(&frame.data, frame.width, frame.height, THUMBNAIL_SIZE, mode);
-        log::debug!(
+        tracing::debug!(
             "Thumbnail {} result: {}x{} (expected {}x{} for Fill)",
             key, thumb_w, thumb_h, THUMBNAIL_SIZE, THUMBNAIL_SIZE
         );
@@ -149,14 +149,14 @@ impl ThumbnailCache {
         mode: ThumbnailMode,
     ) -> (Vec<u8>, u32, u32) {
         let aspect = src_width as f32 / src_height as f32;
-        log::info!(
+        tracing::info!(
             "resize_frame: {}x{} aspect={:.2}, mode={:?}",
             src_width, src_height, aspect, mode
         );
 
         match mode {
             ThumbnailMode::Fit => {
-                log::info!("Using FIT mode branch");
+                tracing::info!("Using FIT mode branch");
                 // Fit: Scale to fit within target_size, maintaining aspect ratio
                 let (dst_width, dst_height) = if aspect > 1.0 {
                     // Wider than tall
@@ -192,7 +192,7 @@ impl ThumbnailCache {
                 (resized, dst_width, dst_height)
             }
             ThumbnailMode::Fill => {
-                log::info!("Using FILL mode branch");
+                tracing::info!("Using FILL mode branch");
                 // Fill: Center crop to square, then resize to target
                 let dst_size = target_size;
 
@@ -201,7 +201,7 @@ impl ThumbnailCache {
                 let crop_x = (src_width.saturating_sub(crop_size)) / 2;
                 let crop_y = (src_height.saturating_sub(crop_size)) / 2;
 
-                log::info!(
+                tracing::info!(
                     "FILL: crop_size={}, crop_x={}, crop_y={}, data.len()={}, expected={}",
                     crop_size, crop_x, crop_y, data.len(), src_width * src_height * 4
                 );
@@ -233,7 +233,7 @@ impl ThumbnailCache {
                 }
 
                 // Log sample pixels to verify
-                log::info!(
+                tracing::info!(
                     "FILL result: first pixel [{},{},{},{}], middle pixel at y=80 [{},{},{},{}]",
                     resized[0], resized[1], resized[2], resized[3],
                     resized[80 * dst_size as usize * 4], resized[80 * dst_size as usize * 4 + 1],
@@ -254,11 +254,11 @@ impl ThumbnailCache {
             // Discard results for keys that are no longer pending
             // (they were cleared due to mode change)
             if !self.pending.remove(&result.key) {
-                log::debug!("Discarding stale thumbnail result for {}", result.key);
+                tracing::debug!("Discarding stale thumbnail result for {}", result.key);
                 continue;
             }
 
-            log::debug!(
+            tracing::debug!(
                 "Thumbnail received: {} ({}x{}, mode={:?})",
                 result.key, result.width, result.height, self.current_mode
             );

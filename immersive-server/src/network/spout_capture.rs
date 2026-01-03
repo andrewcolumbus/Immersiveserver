@@ -164,7 +164,7 @@ impl SpoutCapture {
         self.name = name.to_string();
         self.active = true;
 
-        log::info!(
+        tracing::info!(
             "Spout: Started capture as '{}' ({}x{}) @ {}fps",
             name,
             self.width,
@@ -181,7 +181,7 @@ impl SpoutCapture {
             if let Some(ref spout) = self.spout {
                 spout.release_sender();
             }
-            log::info!(
+            tracing::info!(
                 "Spout: Stopped capture (sent {} frames, skipped {})",
                 self.frame_count,
                 self.frames_skipped
@@ -335,7 +335,7 @@ impl SpoutCapture {
             if spout.send_image(&self.unpack_buffer, self.width, self.height, GL_BGRA, true) {
                 self.frame_count += 1;
                 if self.frame_count == 1 || self.frame_count % 300 == 0 {
-                    log::info!(
+                    tracing::info!(
                         "📺 Spout: Sent {} frames ({}x{})",
                         self.frame_count,
                         self.width,
@@ -384,7 +384,7 @@ impl SpoutCapture {
         // Resize unpack buffer
         self.unpack_buffer = Vec::with_capacity((width * height * 4) as usize);
 
-        log::info!("Spout: Resized capture to {}x{}", width, height);
+        tracing::info!("Spout: Resized capture to {}x{}", width, height);
     }
 
     /// Set target capture frame rate.

@@ -153,7 +153,7 @@ impl NdiReceiver {
             Self::receive_loop(state_clone, &name_clone);
         });
 
-        log::info!("NDI Receiver: Connecting to '{}'", source_name);
+        tracing::info!("NDI Receiver: Connecting to '{}'", source_name);
 
         Ok(Self {
             state,
@@ -171,7 +171,7 @@ impl NdiReceiver {
         let c_name = match CString::new(ndi_name) {
             Ok(s) => s,
             Err(e) => {
-                log::error!("NDI Receiver: Invalid source name: {}", e);
+                tracing::error!("NDI Receiver: Invalid source name: {}", e);
                 return;
             }
         };
@@ -195,11 +195,11 @@ impl NdiReceiver {
 
         let receiver = unsafe { NDIlib_recv_create_v3(&create_settings) };
         if receiver.is_null() {
-            log::error!("NDI Receiver: Failed to create receiver for '{}'", ndi_name);
+            tracing::error!("NDI Receiver: Failed to create receiver for '{}'", ndi_name);
             return;
         }
 
-        log::info!("NDI Receiver: Created receiver for '{}'", ndi_name);
+        tracing::info!("NDI Receiver: Created receiver for '{}'", ndi_name);
 
         let start_time = Instant::now();
         let mut first_frame_logged = false;
@@ -223,11 +223,11 @@ impl NdiReceiver {
                     // Mark as connected on first video frame
                     if !state.connected.load(Ordering::Acquire) {
                         state.connected.store(true, Ordering::Release);
-                        log::info!("NDI Receiver: Connected to '{}'", ndi_name);
+                        tracing::info!("NDI Receiver: Connected to '{}'", ndi_name);
                     }
 
                     if !first_frame_logged {
-                        log::info!(
+                        tracing::info!(
                             "NDI Receiver: First frame {}x{} @ {:.2}fps from '{}'",
                             video_frame.xres,
                             video_frame.yres,
@@ -281,7 +281,7 @@ impl NdiReceiver {
                 }
                 NDIlib_frame_type_e::Error => {
                     if state.connected.swap(false, Ordering::AcqRel) {
-                        log::warn!("NDI Receiver: Connection lost to '{}'", ndi_name);
+                        tracing::warn!("NDI Receiver: Connection lost to '{}'", ndi_name);
                     }
                     // Keep trying to reconnect
                     thread::sleep(Duration::from_millis(100));
@@ -290,7 +290,7 @@ impl NdiReceiver {
                     // No frame available, continue
                 }
                 NDIlib_frame_type_e::StatusChange => {
-                    log::debug!("NDI Receiver: Status change from '{}'", ndi_name);
+                    tracing::debug!("NDI Receiver: Status change from '{}'", ndi_name);
                 }
                 _ => {}
             }
@@ -298,7 +298,7 @@ impl NdiReceiver {
 
         // Cleanup
         unsafe { NDIlib_recv_destroy(receiver) };
-        log::info!("NDI Receiver: Stopped receiving from '{}'", ndi_name);
+        tracing::info!("NDI Receiver: Stopped receiving from '{}'", ndi_name);
     }
 
     /// Take the latest frame (non-blocking).
@@ -364,7 +364,7 @@ impl Drop for NdiReceiver {
             let _ = handle.join();
         }
 
-        log::info!("NDI Receiver: Dropped receiver for '{}'", self.source_name);
+        tracing::info!("NDI Receiver: Dropped receiver for '{}'", self.source_name);
     }
 }
 
@@ -393,17 +393,21 @@ pub struct NdiSender {
 unsafe impl Send for NdiSender {}
 
 impl NdiSender {
-    /// Create a new NDI sender with the given name.
+    /// Create a new NDI sender with the given name and frame rate.
     ///
     /// The sender will be automatically registered on the network
     /// and discoverable by NDI receivers.
-    pub fn new(name: &str) -> Result<Self, NdiError> {
+    ///
+    /// When `clock_video` is enabled, the NDI SDK handles frame pacing
+    /// automatically - if you submit frames faster than the target rate,
+    /// the SDK will block until the correct time.
+    pub fn new(name: &str, frame_rate: u32) -> Result<Self, NdiError> {
         let c_name = CString::new(name).map_err(|_| NdiError::InvalidName)?;
 
         let create_settings = NDIlib_send_create_t {
             p_ndi_name: c_name.as_ptr(),
             p_groups: std::ptr::null(),
-            clock_video: false, // Don't block - we handle frame rate throttling ourselves
+            clock_video: true, // Enable NDI SDK frame pacing for smooth delivery
             clock_audio: false,
         };
 
@@ -412,13 +416,17 @@ impl NdiSender {
             return Err(NdiError::Creation("Failed to create NDI sender".into()));
         }
 
-        log::info!("NDI Sender: Created sender '{}'", name);
+        tracing::info!(
+            "NDI Sender: Created sender '{}' at {}fps (clock_video enabled)",
+            name,
+            frame_rate
+        );
 
         Ok(Self {
             sender,
             name: name.to_string(),
             frame_count: 0,
-            frame_rate: 60,
+            frame_rate,
             start_time: Instant::now(),
         })
     }
@@ -535,7 +543,7 @@ impl NdiSender {
 
 impl Drop for NdiSender {
     fn drop(&mut self) {
-        log::info!("NDI Sender: Destroying sender '{}'", self.name);
+        tracing::info!("NDI Sender: Destroying sender '{}'", self.name);
         unsafe { NDIlib_send_destroy(self.sender) };
     }
 }

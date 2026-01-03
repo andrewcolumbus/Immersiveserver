@@ -63,7 +63,7 @@ impl SpoutLibrary {
 
         for path in &paths {
             if let Ok(dll) = libloading::Library::new(path) {
-                log::info!("Spout: Loaded SpoutLibrary.dll from {}", path);
+                tracing::info!("Spout: Loaded SpoutLibrary.dll from {}", path);
                 return Ok(dll);
             }
         }

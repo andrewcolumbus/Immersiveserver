@@ -208,6 +208,75 @@ impl LayerParams {
             tile: [1.0, 1.0],
         }
     }
+
+    /// Create LayerParams from a Layer and an optional clip transform.
+    ///
+    /// Clip transform is applied first (in layer space), then layer transform
+    /// (in environment space). This allows clips to be positioned within their
+    /// layer's coordinate system.
+    ///
+    /// Transform composition:
+    /// - Scale: multiplicative (layer_scale * clip_scale)
+    /// - Rotation: additive (layer_rotation + clip_rotation)
+    /// - Position: clip position is rotated and scaled by layer transform,
+    ///   then added to layer position
+    pub fn from_layer_and_clip(
+        layer: &Layer,
+        clip_transform: Option<&Transform2D>,
+        video_width: u32,
+        video_height: u32,
+        env_width: u32,
+        env_height: u32,
+    ) -> Self {
+        // If no clip transform or it's identity, just use from_layer
+        let clip_t = match clip_transform {
+            Some(t) if !t.is_identity() => t,
+            _ => return Self::from_layer(layer, video_width, video_height, env_width, env_height),
+        };
+
+        // Size scale: how big is the video relative to the environment
+        let size_scale_x = video_width as f32 / env_width as f32;
+        let size_scale_y = video_height as f32 / env_height as f32;
+
+        // Compose scales (multiplicative)
+        let combined_scale = (
+            layer.transform.scale.0 * clip_t.scale.0,
+            layer.transform.scale.1 * clip_t.scale.1,
+        );
+
+        // Compose rotations (additive)
+        let combined_rotation = layer.transform.rotation + clip_t.rotation;
+
+        // Compose positions:
+        // Clip position is in pixel space relative to layer anchor.
+        // We need to rotate and scale it by the layer transform, then add to layer position.
+        let (sin, cos) = layer.transform.rotation.sin_cos();
+        let rotated_clip_pos = (
+            clip_t.position.0 * cos - clip_t.position.1 * sin,
+            clip_t.position.0 * sin + clip_t.position.1 * cos,
+        );
+        let combined_position = (
+            layer.transform.position.0 + rotated_clip_pos.0 * layer.transform.scale.0,
+            layer.transform.position.1 + rotated_clip_pos.1 * layer.transform.scale.1,
+        );
+
+        // Convert combined pixel position to normalized coordinates
+        let pos_norm_x = combined_position.0 / env_width as f32;
+        let pos_norm_y = combined_position.1 / env_height as f32;
+
+        Self {
+            size_scale: [size_scale_x, size_scale_y],
+            position: [pos_norm_x, pos_norm_y],
+            scale: [combined_scale.0, combined_scale.1],
+            rotation: combined_rotation,
+            env_aspect: env_width as f32 / env_height.max(1) as f32,
+            // Use layer anchor for the combined transform
+            anchor: [layer.transform.anchor.0, layer.transform.anchor.1],
+            opacity: layer.opacity,
+            _pad_opacity: 0.0,
+            tile: [layer.tile_x as f32, layer.tile_y as f32],
+        }
+    }
 }
 
 /// Video renderer that displays video textures using a fullscreen quad.
@@ -419,7 +488,7 @@ impl VideoRenderer {
 
         // Replace old pipelines with new ones
         self.pipelines = new_pipelines;
-        log::info!("✅ Shader hot-reload successful");
+        tracing::info!("✅ Shader hot-reload successful");
 
         Ok(())
     }

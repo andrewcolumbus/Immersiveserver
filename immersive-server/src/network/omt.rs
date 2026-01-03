@@ -68,7 +68,7 @@ impl OmtReceiver {
     ///
     /// NOTE: Not yet implemented with libOMT.
     pub async fn connect(&mut self, address: &str) -> Result<(), OmtError> {
-        log::warn!("OMT Receiver: libOMT receiver not yet implemented");
+        tracing::warn!("OMT Receiver: libOMT receiver not yet implemented");
         self.connected_source = Some(address.to_string());
         Err(OmtError::NotImplemented)
     }
@@ -76,7 +76,7 @@ impl OmtReceiver {
     /// Disconnect from the current source.
     pub fn disconnect(&mut self) {
         if self.connected_source.is_some() {
-            log::info!("OMT Receiver: Disconnecting from {:?}", self.connected_source);
+            tracing::info!("OMT Receiver: Disconnecting from {:?}", self.connected_source);
         }
         self.connected_source = None;
         self.running = false;
@@ -193,22 +193,22 @@ impl OmtSender {
             return Ok(()); // Already started
         }
 
-        log::info!("libOMT Sender: Starting as '{}'", self.name);
+        tracing::info!("libOMT Sender: Starting as '{}'", self.name);
 
         match LibOmtSender::new(&self.name) {
             Ok(sender) => {
                 if let Some(addr) = sender.get_address() {
-                    log::info!("libOMT Sender: Registered as '{}'", addr);
+                    tracing::info!("libOMT Sender: Registered as '{}'", addr);
                 }
                 self.sender = Some(sender);
                 self.running = true;
                 self.frame_count = 0;
                 self.start_time = Some(Instant::now());
-                log::info!("libOMT Sender: Started successfully");
+                tracing::info!("libOMT Sender: Started successfully");
                 Ok(())
             }
             Err(e) => {
-                log::error!("libOMT Sender: Failed to create: {}", e);
+                tracing::error!("libOMT Sender: Failed to create: {}", e);
                 Err(OmtError::Creation(e))
             }
         }
@@ -217,7 +217,7 @@ impl OmtSender {
     /// Stop the OMT sender.
     pub fn stop(&mut self) {
         if self.sender.is_some() {
-            log::info!("libOMT Sender: Stopping");
+            tracing::info!("libOMT Sender: Stopping");
             self.sender = None;
             self.running = false;
         }

@@ -225,7 +225,7 @@ impl LibOmtSender {
             return Err("Failed to create OMT sender - null handle returned".to_string());
         }
 
-        log::info!("libOMT: Created sender '{}'", name);
+        tracing::info!("libOMT: Created sender '{}'", name);
 
         Ok(Self {
             handle,
@@ -310,7 +310,7 @@ impl LibOmtSender {
 
 impl Drop for LibOmtSender {
     fn drop(&mut self) {
-        log::info!("libOMT: Destroying sender '{}'", self.name);
+        tracing::info!("libOMT: Destroying sender '{}'", self.name);
         unsafe {
             omt_send_destroy(self.handle);
         }

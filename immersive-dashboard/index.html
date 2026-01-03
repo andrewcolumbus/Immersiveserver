@@ -1,0 +1,1594 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Immersive Server Dashboard</title>
+  <style>
+    :root {
+      --bg-dark: #1a1a1f;
+      --bg-panel: #252530;
+      --bg-input: #2a2a35;
+      --bg-hover: #35354a;
+      --border: #3a3a4a;
+      --accent: #6b8afd;
+      --accent-hover: #8aa4ff;
+      --text: #e8e8ec;
+      --text-dim: #888890;
+      --success: #4ade80;
+      --warning: #fbbf24;
+      --error: #ef4444;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-size: 13px;
+      background: var(--bg-dark);
+      color: var(--text);
+      height: 100vh;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* Menu Bar */
+    .menu-bar {
+      height: 32px;
+      background: var(--bg-panel);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      padding: 0 8px;
+      gap: 4px;
+      flex-shrink: 0;
+    }
+
+    .menu-item {
+      padding: 4px 12px;
+      border-radius: 4px;
+      cursor: pointer;
+      position: relative;
+    }
+
+    .menu-item:hover { background: var(--bg-hover); }
+
+    .menu-dropdown {
+      display: none;
+      position: absolute;
+      top: 100%;
+      left: 0;
+      background: var(--bg-panel);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      min-width: 180px;
+      z-index: 1000;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+    }
+
+    .menu-item:hover .menu-dropdown { display: block; }
+
+    .menu-dropdown-item {
+      padding: 8px 16px;
+      cursor: pointer;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .menu-dropdown-item:hover { background: var(--bg-hover); }
+    .menu-dropdown-item .shortcut { color: var(--text-dim); font-size: 11px; }
+
+    .menu-spacer { flex: 1; }
+
+    .status-area {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      font-size: 12px;
+    }
+
+    .fps-display {
+      font-family: 'Monaco', monospace;
+      color: var(--success);
+    }
+
+    .connection-badge {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 2px 8px;
+      border-radius: 4px;
+      background: var(--bg-input);
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--error);
+    }
+
+    .status-dot.connected { background: var(--success); }
+    .status-dot.connecting { background: var(--warning); animation: pulse 1s infinite; }
+
+    @keyframes pulse { 50% { opacity: 0.5; } }
+
+    /* Main Layout */
+    .main-layout {
+      flex: 1;
+      display: flex;
+      overflow: hidden;
+    }
+
+    /* Left Panel - Properties */
+    .left-panel {
+      width: 300px;
+      background: var(--bg-panel);
+      border-right: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      flex-shrink: 0;
+    }
+
+    .panel-tabs {
+      display: flex;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .panel-tab {
+      flex: 1;
+      padding: 10px;
+      text-align: center;
+      cursor: pointer;
+      background: transparent;
+      border: none;
+      color: var(--text-dim);
+      font-size: 12px;
+      font-weight: 500;
+    }
+
+    .panel-tab:hover { color: var(--text); background: var(--bg-hover); }
+    .panel-tab.active { color: var(--accent); border-bottom: 2px solid var(--accent); }
+
+    .panel-content {
+      flex: 1;
+      overflow-y: auto;
+      padding: 12px;
+    }
+
+    .tab-panel { display: none; }
+    .tab-panel.active { display: block; }
+
+    /* Center Area */
+    .center-area {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      background: var(--bg-dark);
+    }
+
+    .viewport-area {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: repeating-conic-gradient(#1f1f24 0% 25%, #25252a 0% 50%) 50% / 20px 20px;
+      position: relative;
+    }
+
+    .viewport-info {
+      position: absolute;
+      bottom: 16px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(0,0,0,0.7);
+      padding: 8px 16px;
+      border-radius: 6px;
+      font-size: 12px;
+      color: var(--text-dim);
+    }
+
+    .console-area {
+      height: 200px;
+      border-top: 1px solid var(--border);
+      background: var(--bg-panel);
+      display: flex;
+      flex-direction: column;
+    }
+
+    .console-header {
+      padding: 8px 12px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+      font-weight: 500;
+    }
+
+    .console-output {
+      flex: 1;
+      overflow-y: auto;
+      padding: 8px;
+      font-family: 'Monaco', monospace;
+      font-size: 11px;
+    }
+
+    .console-entry {
+      padding: 2px 0;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .console-entry.error { color: var(--error); }
+    .console-entry.success { color: var(--success); }
+    .console-entry .timestamp { color: var(--text-dim); margin-right: 8px; }
+
+    .console-input-row {
+      display: flex;
+      gap: 4px;
+      padding: 8px;
+      border-top: 1px solid var(--border);
+    }
+
+    /* Right Panel - Clip Grid */
+    .right-panel {
+      width: 400px;
+      background: var(--bg-panel);
+      border-left: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      flex-shrink: 0;
+    }
+
+    .clip-grid-header {
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .clip-grid-container {
+      flex: 1;
+      overflow: auto;
+      padding: 12px;
+    }
+
+    .clip-grid {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .layer-row {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .layer-label {
+      width: 80px;
+      padding: 4px 8px;
+      font-size: 11px;
+      color: var(--text-dim);
+      text-overflow: ellipsis;
+      overflow: hidden;
+      white-space: nowrap;
+      cursor: pointer;
+    }
+
+    .layer-label:hover { color: var(--text); }
+    .layer-label.selected { color: var(--accent); }
+
+    .clip-cells {
+      display: flex;
+      gap: 3px;
+    }
+
+    .clip-cell {
+      width: 64px;
+      height: 48px;
+      background: var(--bg-input);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 10px;
+      color: var(--text-dim);
+      position: relative;
+      overflow: hidden;
+    }
+
+    .clip-cell:hover { border-color: var(--accent); }
+    .clip-cell.active { border-color: var(--accent); box-shadow: 0 0 8px rgba(107,138,253,0.4); }
+    .clip-cell.has-content { background: var(--bg-hover); }
+
+    .clip-cell .clip-label {
+      font-size: 9px;
+      text-align: center;
+      padding: 2px;
+    }
+
+    .layer-opacity {
+      width: 50px;
+      height: 4px;
+      -webkit-appearance: none;
+      background: var(--bg-input);
+      border-radius: 2px;
+    }
+
+    .layer-opacity::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 10px;
+      height: 10px;
+      background: var(--accent);
+      border-radius: 50%;
+      cursor: pointer;
+    }
+
+    /* Form Elements */
+    .form-section {
+      margin-bottom: 16px;
+    }
+
+    .form-section-title {
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--text-dim);
+      text-transform: uppercase;
+      margin-bottom: 8px;
+    }
+
+    .form-group {
+      margin-bottom: 10px;
+    }
+
+    .form-label {
+      display: block;
+      font-size: 11px;
+      color: var(--text-dim);
+      margin-bottom: 4px;
+    }
+
+    .form-row {
+      display: flex;
+      gap: 8px;
+    }
+
+    .form-row .form-group { flex: 1; }
+
+    input, select {
+      width: 100%;
+      background: var(--bg-input);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 6px 10px;
+      border-radius: 4px;
+      font-size: 12px;
+    }
+
+    input:focus, select:focus {
+      outline: none;
+      border-color: var(--accent);
+    }
+
+    input[type="range"] {
+      padding: 0;
+      height: 4px;
+    }
+
+    button {
+      background: var(--accent);
+      color: white;
+      border: none;
+      padding: 6px 12px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 500;
+    }
+
+    button:hover { background: var(--accent-hover); }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    button.secondary { background: var(--bg-input); }
+    button.secondary:hover { background: var(--bg-hover); }
+    button.small { padding: 4px 8px; font-size: 11px; }
+    button.icon { padding: 4px 6px; font-size: 14px; }
+
+    .button-row {
+      display: flex;
+      gap: 6px;
+      margin-top: 8px;
+    }
+
+    /* Floating Panels */
+    .floating-panel {
+      position: fixed;
+      background: var(--bg-panel);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+      min-width: 200px;
+      z-index: 100;
+      display: none;
+    }
+
+    .floating-panel.visible { display: block; }
+
+    .floating-panel-header {
+      padding: 8px 12px;
+      background: var(--bg-hover);
+      border-bottom: 1px solid var(--border);
+      border-radius: 6px 6px 0 0;
+      cursor: move;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 12px;
+      font-weight: 500;
+    }
+
+    .floating-panel-content {
+      padding: 12px;
+      max-height: 400px;
+      overflow-y: auto;
+    }
+
+    .floating-panel-close {
+      background: none;
+      border: none;
+      color: var(--text-dim);
+      cursor: pointer;
+      padding: 2px 6px;
+      font-size: 14px;
+    }
+
+    .floating-panel-close:hover { color: var(--text); background: none; }
+
+    /* List Items */
+    .list-item {
+      padding: 8px;
+      background: var(--bg-input);
+      border-radius: 4px;
+      margin-bottom: 4px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .list-item:hover { background: var(--bg-hover); }
+    .list-item .name { font-weight: 500; }
+    .list-item .details { font-size: 11px; color: var(--text-dim); margin-top: 2px; }
+
+    .badge {
+      display: inline-block;
+      padding: 2px 6px;
+      border-radius: 3px;
+      font-size: 10px;
+      font-weight: 500;
+    }
+
+    .badge.active { background: var(--success); color: black; }
+    .badge.inactive { background: var(--bg-input); color: var(--text-dim); }
+
+    .empty-state {
+      text-align: center;
+      padding: 20px;
+      color: var(--text-dim);
+      font-size: 12px;
+    }
+
+    /* Effects list */
+    .effect-item {
+      padding: 8px;
+      background: var(--bg-input);
+      border-radius: 4px;
+      margin-bottom: 4px;
+    }
+
+    .effect-item .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 6px;
+    }
+
+    .effect-params {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .effect-param {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 11px;
+    }
+
+    .effect-param label {
+      width: 80px;
+      color: var(--text-dim);
+    }
+
+    .effect-param input {
+      flex: 1;
+      padding: 4px 6px;
+    }
+
+    /* Streaming status */
+    .streaming-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 10px;
+      background: var(--bg-input);
+      border-radius: 4px;
+      margin-bottom: 8px;
+    }
+
+    .streaming-item .info {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .streaming-item .actions {
+      display: flex;
+      gap: 6px;
+    }
+
+    /* Connection Modal */
+    .modal-overlay {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background: rgba(0,0,0,0.6);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 1000;
+    }
+
+    .modal-overlay.visible { display: flex; }
+
+    .modal {
+      background: var(--bg-panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 24px;
+      min-width: 320px;
+    }
+
+    .modal h2 {
+      font-size: 16px;
+      margin-bottom: 16px;
+    }
+  </style>
+</head>
+<body>
+  <!-- Menu Bar -->
+  <div class="menu-bar">
+    <div class="menu-item">
+      File
+      <div class="menu-dropdown">
+        <div class="menu-dropdown-item" onclick="showOpenDialog()">Open... <span class="shortcut">Cmd+O</span></div>
+        <div class="menu-dropdown-item" onclick="saveFile()">Save <span class="shortcut">Cmd+S</span></div>
+        <div class="menu-dropdown-item" onclick="showSaveAsDialog()">Save As...</div>
+      </div>
+    </div>
+    <div class="menu-item">
+      View
+      <div class="menu-dropdown">
+        <div class="menu-dropdown-item" onclick="togglePanel('sources')">Sources</div>
+        <div class="menu-dropdown-item" onclick="togglePanel('effects')">Effects Browser</div>
+        <div class="menu-dropdown-item" onclick="togglePanel('streaming')">Streaming</div>
+      </div>
+    </div>
+    <div class="menu-spacer"></div>
+    <div class="status-area">
+      <span class="fps-display" id="fpsDisplay">-- fps</span>
+      <div class="connection-badge" onclick="showConnectionModal()">
+        <span class="status-dot" id="statusDot"></span>
+        <span id="statusText">Disconnected</span>
+      </div>
+      <div class="connection-badge">
+        <span class="status-dot" id="wsStatusDot"></span>
+        <span id="wsStatusText">WS</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Main Layout -->
+  <div class="main-layout">
+    <!-- Left Panel - Properties -->
+    <div class="left-panel">
+      <div class="panel-tabs">
+        <button class="panel-tab active" data-tab="environment">Environment</button>
+        <button class="panel-tab" data-tab="layer">Layer</button>
+        <button class="panel-tab" data-tab="clip">Clip</button>
+      </div>
+      <div class="panel-content">
+        <!-- Environment Tab -->
+        <div class="tab-panel active" id="tab-environment">
+          <div class="form-section">
+            <div class="form-section-title">Resolution</div>
+            <div class="form-row">
+              <div class="form-group">
+                <label class="form-label">Width</label>
+                <input type="number" id="env-width" value="1920">
+              </div>
+              <div class="form-group">
+                <label class="form-label">Height</label>
+                <input type="number" id="env-height" value="1080">
+              </div>
+            </div>
+          </div>
+          <div class="form-section">
+            <div class="form-section-title">Performance</div>
+            <div class="form-group">
+              <label class="form-label">Target FPS</label>
+              <input type="number" id="env-fps" value="60">
+            </div>
+          </div>
+          <div class="button-row">
+            <button onclick="updateEnvironment()">Apply</button>
+          </div>
+
+          <div class="form-section" style="margin-top: 24px;">
+            <div class="form-section-title">Environment Effects</div>
+            <div class="form-row" style="margin-bottom: 8px;">
+              <select id="env-effect-type" style="flex: 1;">
+                <option value="color_correction">Color Correction</option>
+                <option value="invert">Invert</option>
+              </select>
+              <button class="small" onclick="addEnvironmentEffect()">+ Add</button>
+            </div>
+            <div id="envEffectList"></div>
+          </div>
+        </div>
+
+        <!-- Layer Tab -->
+        <div class="tab-panel" id="tab-layer">
+          <div class="form-section">
+            <div class="form-section-title">Selected Layer</div>
+            <div class="form-group">
+              <select id="layer-select" onchange="loadLayerProperties()">
+                <option value="">Select a layer...</option>
+              </select>
+            </div>
+          </div>
+
+          <div id="layer-properties" style="display: none;">
+            <div class="form-section">
+              <div class="form-section-title">Properties</div>
+              <div class="form-group">
+                <label class="form-label">Name</label>
+                <input type="text" id="layer-name">
+              </div>
+              <div class="form-row">
+                <div class="form-group">
+                  <label class="form-label">Opacity</label>
+                  <input type="range" id="layer-opacity" min="0" max="1" step="0.01" value="1">
+                </div>
+                <div class="form-group">
+                  <label class="form-label">Blend</label>
+                  <select id="layer-blend">
+                    <option value="Normal">Normal</option>
+                    <option value="Additive">Additive</option>
+                    <option value="Multiply">Multiply</option>
+                    <option value="Screen">Screen</option>
+                  </select>
+                </div>
+              </div>
+            </div>
+
+            <div class="form-section">
+              <div class="form-section-title">Transform</div>
+              <div class="form-row">
+                <div class="form-group">
+                  <label class="form-label">Position X</label>
+                  <input type="number" id="layer-pos-x" value="0">
+                </div>
+                <div class="form-group">
+                  <label class="form-label">Position Y</label>
+                  <input type="number" id="layer-pos-y" value="0">
+                </div>
+              </div>
+              <div class="form-row">
+                <div class="form-group">
+                  <label class="form-label">Scale X</label>
+                  <input type="number" id="layer-scale-x" value="1" step="0.1">
+                </div>
+                <div class="form-group">
+                  <label class="form-label">Scale Y</label>
+                  <input type="number" id="layer-scale-y" value="1" step="0.1">
+                </div>
+              </div>
+              <div class="form-group">
+                <label class="form-label">Rotation</label>
+                <input type="number" id="layer-rotation" value="0" step="1">
+              </div>
+            </div>
+
+            <div class="button-row">
+              <button onclick="updateLayer()">Apply</button>
+              <button class="secondary" onclick="cloneLayer()">Clone</button>
+              <button class="secondary" onclick="deleteLayer()">Delete</button>
+            </div>
+
+            <div class="form-section" style="margin-top: 24px;">
+              <div class="form-section-title">Layer Effects</div>
+              <div class="form-row" style="margin-bottom: 8px;">
+                <select id="layer-effect-type" style="flex: 1;">
+                  <option value="color_correction">Color Correction</option>
+                  <option value="invert">Invert</option>
+                </select>
+                <button class="small" onclick="addLayerEffect()">+ Add</button>
+              </div>
+              <div id="layerEffectList"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Clip Tab -->
+        <div class="tab-panel" id="tab-clip">
+          <div class="form-section">
+            <div class="form-section-title">Selected Clip</div>
+            <div class="form-row">
+              <div class="form-group">
+                <label class="form-label">Layer</label>
+                <select id="clip-layer-select" onchange="loadClipSlots()">
+                  <option value="">Select layer...</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label class="form-label">Slot</label>
+                <select id="clip-slot-select" onchange="loadClipProperties()">
+                  <option value="">Select slot...</option>
+                </select>
+              </div>
+            </div>
+          </div>
+
+          <div id="clip-properties" style="display: none;">
+            <div class="form-section">
+              <div class="form-section-title">Source</div>
+              <div class="form-group">
+                <label class="form-label">Type</label>
+                <select id="clip-source-type">
+                  <option value="file">File</option>
+                  <option value="omt">OMT</option>
+                  <option value="ndi">NDI</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label class="form-label">Path / Source ID</label>
+                <input type="text" id="clip-path" placeholder="/path/to/video.mov">
+              </div>
+              <div class="form-group">
+                <label class="form-label">Label</label>
+                <input type="text" id="clip-label">
+              </div>
+            </div>
+
+            <div class="form-section">
+              <div class="form-section-title">Transition</div>
+              <div class="form-row">
+                <div class="form-group">
+                  <label class="form-label">Type</label>
+                  <select id="clip-transition">
+                    <option value="Cut">Cut</option>
+                    <option value="Fade">Fade</option>
+                    <option value="Crossfade">Crossfade</option>
+                  </select>
+                </div>
+                <div class="form-group">
+                  <label class="form-label">Duration (s)</label>
+                  <input type="number" id="clip-transition-duration" value="0.5" step="0.1">
+                </div>
+              </div>
+            </div>
+
+            <div class="button-row">
+              <button onclick="setClip()">Set Source</button>
+              <button onclick="triggerClip()">Trigger</button>
+              <button class="secondary" onclick="clearClip()">Clear</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Center Area -->
+    <div class="center-area">
+      <div class="viewport-area">
+        <div class="viewport-info" id="viewportInfo">
+          <span id="envResolution">1920 x 1080</span> | Zoom: <span id="viewportZoom">100%</span>
+        </div>
+      </div>
+      <div class="console-area">
+        <div class="console-header">
+          Console
+          <button class="small secondary" onclick="clearConsole()">Clear</button>
+        </div>
+        <div class="console-output" id="consoleOutput">
+          <div class="empty-state">Console output will appear here</div>
+        </div>
+        <div class="console-input-row">
+          <select id="console-method" style="width: 80px;">
+            <option value="GET">GET</option>
+            <option value="POST">POST</option>
+            <option value="PUT">PUT</option>
+            <option value="DELETE">DELETE</option>
+          </select>
+          <input type="text" id="console-endpoint" value="/api/status" style="flex: 1;" placeholder="/api/...">
+          <input type="text" id="console-body" placeholder="{}" style="width: 200px;">
+          <button onclick="sendRequest()">Send</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Right Panel - Clip Grid -->
+    <div class="right-panel">
+      <div class="clip-grid-header">
+        <span>Clip Grid</span>
+        <div>
+          <button class="small secondary icon" onclick="addColumn()" title="Add Column">+</button>
+          <button class="small secondary icon" onclick="deleteColumn()" title="Delete Column">-</button>
+        </div>
+      </div>
+      <div class="clip-grid-container">
+        <div class="clip-grid" id="clipGrid">
+          <div class="empty-state">Connect to server to load clips</div>
+        </div>
+      </div>
+      <div style="padding: 12px; border-top: 1px solid var(--border);">
+        <div class="button-row">
+          <button onclick="createLayer()">+ Add Layer</button>
+          <button class="secondary" onclick="refreshAll()">Refresh</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Floating Panels -->
+  <!-- Sources Panel -->
+  <div class="floating-panel" id="panel-sources" style="top: 100px; left: 320px; width: 250px;">
+    <div class="floating-panel-header">
+      Sources
+      <button class="floating-panel-close" onclick="togglePanel('sources')">x</button>
+    </div>
+    <div class="floating-panel-content">
+      <div class="form-section-title">OMT Sources</div>
+      <div id="omtSourceList"><div class="empty-state">No sources</div></div>
+      <div class="form-section-title" style="margin-top: 12px;">NDI Sources</div>
+      <div id="ndiSourceList"><div class="empty-state">No sources</div></div>
+      <div class="button-row" style="margin-top: 12px;">
+        <button class="small" onclick="refreshSources()">Refresh</button>
+        <button class="small secondary" onclick="startNdiDiscovery()">Start NDI</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Effects Browser Panel -->
+  <div class="floating-panel" id="panel-effects" style="top: 100px; left: 580px; width: 250px;">
+    <div class="floating-panel-header">
+      Effects Browser
+      <button class="floating-panel-close" onclick="togglePanel('effects')">x</button>
+    </div>
+    <div class="floating-panel-content">
+      <div id="effectTypeList"><div class="empty-state">Loading...</div></div>
+    </div>
+  </div>
+
+  <!-- Streaming Panel -->
+  <div class="floating-panel" id="panel-streaming" style="top: 100px; left: 840px; width: 300px;">
+    <div class="floating-panel-header">
+      Streaming
+      <button class="floating-panel-close" onclick="togglePanel('streaming')">x</button>
+    </div>
+    <div class="floating-panel-content">
+      <div class="streaming-item">
+        <div class="info">
+          <span class="badge" id="omt-status">OFF</span>
+          <span>OMT Broadcast</span>
+        </div>
+        <div class="actions">
+          <button class="small" onclick="startOmt()">Start</button>
+          <button class="small secondary" onclick="stopOmt()">Stop</button>
+        </div>
+      </div>
+      <div class="streaming-item">
+        <div class="info">
+          <span class="badge" id="ndi-status">OFF</span>
+          <span>NDI Output</span>
+        </div>
+        <div class="actions">
+          <button class="small" onclick="startNdi()">Start</button>
+          <button class="small secondary" onclick="stopNdi()">Stop</button>
+        </div>
+      </div>
+      <div class="streaming-item">
+        <div class="info">
+          <span class="badge" id="texture-status">OFF</span>
+          <span>Syphon/Spout</span>
+        </div>
+        <div class="actions">
+          <button class="small" onclick="startTextureShare()">Start</button>
+          <button class="small secondary" onclick="stopTextureShare()">Stop</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Connection Modal -->
+  <div class="modal-overlay" id="connectionModal">
+    <div class="modal">
+      <h2>Connect to Server</h2>
+      <div class="form-group">
+        <label class="form-label">Server Address</label>
+        <input type="text" id="serverUrl" value="localhost:8080" placeholder="host:port">
+      </div>
+      <div class="button-row" style="margin-top: 16px;">
+        <button onclick="connect()">Connect</button>
+        <button class="secondary" onclick="hideConnectionModal()">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // State
+    let serverUrl = 'localhost:8080';
+    let connected = false;
+    let ws = null;
+    let layers = [];
+    let selectedLayerId = null;
+    let selectedClipSlot = null;
+
+    // Tab switching
+    document.querySelectorAll('.panel-tab').forEach(tab => {
+      tab.addEventListener('click', () => {
+        document.querySelectorAll('.panel-tab').forEach(t => t.classList.remove('active'));
+        document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+        tab.classList.add('active');
+        document.getElementById('tab-' + tab.dataset.tab).classList.add('active');
+      });
+    });
+
+    // Panel visibility
+    function togglePanel(id) {
+      const panel = document.getElementById('panel-' + id);
+      panel.classList.toggle('visible');
+    }
+
+    // Connection modal
+    function showConnectionModal() {
+      document.getElementById('connectionModal').classList.add('visible');
+    }
+
+    function hideConnectionModal() {
+      document.getElementById('connectionModal').classList.remove('visible');
+    }
+
+    // API Helper
+    async function api(method, endpoint, body = null) {
+      const url = `http://${serverUrl}${endpoint}`;
+      const options = {
+        method,
+        headers: { 'Content-Type': 'application/json' },
+      };
+      if (body && method !== 'GET') {
+        options.body = JSON.stringify(body);
+      }
+      try {
+        const res = await fetch(url, options);
+        const data = await res.json();
+        return { ok: res.ok, status: res.status, data };
+      } catch (err) {
+        return { ok: false, error: err.message };
+      }
+    }
+
+    // Console logging
+    function log(message, type = 'info') {
+      const container = document.getElementById('consoleOutput');
+      if (container.querySelector('.empty-state')) {
+        container.innerHTML = '';
+      }
+      const entry = document.createElement('div');
+      entry.className = `console-entry ${type}`;
+      const time = new Date().toLocaleTimeString();
+      entry.innerHTML = `<span class="timestamp">[${time}]</span>${message}`;
+      container.insertBefore(entry, container.firstChild);
+    }
+
+    function clearConsole() {
+      document.getElementById('consoleOutput').innerHTML = '<div class="empty-state">Console cleared</div>';
+    }
+
+    // Connection
+    async function connect() {
+      serverUrl = document.getElementById('serverUrl').value;
+      hideConnectionModal();
+
+      document.getElementById('statusDot').className = 'status-dot connecting';
+      document.getElementById('statusText').textContent = 'Connecting...';
+
+      const result = await api('GET', '/api/status');
+      if (result.ok) {
+        connected = true;
+        document.getElementById('statusDot').className = 'status-dot connected';
+        document.getElementById('statusText').textContent = 'Connected';
+        log(`Connected to ${serverUrl}`, 'success');
+        connectWebSocket();
+        refreshAll();
+        loadEffectTypes();
+      } else {
+        connected = false;
+        document.getElementById('statusDot').className = 'status-dot';
+        document.getElementById('statusText').textContent = 'Failed';
+        log(`Connection failed: ${result.error || result.data?.message}`, 'error');
+      }
+    }
+
+    function connectWebSocket() {
+      if (ws) ws.close();
+
+      document.getElementById('wsStatusDot').className = 'status-dot connecting';
+
+      ws = new WebSocket(`ws://${serverUrl}/ws`);
+
+      ws.onopen = () => {
+        document.getElementById('wsStatusDot').className = 'status-dot connected';
+        log('WebSocket connected', 'success');
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          handleWsEvent(data);
+        } catch (e) {
+          console.error('WS parse error:', e);
+        }
+      };
+
+      ws.onclose = () => {
+        document.getElementById('wsStatusDot').className = 'status-dot';
+      };
+
+      ws.onerror = () => {
+        document.getElementById('wsStatusDot').className = 'status-dot';
+      };
+    }
+
+    function handleWsEvent(event) {
+      if (event.type === 'fps') {
+        document.getElementById('fpsDisplay').textContent = event.data.fps.toFixed(1) + ' fps';
+      } else if (event.type === 'snapshot') {
+        document.getElementById('fpsDisplay').textContent = event.data.fps.toFixed(1) + ' fps';
+        document.getElementById('envResolution').textContent = `${event.data.env_width} x ${event.data.env_height}`;
+        updateStreamingStatus(event.data.omt_broadcasting, event.data.ndi_broadcasting, event.data.texture_sharing);
+      }
+    }
+
+    function updateStreamingStatus(omt, ndi, texture) {
+      const omtEl = document.getElementById('omt-status');
+      const ndiEl = document.getElementById('ndi-status');
+      const texEl = document.getElementById('texture-status');
+
+      omtEl.className = `badge ${omt ? 'active' : 'inactive'}`;
+      omtEl.textContent = omt ? 'ON' : 'OFF';
+      ndiEl.className = `badge ${ndi ? 'active' : 'inactive'}`;
+      ndiEl.textContent = ndi ? 'ON' : 'OFF';
+      texEl.className = `badge ${texture ? 'active' : 'inactive'}`;
+      texEl.textContent = texture ? 'ON' : 'OFF';
+    }
+
+    async function refreshAll() {
+      await refreshEnvironment();
+      await refreshLayers();
+    }
+
+    async function refreshEnvironment() {
+      const result = await api('GET', '/api/environment');
+      if (result.ok) {
+        document.getElementById('env-width').value = result.data.width;
+        document.getElementById('env-height').value = result.data.height;
+        document.getElementById('env-fps').value = result.data.target_fps;
+        document.getElementById('envResolution').textContent = `${result.data.width} x ${result.data.height}`;
+      }
+      await loadEnvironmentEffects();
+    }
+
+    // Layers
+    async function refreshLayers() {
+      const result = await api('GET', '/api/layers');
+      if (result.ok) {
+        layers = result.data.layers;
+        renderClipGrid();
+        updateLayerSelects();
+      }
+    }
+
+    function updateLayerSelects() {
+      const selects = [
+        document.getElementById('layer-select'),
+        document.getElementById('clip-layer-select')
+      ];
+
+      selects.forEach(select => {
+        const value = select.value;
+        select.innerHTML = '<option value="">Select layer...</option>';
+        layers.forEach(layer => {
+          const opt = document.createElement('option');
+          opt.value = layer.id;
+          opt.textContent = `${layer.name} (ID: ${layer.id})`;
+          select.appendChild(opt);
+        });
+        select.value = value;
+      });
+    }
+
+    function renderClipGrid() {
+      const container = document.getElementById('clipGrid');
+      if (layers.length === 0) {
+        container.innerHTML = '<div class="empty-state">No layers</div>';
+        return;
+      }
+
+      container.innerHTML = layers.map(layer => {
+        const clips = layer.clips || [];
+        const numColumns = Math.max(4, clips.length);
+
+        return `
+          <div class="layer-row" data-layer-id="${layer.id}">
+            <div class="layer-label ${selectedLayerId === layer.id ? 'selected' : ''}"
+                 onclick="selectLayer(${layer.id})">${layer.name}</div>
+            <div class="clip-cells">
+              ${Array(numColumns).fill(0).map((_, i) => {
+                const clip = clips.find(c => c.slot === i);
+                const isActive = layer.active_slot === i;
+                const hasContent = clip && clip.source_type;
+                return `
+                  <div class="clip-cell ${isActive ? 'active' : ''} ${hasContent ? 'has-content' : ''}"
+                       onclick="selectClip(${layer.id}, ${i})"
+                       ondblclick="triggerClipSlot(${layer.id}, ${i})">
+                    <span class="clip-label">${clip?.label || (hasContent ? clip.source_type : '')}</span>
+                  </div>
+                `;
+              }).join('')}
+            </div>
+            <input type="range" class="layer-opacity" min="0" max="1" step="0.01"
+                   value="${layer.opacity}"
+                   onchange="setLayerOpacity(${layer.id}, this.value)">
+          </div>
+        `;
+      }).join('');
+    }
+
+    function selectLayer(id) {
+      selectedLayerId = id;
+      document.getElementById('layer-select').value = id;
+      loadLayerProperties();
+      renderClipGrid();
+    }
+
+    function selectClip(layerId, slot) {
+      selectedLayerId = layerId;
+      selectedClipSlot = slot;
+      document.getElementById('clip-layer-select').value = layerId;
+      loadClipSlots();
+      document.getElementById('clip-slot-select').value = slot;
+      loadClipProperties();
+
+      // Switch to clip tab
+      document.querySelectorAll('.panel-tab').forEach(t => t.classList.remove('active'));
+      document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+      document.querySelector('[data-tab="clip"]').classList.add('active');
+      document.getElementById('tab-clip').classList.add('active');
+    }
+
+    async function loadLayerProperties() {
+      const id = document.getElementById('layer-select').value;
+      if (!id) {
+        document.getElementById('layer-properties').style.display = 'none';
+        return;
+      }
+
+      const result = await api('GET', `/api/layers/${id}`);
+      if (result.ok) {
+        const layer = result.data;
+        document.getElementById('layer-name').value = layer.name;
+        document.getElementById('layer-opacity').value = layer.opacity;
+        document.getElementById('layer-blend').value = layer.blend_mode;
+        document.getElementById('layer-pos-x').value = layer.transform?.position_x || 0;
+        document.getElementById('layer-pos-y').value = layer.transform?.position_y || 0;
+        document.getElementById('layer-scale-x').value = layer.transform?.scale_x || 1;
+        document.getElementById('layer-scale-y').value = layer.transform?.scale_y || 1;
+        document.getElementById('layer-rotation').value = layer.transform?.rotation || 0;
+        document.getElementById('layer-properties').style.display = 'block';
+        selectedLayerId = parseInt(id);
+        await loadLayerEffects();
+      }
+    }
+
+    async function loadClipSlots() {
+      const layerId = document.getElementById('clip-layer-select').value;
+      const select = document.getElementById('clip-slot-select');
+      select.innerHTML = '<option value="">Select slot...</option>';
+
+      if (!layerId) return;
+
+      const result = await api('GET', `/api/layers/${layerId}/clips`);
+      if (result.ok) {
+        const numSlots = Math.max(8, result.data.clips.length);
+        for (let i = 0; i < numSlots; i++) {
+          const clip = result.data.clips.find(c => c.slot === i);
+          const opt = document.createElement('option');
+          opt.value = i;
+          opt.textContent = `Slot ${i}${clip?.label ? ` - ${clip.label}` : ''}`;
+          select.appendChild(opt);
+        }
+      }
+    }
+
+    async function loadClipProperties() {
+      const layerId = document.getElementById('clip-layer-select').value;
+      const slot = document.getElementById('clip-slot-select').value;
+
+      if (!layerId || slot === '') {
+        document.getElementById('clip-properties').style.display = 'none';
+        return;
+      }
+
+      const result = await api('GET', `/api/layers/${layerId}/clips/${slot}`);
+      if (result.ok && result.data) {
+        const clip = result.data;
+        document.getElementById('clip-source-type').value = clip.source_type || 'file';
+        document.getElementById('clip-path').value = clip.path || clip.source_id || '';
+        document.getElementById('clip-label').value = clip.label || '';
+        document.getElementById('clip-properties').style.display = 'block';
+        selectedClipSlot = parseInt(slot);
+      } else {
+        document.getElementById('clip-source-type').value = 'file';
+        document.getElementById('clip-path').value = '';
+        document.getElementById('clip-label').value = '';
+        document.getElementById('clip-properties').style.display = 'block';
+        selectedClipSlot = parseInt(slot);
+      }
+    }
+
+    async function setLayerOpacity(id, value) {
+      await api('PUT', `/api/layers/${id}`, { opacity: parseFloat(value) });
+    }
+
+    async function createLayer() {
+      const result = await api('POST', '/api/layers', { name: 'New Layer' });
+      log(`Create layer: ${result.ok ? 'success' : 'failed'}`, result.ok ? 'success' : 'error');
+      if (result.ok) refreshLayers();
+    }
+
+    async function updateLayer() {
+      const id = document.getElementById('layer-select').value;
+      const result = await api('PUT', `/api/layers/${id}`, {
+        name: document.getElementById('layer-name').value,
+        opacity: parseFloat(document.getElementById('layer-opacity').value),
+        blend_mode: document.getElementById('layer-blend').value,
+        transform: {
+          position_x: parseFloat(document.getElementById('layer-pos-x').value),
+          position_y: parseFloat(document.getElementById('layer-pos-y').value),
+          scale_x: parseFloat(document.getElementById('layer-scale-x').value),
+          scale_y: parseFloat(document.getElementById('layer-scale-y').value),
+          rotation: parseFloat(document.getElementById('layer-rotation').value),
+        }
+      });
+      log(`Update layer: ${result.ok ? 'success' : 'failed'}`, result.ok ? 'success' : 'error');
+      if (result.ok) refreshLayers();
+    }
+
+    async function cloneLayer() {
+      const id = document.getElementById('layer-select').value;
+      const result = await api('POST', `/api/layers/${id}/clone`);
+      log(`Clone layer: ${result.ok ? 'success' : 'failed'}`, result.ok ? 'success' : 'error');
+      if (result.ok) refreshLayers();
+    }
+
+    async function deleteLayer() {
+      const id = document.getElementById('layer-select').value;
+      if (!confirm(`Delete layer ${id}?`)) return;
+      const result = await api('DELETE', `/api/layers/${id}`);
+      log(`Delete layer: ${result.ok ? 'success' : 'failed'}`, result.ok ? 'success' : 'error');
+      if (result.ok) {
+        document.getElementById('layer-properties').style.display = 'none';
+        refreshLayers();
+      }
+    }
+
+    // Environment
+    async function updateEnvironment() {
+      const result = await api('PUT', '/api/environment', {
+        width: parseInt(document.getElementById('env-width').value),
+        height: parseInt(document.getElementById('env-height').value),
+        target_fps: parseInt(document.getElementById('env-fps').value),
+      });
+      log(`Update environment: ${result.ok ? 'success' : 'failed'}`, result.ok ? 'success' : 'error');
+    }
+
+    // Clips
+    async function setClip() {
+      const layerId = document.getElementById('clip-layer-select').value;
+      const slot = document.getElementById('clip-slot-select').value;
+      const sourceType = document.getElementById('clip-source-type').value;
+      const path = document.getElementById('clip-path').value;
+      const label = document.getElementById('clip-label').value;
+
+      const body = { source_type: sourceType };
+      if (sourceType === 'file') body.path = path;
+      else body.source_id = path;
+      if (label) body.label = label;
+
+      const result = await api('PUT', `/api/layers/${layerId}/clips/${slot}`, body);
+      log(`Set clip: ${result.ok ? 'success' : 'failed'}`, result.ok ? 'success' : 'error');
+      if (result.ok) refreshLayers();
+    }
+
+    async function triggerClip() {
+      const layerId = document.getElementById('clip-layer-select').value;
+      const slot = document.getElementById('clip-slot-select').value;
+      await triggerClipSlot(layerId, slot);
+    }
+
+    async function triggerClipSlot(layerId, slot) {
+      const result = await api('POST', `/api/layers/${layerId}/clips/${slot}/trigger`);
+      log(`Trigger clip ${layerId}:${slot}: ${result.ok ? 'success' : 'failed'}`, result.ok ? 'success' : 'error');
+      if (result.ok) refreshLayers();
+    }
+
+    async function clearClip() {
+      const layerId = document.getElementById('clip-layer-select').value;
+      const slot = document.getElementById('clip-slot-select').value;
+      const result = await api('DELETE', `/api/layers/${layerId}/clips/${slot}`);
+      log(`Clear clip: ${result.ok ? 'success' : 'failed'}`, result.ok ? 'success' : 'error');
+      if (result.ok) refreshLayers();
+    }
+
+    async function addColumn() {
+      const result = await api('POST', '/api/clips/columns');
+      log(`Add column: ${result.ok ? 'success' : 'failed'}`, result.ok ? 'success' : 'error');
+      if (result.ok) refreshLayers();
+    }
+
+    async function deleteColumn() {
+      const result = await api('DELETE', '/api/clips/columns');
+      log(`Delete column: ${result.ok ? 'success' : 'failed'}`, result.ok ? 'success' : 'error');
+      if (result.ok) refreshLayers();
+    }
+
+    // Effects
+    async function loadEffectTypes() {
+      const result = await api('GET', '/api/effects/types');
+      const container = document.getElementById('effectTypeList');
+      if (result.ok && result.data.effects.length > 0) {
+        container.innerHTML = result.data.effects.map(e => `
+          <div class="list-item">
+            <div>
+              <div class="name">${e.name}</div>
+              <div class="details">${e.category}</div>
+            </div>
+          </div>
+        `).join('');
+
+        // Update effect type dropdowns
+        const options = result.data.effects.map(e => `<option value="${e.type}">${e.name}</option>`).join('');
+        document.getElementById('env-effect-type').innerHTML = options;
+        document.getElementById('layer-effect-type').innerHTML = options;
+      }
+    }
+
+    async function loadEnvironmentEffects() {
+      const result = await api('GET', '/api/environment/effects');
+      const container = document.getElementById('envEffectList');
+      if (result.ok && result.data.effects && result.data.effects.length > 0) {
+        container.innerHTML = result.data.effects.map(e => `
+          <div class="effect-item">
+            <div class="header">
+              <span>${e.type} <span class="badge ${e.bypassed ? 'inactive' : 'active'}">${e.bypassed ? 'OFF' : 'ON'}</span></span>
+              <button class="small secondary" onclick="removeEnvEffect('${e.id}')">x</button>
+            </div>
+          </div>
+        `).join('');
+      } else {
+        container.innerHTML = '<div class="empty-state">No effects</div>';
+      }
+    }
+
+    async function loadLayerEffects() {
+      const id = selectedLayerId;
+      if (!id) return;
+
+      const result = await api('GET', `/api/layers/${id}/effects`);
+      const container = document.getElementById('layerEffectList');
+      if (result.ok && result.data.effects && result.data.effects.length > 0) {
+        container.innerHTML = result.data.effects.map(e => `
+          <div class="effect-item">
+            <div class="header">
+              <span>${e.type} <span class="badge ${e.bypassed ? 'inactive' : 'active'}">${e.bypassed ? 'OFF' : 'ON'}</span></span>
+              <button class="small secondary" onclick="removeLayerEffect('${e.id}')">x</button>
+            </div>
+          </div>
+        `).join('');
+      } else {
+        container.innerHTML = '<div class="empty-state">No effects</div>';
+      }
+    }
+
+    async function addEnvironmentEffect() {
+      const effectType = document.getElementById('env-effect-type').value;
+      const result = await api('POST', '/api/environment/effects', { type: effectType });
+      log(`Add effect: ${result.ok ? 'success' : 'failed'}`, result.ok ? 'success' : 'error');
+      if (result.ok) loadEnvironmentEffects();
+    }
+
+    async function removeEnvEffect(id) {
+      const result = await api('DELETE', `/api/environment/effects/${id}`);
+      if (result.ok) loadEnvironmentEffects();
+    }
+
+    async function addLayerEffect() {
+      const id = selectedLayerId;
+      if (!id) return;
+      const effectType = document.getElementById('layer-effect-type').value;
+      const result = await api('POST', `/api/layers/${id}/effects`, { type: effectType });
+      log(`Add layer effect: ${result.ok ? 'success' : 'failed'}`, result.ok ? 'success' : 'error');
+      if (result.ok) loadLayerEffects();
+    }
+
+    async function removeLayerEffect(effectId) {
+      const id = selectedLayerId;
+      if (!id) return;
+      const result = await api('DELETE', `/api/layers/${id}/effects/${effectId}`);
+      if (result.ok) loadLayerEffects();
+    }
+
+    // Streaming
+    async function startOmt() {
+      const result = await api('POST', '/api/streaming/omt/start', { name: 'Immersive Server', port: 5000 });
+      log(`Start OMT: ${result.ok ? 'success' : 'failed'}`, result.ok ? 'success' : 'error');
+    }
+
+    async function stopOmt() {
+      const result = await api('POST', '/api/streaming/omt/stop');
+      log(`Stop OMT: ${result.ok ? 'success' : 'failed'}`, result.ok ? 'success' : 'error');
+    }
+
+    async function startNdi() {
+      const result = await api('POST', '/api/streaming/ndi/start', { name: 'Immersive Server' });
+      log(`Start NDI: ${result.ok ? 'success' : 'failed'}`, result.ok ? 'success' : 'error');
+    }
+
+    async function stopNdi() {
+      const result = await api('POST', '/api/streaming/ndi/stop');
+      log(`Stop NDI: ${result.ok ? 'success' : 'failed'}`, result.ok ? 'success' : 'error');
+    }
+
+    async function startTextureShare() {
+      const result = await api('POST', '/api/streaming/texture/start');
+      log(`Start texture share: ${result.ok ? 'success' : 'failed'}`, result.ok ? 'success' : 'error');
+    }
+
+    async function stopTextureShare() {
+      const result = await api('POST', '/api/streaming/texture/stop');
+      log(`Stop texture share: ${result.ok ? 'success' : 'failed'}`, result.ok ? 'success' : 'error');
+    }
+
+    // Sources
+    async function refreshSources() {
+      const result = await api('GET', '/api/sources');
+      if (result.ok && result.data.sources) {
+        const omt = result.data.sources.filter(s => s.source_type === 'omt');
+        const ndi = result.data.sources.filter(s => s.source_type === 'ndi');
+
+        document.getElementById('omtSourceList').innerHTML = omt.length > 0
+          ? omt.map(s => `<div class="list-item"><div class="name">${s.name}</div></div>`).join('')
+          : '<div class="empty-state">No sources</div>';
+
+        document.getElementById('ndiSourceList').innerHTML = ndi.length > 0
+          ? ndi.map(s => `<div class="list-item"><div class="name">${s.name}</div></div>`).join('')
+          : '<div class="empty-state">No sources</div>';
+      }
+    }
+
+    async function startNdiDiscovery() {
+      const result = await api('POST', '/api/sources/ndi/start');
+      log(`Start NDI discovery: ${result.ok ? 'success' : 'failed'}`, result.ok ? 'success' : 'error');
+    }
+
+    // Files
+    function showOpenDialog() {
+      const path = prompt('Enter file path to open:');
+      if (path) openFile(path);
+    }
+
+    function showSaveAsDialog() {
+      const path = prompt('Enter file path to save:');
+      if (path) saveFileAs(path);
+    }
+
+    async function openFile(path) {
+      const result = await api('POST', '/api/files/open', { path });
+      log(`Open file: ${result.ok ? 'success' : 'failed'}`, result.ok ? 'success' : 'error');
+      if (result.ok) refreshAll();
+    }
+
+    async function saveFile() {
+      const result = await api('POST', '/api/files/save');
+      log(`Save file: ${result.ok ? 'success' : 'failed'}`, result.ok ? 'success' : 'error');
+    }
+
+    async function saveFileAs(path) {
+      const result = await api('POST', '/api/files/save-as', { path });
+      log(`Save file as: ${result.ok ? 'success' : 'failed'}`, result.ok ? 'success' : 'error');
+    }
+
+    // Console
+    async function sendRequest() {
+      const method = document.getElementById('console-method').value;
+      const endpoint = document.getElementById('console-endpoint').value;
+      let body = null;
+      try {
+        const bodyText = document.getElementById('console-body').value;
+        if (bodyText && method !== 'GET') {
+          body = JSON.parse(bodyText);
+        }
+      } catch (e) {
+        log('Invalid JSON body', 'error');
+        return;
+      }
+
+      const result = await api(method, endpoint, body);
+      if (result.ok) {
+        log(`${method} ${endpoint} -> ${JSON.stringify(result.data)}`, 'success');
+      } else {
+        log(`${method} ${endpoint} -> ERROR: ${result.error || JSON.stringify(result.data)}`, 'error');
+      }
+    }
+
+    // Make floating panels draggable
+    document.querySelectorAll('.floating-panel-header').forEach(header => {
+      let isDragging = false;
+      let startX, startY, startLeft, startTop;
+
+      header.addEventListener('mousedown', (e) => {
+        if (e.target.classList.contains('floating-panel-close')) return;
+        isDragging = true;
+        const panel = header.parentElement;
+        startX = e.clientX;
+        startY = e.clientY;
+        startLeft = panel.offsetLeft;
+        startTop = panel.offsetTop;
+      });
+
+      document.addEventListener('mousemove', (e) => {
+        if (!isDragging) return;
+        const panel = header.parentElement;
+        panel.style.left = (startLeft + e.clientX - startX) + 'px';
+        panel.style.top = (startTop + e.clientY - startY) + 'px';
+      });
+
+      document.addEventListener('mouseup', () => {
+        isDragging = false;
+      });
+    });
+
+    // Auto-connect on load
+    showConnectionModal();
+  </script>
+</body>
+</html>

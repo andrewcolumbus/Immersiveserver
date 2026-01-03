@@ -10,6 +10,7 @@ use std::path::PathBuf;
 
 use crate::compositor::Layer;
 use crate::effects::EffectStack;
+use crate::previs::PrevisSettings;
 
 /// Thumbnail display mode for clip grid cells
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -104,6 +105,14 @@ pub struct EnvironmentSettings {
     #[serde(rename = "textureShareEnabled", default)]
     pub texture_share_enabled: bool,
 
+    /// Whether the REST API server is enabled
+    #[serde(rename = "apiServerEnabled", default = "default_api_enabled")]
+    pub api_server_enabled: bool,
+
+    /// REST API server port (default 8080)
+    #[serde(rename = "apiPort", default = "default_api_port")]
+    pub api_port: u16,
+
     /// Thumbnail display mode (Fit or Fill)
     #[serde(rename = "thumbnailMode", default)]
     pub thumbnail_mode: ThumbnailMode,
@@ -111,6 +120,10 @@ pub struct EnvironmentSettings {
     /// Master effect stack (applied to entire composition)
     #[serde(rename = "effects", default)]
     pub effects: EffectStack,
+
+    /// 3D previsualization settings
+    #[serde(rename = "previsSettings", default)]
+    pub previs_settings: PrevisSettings,
 }
 
 /// Default OMT capture FPS
@@ -126,6 +139,16 @@ fn default_ndi_capture_fps() -> u32 {
 /// Default number of clip columns
 fn default_clip_columns() -> usize {
     8
+}
+
+/// Default API server enabled state
+fn default_api_enabled() -> bool {
+    true
+}
+
+/// Default API server port
+fn default_api_port() -> u16 {
+    8080
 }
 
 impl Default for EnvironmentSettings {
@@ -144,8 +167,11 @@ impl Default for EnvironmentSettings {
             ndi_broadcast_enabled: false,
             ndi_capture_fps: default_ndi_capture_fps(),
             texture_share_enabled: false,
+            api_server_enabled: default_api_enabled(),
+            api_port: default_api_port(),
             thumbnail_mode: ThumbnailMode::default(),
             effects: EffectStack::new(),
+            previs_settings: PrevisSettings::default(),
         }
     }
 }
@@ -280,7 +306,7 @@ impl AppPreferences {
     pub fn set_last_opened(&mut self, path: &PathBuf) {
         self.last_opened_file = Some(path.to_string_lossy().to_string());
         if let Err(e) = self.save() {
-            log::warn!("Failed to save preferences: {:?}", e);
+            tracing::warn!("Failed to save preferences: {:?}", e);
         }
     }
 
@@ -293,7 +319,7 @@ impl AppPreferences {
     pub fn set_converter_output_dir(&mut self, path: &PathBuf) {
         self.converter_output_dir = Some(path.to_string_lossy().to_string());
         if let Err(e) = self.save() {
-            log::warn!("Failed to save preferences: {:?}", e);
+            tracing::warn!("Failed to save preferences: {:?}", e);
         }
     }
     

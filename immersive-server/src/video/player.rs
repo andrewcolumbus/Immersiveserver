@@ -93,7 +93,7 @@ impl VideoPlayer {
             is_hap,
         };
         
-        log::info!(
+        tracing::info!(
             "VideoPlayer: {}x{} @ {:.2}fps, duration: {:.2}s, gpu_native: {}, codec: {}",
             info.width, info.height, info.frame_rate, info.duration, is_gpu_native, codec_name
         );
@@ -121,7 +121,7 @@ impl VideoPlayer {
         let mut decoder = match VideoDecoder::open(&path) {
             Ok(d) => d,
             Err(e) => {
-                log::error!("Failed to open video in decode thread: {}", e);
+                tracing::error!("Failed to open video in decode thread: {}", e);
                 return;
             }
         };
@@ -141,11 +141,11 @@ impl VideoPlayer {
             // Check for restart request
             if state.restart_requested.swap(false, Ordering::AcqRel) {
                 if let Err(e) = decoder.reset() {
-                    log::warn!("Failed to reset decoder: {}", e);
+                    tracing::warn!("Failed to reset decoder: {}", e);
                 }
                 next_frame_time = Instant::now();
                 state.frame_index.store(0, Ordering::Release);
-                log::debug!("VideoPlayer: restarted");
+                tracing::debug!("VideoPlayer: restarted");
             }
 
             // Check if paused
@@ -182,14 +182,14 @@ impl VideoPlayer {
                 Ok(None) => {
                     // End of video - loop
                     if let Err(e) = decoder.reset() {
-                        log::warn!("Failed to reset decoder for loop: {}", e);
+                        tracing::warn!("Failed to reset decoder for loop: {}", e);
                     }
                     next_frame_time = Instant::now();
                     state.frame_index.store(0, Ordering::Release);
-                    log::debug!("VideoPlayer: looping");
+                    tracing::debug!("VideoPlayer: looping");
                 }
                 Err(e) => {
-                    log::error!("Decode error: {}", e);
+                    tracing::error!("Decode error: {}", e);
                 }
             }
 
@@ -203,7 +203,7 @@ impl VideoPlayer {
             }
         }
 
-        log::debug!("VideoPlayer decode thread stopped");
+        tracing::debug!("VideoPlayer decode thread stopped");
     }
     
     /// Take the latest decoded frame if available (non-blocking)
@@ -227,19 +227,19 @@ impl VideoPlayer {
     /// Pause playback
     pub fn pause(&self) {
         self.state.paused.store(true, Ordering::Release);
-        log::info!("VideoPlayer: paused");
+        tracing::info!("VideoPlayer: paused");
     }
     
     /// Resume playback
     pub fn resume(&self) {
         self.state.paused.store(false, Ordering::Release);
-        log::info!("VideoPlayer: resumed");
+        tracing::info!("VideoPlayer: resumed");
     }
     
     /// Toggle pause state
     pub fn toggle_pause(&self) {
         let was_paused = self.state.paused.fetch_xor(true, Ordering::AcqRel);
-        log::info!("VideoPlayer: {}", if was_paused { "resumed" } else { "paused" });
+        tracing::info!("VideoPlayer: {}", if was_paused { "resumed" } else { "paused" });
     }
     
     /// Check if paused
@@ -314,7 +314,7 @@ impl Drop for VideoPlayer {
         // Wait for thread to finish
         if let Some(handle) = self.thread_handle.take() {
             if let Err(e) = handle.join() {
-                log::warn!("Failed to join decode thread: {:?}", e);
+                tracing::warn!("Failed to join decode thread: {:?}", e);
             }
         }
     }

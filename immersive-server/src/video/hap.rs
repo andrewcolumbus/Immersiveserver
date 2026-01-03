@@ -221,7 +221,7 @@ impl HapDecoder {
         let width = decoder.width();
         let height = decoder.height();
 
-        log::info!(
+        tracing::info!(
             "Opened HAP video: {}x{} @ {:.2}fps, duration: {:.2}s, format: {:?}",
             width,
             height,

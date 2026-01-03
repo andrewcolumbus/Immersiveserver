@@ -9,6 +9,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use immersive_server::settings::{AppPreferences, EnvironmentSettings};
+use immersive_server::ui::{activate_macos_app, focus_window_on_click, is_native_menu_supported, NativeMenu, NativeMenuEvent, WindowRegistry};
 use immersive_server::App;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -216,6 +217,12 @@ enum AppState {
         preferences: AppPreferences,
         /// Async file dialogs manager
         file_dialogs: AsyncFileDialogs,
+        /// Native OS menu (macOS/Windows only)
+        native_menu: Option<NativeMenu>,
+        /// Whether we've activated the app (macOS focus fix)
+        has_activated: bool,
+        /// Registry for tracking all windows (main + panel windows)
+        window_registry: WindowRegistry,
     },
 }
 
@@ -249,11 +256,11 @@ impl ImmersiveApp {
         
         match app.settings.save_to_file(path) {
             Ok(_) => {
-                log::info!("Saved settings to: {}", path.display());
+                tracing::info!("Saved settings to: {}", path.display());
                 true
             }
             Err(e) => {
-                log::error!("Failed to save settings: {}", e);
+                tracing::error!("Failed to save settings: {}", e);
                 false
             }
         }
@@ -269,7 +276,7 @@ impl ApplicationHandler for ImmersiveApp {
             initial_file,
         } = &self.state
         {
-            log::info!("Creating window...");
+            tracing::info!("Creating window...");
 
             let settings = initial_settings.clone();
             let file = initial_file.clone();
@@ -289,14 +296,17 @@ impl ApplicationHandler for ImmersiveApp {
                     .expect("Failed to create window"),
             );
 
-            log::info!(
+            // Explicitly request focus on the window
+            window.focus_window();
+
+            tracing::info!(
                 "Window created: {}x{}",
                 window.inner_size().width,
                 window.inner_size().height
             );
 
             // Initialize wgpu and egui
-            log::info!("Initializing wgpu and egui...");
+            tracing::info!("Initializing wgpu and egui...");
             let mut app = pollster::block_on(App::new(window.clone(), settings));
 
             // Set current file if we loaded from one
@@ -310,19 +320,49 @@ impl ApplicationHandler for ImmersiveApp {
             // Sync OMT broadcast state from settings
             app.sync_omt_broadcast_from_settings();
 
+            // Start API server if enabled
+            if app.settings.api_server_enabled {
+                app.start_api_server();
+            }
+
             let preferences = AppPreferences::load();
-            
+
             // Refresh OMT source list for UI
             app.refresh_omt_sources();
 
-            log::info!("Immersive Server ready!");
-            log::info!("Press ESC to exit, F11 for fullscreen");
+            // Initialize native menu on supported platforms
+            let native_menu = if is_native_menu_supported() {
+                tracing::info!("Initializing native OS menu bar");
+                let menu = NativeMenu::new();
+                // On Windows, attach menu to window
+                menu.attach_to_window(&window);
+                // Sync initial show_fps state
+                menu.update_show_fps(app.settings.show_fps);
+                // Tell app to skip egui menu bar rendering
+                app.use_native_menu = true;
+                Some(menu)
+            } else {
+                None
+            };
+
+            tracing::info!("Immersive Server ready!");
+            tracing::info!("Press ESC to exit, F11 for fullscreen");
+
+            // Initialize window registry and register the main window
+            let window_registry = WindowRegistry::new();
+            // Note: We don't use the registry's egui state for the main window
+            // because App manages its own egui context. This registration is for
+            // consistent window tracking when panel windows are added later.
+            // For now, just track that we have a main window.
 
             self.state = AppState::Running {
                 window,
                 app,
                 preferences,
                 file_dialogs: AsyncFileDialogs::new(),
+                native_menu,
+                has_activated: false,
+                window_registry,
             };
         }
     }
@@ -330,7 +370,7 @@ impl ApplicationHandler for ImmersiveApp {
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
-        _window_id: WindowId,
+        window_id: WindowId,
         event: WindowEvent,
     ) {
         // Only handle events if we're running
@@ -339,10 +379,30 @@ impl ApplicationHandler for ImmersiveApp {
             app,
             preferences,
             file_dialogs,
+            native_menu,
+            has_activated,
+            window_registry,
         } = &mut self.state
         else {
             return;
         };
+
+        // Check if this is the main window or a panel window
+        let is_main_window = window.id() == window_id;
+
+        // For now, only handle events for the main window
+        // Panel window event handling will be added in Phase E
+        if !is_main_window {
+            // Future: Route to panel window handler
+            // For now, handle basic panel window events
+            if let WindowEvent::CloseRequested = event {
+                // Panel window closed - mark for cleanup
+                // In Phase E, this will trigger re-docking
+                window_registry.mark_closed(window_id);
+                tracing::info!("Panel window closed");
+            }
+            return;
+        }
 
         // Let egui handle the event first
         let egui_consumed = app.handle_window_event(&event);
@@ -350,7 +410,7 @@ impl ApplicationHandler for ImmersiveApp {
         match event {
             // Handle close request
             WindowEvent::CloseRequested => {
-                log::info!("Close requested, exiting...");
+                tracing::info!("Close requested, exiting...");
                 event_loop.exit();
             }
 
@@ -386,7 +446,7 @@ impl ApplicationHandler for ImmersiveApp {
                 match key_code {
                     // Escape to exit
                     KeyCode::Escape => {
-                        log::info!("Escape pressed, exiting...");
+                        tracing::info!("Escape pressed, exiting...");
                         event_loop.exit();
                     }
                     // F11 to toggle fullscreen
@@ -394,12 +454,12 @@ impl ApplicationHandler for ImmersiveApp {
                         let fullscreen = window.fullscreen();
                         if fullscreen.is_some() {
                             window.set_fullscreen(None);
-                            log::info!("Exiting fullscreen");
+                            tracing::info!("Exiting fullscreen");
                         } else {
                             window.set_fullscreen(Some(
                                 winit::window::Fullscreen::Borderless(None),
                             ));
-                            log::info!("Entering fullscreen");
+                            tracing::info!("Entering fullscreen");
                         }
                     }
                     // Space to pause/resume video
@@ -433,6 +493,11 @@ impl ApplicationHandler for ImmersiveApp {
             // Handle window resize
             WindowEvent::Resized(physical_size) => {
                 app.resize(physical_size);
+            }
+
+            // On macOS, ensure window gets focus when clicked (always, even if egui consumes)
+            WindowEvent::MouseInput { state: ElementState::Pressed, .. } => {
+                focus_window_on_click(&window);
             }
 
             // Handle mouse button events (for viewport panning)
@@ -469,6 +534,39 @@ impl ApplicationHandler for ImmersiveApp {
 
             // Handle redraw request
             WindowEvent::RedrawRequested => {
+                // On first frame, activate the app to steal focus from terminal (macOS)
+                if !*has_activated {
+                    *has_activated = true;
+                    activate_macos_app();
+                    focus_window_on_click(window);
+                }
+
+                // Poll native menu events (macOS/Windows)
+                if let Some(menu) = native_menu {
+                    loop {
+                        match menu.poll_events() {
+                            NativeMenuEvent::FileAction(action) => {
+                                app.menu_bar.pending_action = Some(action);
+                            }
+                            NativeMenuEvent::MenuAction(action) => {
+                                app.menu_bar.pending_menu_action = Some(action);
+                            }
+                            NativeMenuEvent::ShowFpsToggled(show) => {
+                                app.settings.show_fps = show;
+                            }
+                            NativeMenuEvent::OpenPreferences => {
+                                app.preferences_window.open = true;
+                            }
+                            NativeMenuEvent::Exit => {
+                                tracing::info!("Exit requested via menu");
+                                event_loop.exit();
+                                return;
+                            }
+                            NativeMenuEvent::None => break,
+                        }
+                    }
+                }
+
                 // Check for pending file actions - spawn async dialogs
                 if let Some(action) = app.menu_bar.take_pending_action() {
                     use immersive_server::ui::menu_bar::FileAction;
@@ -524,10 +622,10 @@ impl ApplicationHandler for ImmersiveApp {
                                                 .map(|s| s.to_string_lossy().to_string())
                                                 .unwrap_or_default()
                                         ));
-                                        log::info!("Loaded settings from: {}", path.display());
+                                        tracing::info!("Loaded settings from: {}", path.display());
                                     }
                                     Err(e) => {
-                                        log::error!("Failed to load settings: {}", e);
+                                        tracing::error!("Failed to load settings: {}", e);
                                         app.menu_bar.set_status("Failed to open file");
                                     }
                                 }
@@ -573,25 +671,32 @@ impl ApplicationHandler for ImmersiveApp {
                 match app.render() {
                     Ok(settings_changed) => {
                         if settings_changed {
-                            log::debug!("Settings changed");
+                            tracing::debug!("Settings changed");
                             // Redraw pacing reads `app.settings.target_fps` directly (see `about_to_wait`).
                         }
                     }
                     Err(wgpu::SurfaceError::Lost) => {
-                        log::warn!("Surface lost, reconfiguring...");
+                        tracing::warn!("Surface lost, reconfiguring...");
                         app.resize(app.size());
                     }
                     Err(wgpu::SurfaceError::OutOfMemory) => {
-                        log::error!("Out of GPU memory!");
+                        tracing::error!("Out of GPU memory!");
                         event_loop.exit();
                     }
                     Err(e) => {
-                        log::warn!("Surface error: {:?}", e);
+                        tracing::warn!("Surface error: {:?}", e);
                     }
                 }
 
                 // End frame: update stats and apply frame rate limiting
                 app.end_frame();
+
+                // Sync native menu states with app state
+                if let Some(menu) = native_menu {
+                    let panel_states = app.get_panel_states();
+                    menu.update_panel_states(&panel_states);
+                    menu.update_show_fps(app.settings.show_fps);
+                }
             }
 
             _ => {}
@@ -602,51 +707,84 @@ impl ApplicationHandler for ImmersiveApp {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        let AppState::Running { window, app, .. } = &mut self.state else {
+        let AppState::Running { window, app, window_registry, .. } = &mut self.state else {
             event_loop.set_control_flow(ControlFlow::Wait);
             return;
         };
 
-        // Drive redraws at a stable cadence (target_fps) instead of continuous polling.
+        // Clean up any closed panel windows
+        let closed_windows = window_registry.cleanup_closed_windows();
+        for closed in closed_windows {
+            if let Some(panel_id) = closed.panel_id() {
+                tracing::info!("Cleaned up panel window: {}", panel_id);
+                // Future: Trigger re-docking logic here
+            }
+        }
+
         let target_fps = app.settings.target_fps.max(1);
         if target_fps != self.last_target_fps {
             self.last_target_fps = target_fps;
             self.next_redraw_at = Instant::now();
         }
 
-        let frame_duration = Duration::from_secs_f64(1.0 / target_fps as f64);
+        // Integer nanoseconds to eliminate floating-point drift
+        let frame_nanos = 1_000_000_000u64 / target_fps as u64;
+        let frame_duration = Duration::from_nanos(frame_nanos);
+
         let now = Instant::now();
 
-        if now >= self.next_redraw_at {
-            window.request_redraw();
-
-            // Advance based on the expected schedule (prevents drift).
-            self.next_redraw_at += frame_duration;
-
-            // If we fell behind (e.g., system was busy), reset to avoid "catch-up spirals".
-            if self.next_redraw_at < now {
-                self.next_redraw_at = now + frame_duration;
+        // Check if we're within 2ms of target - if so, spin-wait for precision
+        let spin_threshold = Duration::from_micros(2000);
+        if now < self.next_redraw_at {
+            if self.next_redraw_at.duration_since(now) <= spin_threshold {
+                // Spin-wait the final microseconds
+                while Instant::now() < self.next_redraw_at {
+                    std::hint::spin_loop();
+                }
+            } else {
+                // Still waiting - wake 1ms early next time
+                let wake_at = self.next_redraw_at
+                    .checked_sub(Duration::from_micros(1000))
+                    .unwrap_or(self.next_redraw_at);
+                event_loop.set_control_flow(ControlFlow::WaitUntil(wake_at));
+                return;
             }
         }
 
-        event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_redraw_at));
+        // Time to render
+        window.request_redraw();
+        self.next_redraw_at += frame_duration;
+
+        // Reset if more than 2 frames behind
+        if Instant::now() > self.next_redraw_at + frame_duration * 2 {
+            self.next_redraw_at = Instant::now() + frame_duration;
+        }
+
+        // Schedule next wake 1ms early
+        let wake_at = self.next_redraw_at
+            .checked_sub(Duration::from_micros(1000))
+            .unwrap_or(self.next_redraw_at);
+        event_loop.set_control_flow(ControlFlow::WaitUntil(wake_at));
     }
 }
 
 fn main() {
-    // Initialize logging
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // Initialize logging with tracing
+    use immersive_server::telemetry::{init_logging, LogConfig};
+    if let Err(e) = init_logging(&LogConfig::default()) {
+        eprintln!("Failed to initialize logging: {}", e);
+    }
 
-    log::info!("🎬 Immersive Server v0.1.0");
+    tracing::info!("Immersive Server v0.1.0");
 
     // Load preferences and check for last opened file
     let preferences = AppPreferences::load();
     let (settings, initial_file) = if let Some(last_file) = preferences.get_last_opened() {
-        log::info!("Loading last opened file: {}", last_file.display());
+        tracing::info!("Loading last opened file: {}", last_file.display());
         match EnvironmentSettings::load_from_file(&last_file) {
             Ok(settings) => (settings, Some(last_file)),
             Err(e) => {
-                log::warn!("Failed to load last file: {}", e);
+                tracing::warn!("Failed to load last file: {}", e);
                 (EnvironmentSettings::default(), None)
             }
         }
@@ -654,10 +792,22 @@ fn main() {
         (EnvironmentSettings::default(), None)
     };
 
-    log::info!("Target FPS: {}", settings.target_fps);
+    tracing::info!("Target FPS: {}", settings.target_fps);
 
     // Create event loop
+    #[cfg(target_os = "macos")]
+    let event_loop = {
+        use winit::platform::macos::EventLoopBuilderExtMacOS;
+        let mut builder = EventLoop::builder();
+        // Disable winit's default macOS menu so muda can take over
+        builder.with_default_menu(false);
+        // Ensure the app activates and takes focus
+        builder.with_activate_ignoring_other_apps(true);
+        builder.build().expect("Failed to create event loop")
+    };
+    #[cfg(not(target_os = "macos"))]
     let event_loop = EventLoop::new().expect("Failed to create event loop");
+
     // Default to sleeping; we explicitly schedule redraws in `about_to_wait`.
     event_loop.set_control_flow(ControlFlow::Wait);
 

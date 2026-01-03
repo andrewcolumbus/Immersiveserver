@@ -574,7 +574,7 @@ try! pngData.write(to: URL(fileURLWithPath: outputPath))
             .ok()?;
 
         if !output.status.success() {
-            log::warn!("Failed to generate emoji texture: {:?}", String::from_utf8_lossy(&output.stderr));
+            tracing::warn!("Failed to generate emoji texture: {:?}", String::from_utf8_lossy(&output.stderr));
             return None;
         }
 
@@ -700,9 +700,9 @@ try! pngData.write(to: URL(fileURLWithPath: outputPath))
                     self.image_texture_view = view;
                     self.current_custom_path = custom_path.to_string();
                     self.current_emoji_index = -1; // Mark as custom
-                    log::info!("Loaded custom image: {}", custom_path);
+                    tracing::info!("Loaded custom image: {}", custom_path);
                 } else {
-                    log::warn!("Failed to load custom image: {}", custom_path);
+                    tracing::warn!("Failed to load custom image: {}", custom_path);
                 }
             }
         } else if !self.current_custom_path.is_empty() {

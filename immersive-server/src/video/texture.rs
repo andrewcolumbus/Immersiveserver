@@ -226,7 +226,7 @@ impl VideoTexture {
         self.width = width;
         self.height = height;
 
-        log::debug!("Resized video texture to {}x{}", width, height);
+        tracing::debug!("Resized video texture to {}x{}", width, height);
     }
     
     /// Change the texture format (recreates texture)
@@ -244,7 +244,7 @@ impl VideoTexture {
         self.format = format;
         self.is_gpu_native = is_gpu_native;
         
-        log::debug!("Changed video texture format to {:?}", format);
+        tracing::debug!("Changed video texture format to {:?}", format);
     }
 
     /// Get the texture view

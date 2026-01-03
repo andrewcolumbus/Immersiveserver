@@ -67,7 +67,7 @@ impl ShaderWatcher {
 
         // Watch the shaders directory
         let shaders_path = shaders_dir();
-        log::info!("🔄 Shader hot-reload enabled, watching: {}", shaders_path.display());
+        tracing::info!("🔄 Shader hot-reload enabled, watching: {}", shaders_path.display());
         watcher.watch(&shaders_path, RecursiveMode::NonRecursive)?;
 
         Ok(Self {
@@ -97,11 +97,11 @@ impl ShaderWatcher {
                     }
                 }
                 Ok(Err(e)) => {
-                    log::warn!("Shader watcher error: {:?}", e);
+                    tracing::warn!("Shader watcher error: {:?}", e);
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                    log::error!("Shader watcher channel disconnected");
+                    tracing::error!("Shader watcher channel disconnected");
                     break;
                 }
             }
@@ -111,7 +111,7 @@ impl ShaderWatcher {
         if let (Some(last), Some(path)) = (self.last_change, self.pending_path.take()) {
             if last.elapsed() >= self.debounce_duration {
                 self.last_change = None;
-                log::info!("🔄 Shader changed: {}", path.display());
+                tracing::info!("🔄 Shader changed: {}", path.display());
                 return Some(path);
             } else {
                 // Put it back, not ready yet

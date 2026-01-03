@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::compositor::layer::Transform2D;
 use crate::effects::EffectStack;
 
 /// Default number of clip slots per layer
@@ -288,6 +289,10 @@ pub struct ClipCell {
     /// Effect stack for this clip
     #[serde(default)]
     pub effects: EffectStack,
+
+    /// Transform for this clip (applied before layer transform)
+    #[serde(default)]
+    pub transform: Transform2D,
 }
 
 /// Helper struct for deserializing ClipCell with backwards compatibility
@@ -301,6 +306,8 @@ struct ClipCellRaw {
     label: Option<String>,
     #[serde(default)]
     effects: EffectStack,
+    #[serde(default)]
+    transform: Transform2D,
 }
 
 impl<'de> Deserialize<'de> for ClipCell {
@@ -337,6 +344,7 @@ impl<'de> Deserialize<'de> for ClipCell {
             source_path: raw.source_path,
             label: raw.label,
             effects: raw.effects,
+            transform: raw.transform,
         })
     }
 }
@@ -361,6 +369,7 @@ impl ClipCell {
             source_path: path,
             label: None,
             effects: EffectStack::new(),
+            transform: Transform2D::default(),
         }
     }
 
@@ -372,6 +381,7 @@ impl ClipCell {
             source_path: path,
             label: Some(label.into()),
             effects: EffectStack::new(),
+            transform: Transform2D::default(),
         }
     }
 
@@ -386,6 +396,7 @@ impl ClipCell {
             source_path: PathBuf::new(), // Empty for OMT sources
             label: Some(name_str),
             effects: EffectStack::new(),
+            transform: Transform2D::default(),
         }
     }
 
@@ -408,6 +419,7 @@ impl ClipCell {
             source_path: PathBuf::new(), // Empty for NDI sources
             label: Some(display_name),
             effects: EffectStack::new(),
+            transform: Transform2D::default(),
         }
     }
 

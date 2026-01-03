@@ -300,7 +300,7 @@ impl EffectStackRuntime {
         }
     }
 
-    /// Process the effect stack
+    /// Process the effect stack (without automation)
     ///
     /// # Arguments
     /// * `encoder` - Command encoder
@@ -318,6 +318,48 @@ impl EffectStackRuntime {
         output: &wgpu::TextureView,
         stack: &EffectStack,
         base_params: &EffectParams,
+    ) {
+        self.process_internal(encoder, queue, device, input, output, stack, base_params, None, None)
+    }
+
+    /// Process the effect stack with automation support
+    ///
+    /// # Arguments
+    /// * `encoder` - Command encoder
+    /// * `queue` - GPU queue
+    /// * `input` - Input texture view
+    /// * `output` - Output texture view
+    /// * `stack` - Effect stack definition
+    /// * `params` - Base effect parameters (timing, beat)
+    /// * `clock` - BPM clock for LFO/Beat automation
+    /// * `audio_manager` - Audio manager for FFT automation
+    pub fn process_with_automation(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        queue: &wgpu::Queue,
+        device: &wgpu::Device,
+        input: &wgpu::TextureView,
+        output: &wgpu::TextureView,
+        stack: &EffectStack,
+        base_params: &EffectParams,
+        clock: &super::automation::BpmClock,
+        audio_manager: Option<&crate::audio::AudioManager>,
+    ) {
+        self.process_internal(encoder, queue, device, input, output, stack, base_params, Some(clock), audio_manager)
+    }
+
+    /// Internal process implementation
+    fn process_internal(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        queue: &wgpu::Queue,
+        device: &wgpu::Device,
+        input: &wgpu::TextureView,
+        output: &wgpu::TextureView,
+        stack: &EffectStack,
+        base_params: &EffectParams,
+        clock: Option<&super::automation::BpmClock>,
+        audio_manager: Option<&crate::audio::AudioManager>,
     ) {
         // Get active effects (not bypassed, respecting solo)
         let active_effects: Vec<&EffectInstance> = stack.active_effects().collect();
@@ -354,9 +396,13 @@ impl EffectStackRuntime {
                 pool.get_views(i)
             };
 
-            // Build params for this effect
+            // Build params for this effect, with automation if available
             let mut params = *base_params;
-            params.pack_parameters(&effect.parameters);
+            if let Some(clk) = clock {
+                params.pack_parameters_with_automation(&effect.parameters, clk, audio_manager);
+            } else {
+                params.pack_parameters(&effect.parameters);
+            }
 
             // Process through runtime
             if let Some(entry) = self.effect_runtimes.get_mut(&effect.id) {

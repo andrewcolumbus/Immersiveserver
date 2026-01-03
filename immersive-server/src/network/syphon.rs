@@ -60,9 +60,9 @@ impl SyphonSharer {
     /// A new SyphonSharer instance.
     pub fn new() -> Self {
         if is_syphon_available() {
-            log::info!("Syphon: Framework available");
+            tracing::info!("Syphon: Framework available");
         } else {
-            log::warn!("Syphon: Framework not available - texture sharing disabled");
+            tracing::warn!("Syphon: Framework not available - texture sharing disabled");
         }
 
         Self {
@@ -208,7 +208,7 @@ impl TextureSharer for SyphonSharer {
         self.name = name.to_string();
         self.server = Some(server);
 
-        log::info!(
+        tracing::info!(
             "Syphon: Started sharing as '{}' ({}x{})",
             name,
             self.width,
@@ -242,7 +242,7 @@ impl TextureSharer for SyphonSharer {
     fn stop(&mut self) {
         if let Some(server) = self.server.take() {
             server.stop();
-            log::info!("Syphon: Stopped sharing");
+            tracing::info!("Syphon: Stopped sharing");
         }
         self.name.clear();
     }
