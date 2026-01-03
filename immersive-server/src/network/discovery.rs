@@ -1,9 +1,15 @@
 //! Network source discovery for OMT and NDI streams.
 //!
-//! Uses libOMT's built-in discovery for finding OMT sources on the network.
+//! Uses libOMT's built-in discovery for finding OMT sources,
+//! and NDI SDK's finder for discovering NDI sources on the network.
 
+use super::ndi_ffi::{
+    NDIlib_find_create_t, NDIlib_find_create_v2, NDIlib_find_destroy,
+    NDIlib_find_get_current_sources, NDIlib_find_instance_t,
+};
 use super::omt_ffi::get_discovered_sources;
 use std::collections::HashMap;
+use std::ffi::CStr;
 use std::sync::{Arc, RwLock};
 
 /// Type of discovered source.
@@ -80,13 +86,17 @@ impl std::error::Error for DiscoveryError {}
 
 /// Manages discovery of network video sources.
 ///
-/// Uses libOMT's built-in discovery which returns sources in format:
-/// "HOSTNAME (NAME)" e.g. "MACBOOKPRO.LOCAL (OBS Output)"
+/// Uses libOMT's built-in discovery and NDI SDK's finder.
+/// Both return sources in format: "HOSTNAME (NAME)" e.g. "MACBOOKPRO.LOCAL (OBS Output)"
 pub struct SourceDiscovery {
     /// Currently discovered sources (cached)
     sources: Arc<RwLock<HashMap<String, DiscoveredSource>>>,
     /// Is discovery active?
     running: bool,
+    /// NDI finder instance (if NDI discovery is enabled)
+    ndi_finder: Option<NDIlib_find_instance_t>,
+    /// Is NDI discovery enabled?
+    ndi_enabled: bool,
 }
 
 impl SourceDiscovery {
@@ -95,6 +105,8 @@ impl SourceDiscovery {
         Ok(Self {
             sources: Arc::new(RwLock::new(HashMap::new())),
             running: false,
+            ndi_finder: None,
+            ndi_enabled: false,
         })
     }
 
@@ -116,50 +128,166 @@ impl SourceDiscovery {
         Ok(())
     }
 
-    /// Refresh the list of discovered sources from libOMT.
+    /// Start NDI source discovery.
+    ///
+    /// Creates an NDI finder instance that will discover NDI sources on the network.
+    /// Sources will be included in refresh() calls.
+    pub fn start_ndi_discovery(&mut self) -> Result<(), DiscoveryError> {
+        if self.ndi_finder.is_some() {
+            return Ok(()); // Already started
+        }
+
+        log::info!("SourceDiscovery: Starting NDI discovery");
+
+        // Create NDI finder with default settings
+        let create_settings = NDIlib_find_create_t::default();
+
+        let finder = unsafe { NDIlib_find_create_v2(&create_settings) };
+        if finder.is_null() {
+            return Err(DiscoveryError(
+                "Failed to create NDI finder".to_string(),
+            ));
+        }
+
+        self.ndi_finder = Some(finder);
+        self.ndi_enabled = true;
+
+        log::info!("SourceDiscovery: NDI finder created successfully");
+        Ok(())
+    }
+
+    /// Stop NDI source discovery.
+    pub fn stop_ndi_discovery(&mut self) {
+        if let Some(finder) = self.ndi_finder.take() {
+            log::info!("SourceDiscovery: Stopping NDI discovery");
+            unsafe { NDIlib_find_destroy(finder) };
+        }
+        self.ndi_enabled = false;
+    }
+
+    /// Check if NDI discovery is enabled.
+    pub fn is_ndi_enabled(&self) -> bool {
+        self.ndi_enabled
+    }
+
+    /// Refresh the list of discovered sources from libOMT and NDI.
     ///
     /// Call this periodically (e.g., every 1-2 seconds) to update the source list.
     pub fn refresh(&mut self) {
-        if !self.running {
+        if !self.running && !self.ndi_enabled {
             return;
         }
 
-        let addresses = get_discovered_sources();
-
         let mut new_sources = HashMap::new();
 
-        for addr in addresses {
-            // libOMT returns format: "HOSTNAME (NAME)"
-            // Parse into host and name
-            let (host, name) = Self::parse_discovery_address(&addr);
+        // Discover OMT sources
+        if self.running {
+            let addresses = get_discovered_sources();
 
-            let source = DiscoveredSource {
-                id: addr.clone(),
-                name,
-                source_type: SourceType::Omt,
-                host,
-                port: 0, // libOMT discovery doesn't include port
-                properties: HashMap::new(),
-            };
+            for addr in addresses {
+                // libOMT returns format: "HOSTNAME (NAME)"
+                // Parse into host and name
+                let (host, name) = Self::parse_discovery_address(&addr);
 
-            // Check if this is a new source
-            let is_new = self.sources
-                .read()
-                .map(|s| !s.contains_key(&addr))
-                .unwrap_or(true);
+                let source = DiscoveredSource {
+                    id: format!("omt:{}", addr),
+                    name,
+                    source_type: SourceType::Omt,
+                    host,
+                    port: 0, // libOMT discovery doesn't include port
+                    properties: HashMap::new(),
+                };
 
-            if is_new {
-                log::info!("SourceDiscovery: Found OMT source '{}'", source.name);
+                // Check if this is a new source
+                let is_new = self
+                    .sources
+                    .read()
+                    .map(|s| !s.contains_key(&source.id))
+                    .unwrap_or(true);
+
+                if is_new {
+                    log::info!("SourceDiscovery: Found OMT source '{}'", source.name);
+                }
+
+                new_sources.insert(source.id.clone(), source);
             }
+        }
 
-            new_sources.insert(addr, source);
+        // Discover NDI sources
+        if let Some(finder) = self.ndi_finder {
+            let mut num_sources: u32 = 0;
+            let sources_ptr =
+                unsafe { NDIlib_find_get_current_sources(finder, &mut num_sources) };
+
+            if !sources_ptr.is_null() && num_sources > 0 {
+                for i in 0..num_sources as usize {
+                    let ndi_source = unsafe { &*sources_ptr.add(i) };
+
+                    // Get NDI name (format: "MACHINE (SOURCE_NAME)")
+                    let ndi_name = if !ndi_source.p_ndi_name.is_null() {
+                        unsafe { CStr::from_ptr(ndi_source.p_ndi_name) }
+                            .to_str()
+                            .unwrap_or("")
+                            .to_string()
+                    } else {
+                        continue;
+                    };
+
+                    // Get URL address (optional)
+                    let url_address = if !ndi_source.p_url_address.is_null() {
+                        Some(
+                            unsafe { CStr::from_ptr(ndi_source.p_url_address) }
+                                .to_str()
+                                .unwrap_or("")
+                                .to_string(),
+                        )
+                    } else {
+                        None
+                    };
+
+                    // Parse the NDI name
+                    let (host, name) = Self::parse_discovery_address(&ndi_name);
+
+                    let source = DiscoveredSource {
+                        id: format!("ndi:{}", ndi_name),
+                        name,
+                        source_type: SourceType::Ndi,
+                        host,
+                        port: 0,
+                        properties: url_address
+                            .map(|url| {
+                                let mut props = HashMap::new();
+                                props.insert("url_address".to_string(), url);
+                                props
+                            })
+                            .unwrap_or_default(),
+                    };
+
+                    // Check if this is a new source
+                    let is_new = self
+                        .sources
+                        .read()
+                        .map(|s| !s.contains_key(&source.id))
+                        .unwrap_or(true);
+
+                    if is_new {
+                        log::info!("SourceDiscovery: Found NDI source '{}'", source.name);
+                    }
+
+                    new_sources.insert(source.id.clone(), source);
+                }
+            }
         }
 
         // Log removed sources
         if let Ok(old_sources) = self.sources.read() {
-            for id in old_sources.keys() {
+            for (id, old_source) in old_sources.iter() {
                 if !new_sources.contains_key(id) {
-                    log::info!("SourceDiscovery: OMT source removed: {}", id);
+                    log::info!(
+                        "SourceDiscovery: {} source removed: {}",
+                        old_source.source_type,
+                        old_source.name
+                    );
                 }
             }
         }
@@ -236,7 +364,16 @@ impl Default for SourceDiscovery {
         Self::new().unwrap_or_else(|_| Self {
             sources: Arc::new(RwLock::new(HashMap::new())),
             running: false,
+            ndi_finder: None,
+            ndi_enabled: false,
         })
+    }
+}
+
+impl Drop for SourceDiscovery {
+    fn drop(&mut self) {
+        // Clean up NDI finder if it exists
+        self.stop_ndi_discovery();
     }
 }
 

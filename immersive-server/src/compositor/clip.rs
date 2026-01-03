@@ -30,8 +30,13 @@ pub enum ClipSource {
         /// Human-readable name of the source
         name: String,
     },
-    // Future: NDI source
-    // Ndi { source_name: String },
+    /// NDI (Network Device Interface) network source
+    Ndi {
+        /// NDI source name (format: "MACHINE (SOURCE)")
+        ndi_name: String,
+        /// Optional URL address for direct connection
+        url_address: Option<String>,
+    },
 }
 
 /// Helper struct for ClipSource serialization (quick-xml compatible)
@@ -45,6 +50,10 @@ struct ClipSourceHelper {
     address: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ndi_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    url_address: Option<String>,
 }
 
 impl Serialize for ClipSource {
@@ -58,12 +67,24 @@ impl Serialize for ClipSource {
                 path: Some(path.clone()),
                 address: None,
                 name: None,
+                ndi_name: None,
+                url_address: None,
             },
             ClipSource::Omt { address, name } => ClipSourceHelper {
                 source_type: "Omt".to_string(),
                 path: None,
                 address: Some(address.clone()),
                 name: Some(name.clone()),
+                ndi_name: None,
+                url_address: None,
+            },
+            ClipSource::Ndi { ndi_name, url_address } => ClipSourceHelper {
+                source_type: "Ndi".to_string(),
+                path: None,
+                address: None,
+                name: None,
+                ndi_name: Some(ndi_name.clone()),
+                url_address: url_address.clone(),
             },
         };
         helper.serialize(serializer)
@@ -83,6 +104,10 @@ impl<'de> Deserialize<'de> for ClipSource {
             "Omt" => Ok(ClipSource::Omt {
                 address: helper.address.unwrap_or_default(),
                 name: helper.name.unwrap_or_default(),
+            }),
+            "Ndi" => Ok(ClipSource::Ndi {
+                ndi_name: helper.ndi_name.unwrap_or_default(),
+                url_address: helper.url_address,
             }),
             _ => Ok(ClipSource::File {
                 path: helper.path.unwrap_or_default(),
@@ -111,6 +136,14 @@ impl ClipSource {
         }
     }
 
+    /// Create an NDI source
+    pub fn ndi(ndi_name: impl Into<String>, url_address: Option<String>) -> Self {
+        ClipSource::Ndi {
+            ndi_name: ndi_name.into(),
+            url_address,
+        }
+    }
+
     /// Check if this is a file source
     pub fn is_file(&self) -> bool {
         matches!(self, ClipSource::File { .. })
@@ -119,6 +152,11 @@ impl ClipSource {
     /// Check if this is an OMT source
     pub fn is_omt(&self) -> bool {
         matches!(self, ClipSource::Omt { .. })
+    }
+
+    /// Check if this is an NDI source
+    pub fn is_ndi(&self) -> bool {
+        matches!(self, ClipSource::Ndi { .. })
     }
 
     /// Get the file path if this is a file source
@@ -138,6 +176,16 @@ impl ClipSource {
                 .unwrap_or("Untitled")
                 .to_string(),
             ClipSource::Omt { name, .. } => name.clone(),
+            ClipSource::Ndi { ndi_name, .. } => {
+                // Parse NDI name format "MACHINE (SOURCE)" to extract SOURCE
+                if let Some(paren_start) = ndi_name.find(" (") {
+                    ndi_name[paren_start + 2..]
+                        .trim_end_matches(')')
+                        .to_string()
+                } else {
+                    ndi_name.clone()
+                }
+            }
         }
     }
 
@@ -146,6 +194,7 @@ impl ClipSource {
         match self {
             ClipSource::File { .. } => "📁",
             ClipSource::Omt { .. } => "📡",
+            ClipSource::Ndi { .. } => "📺",
         }
     }
 }
@@ -340,6 +389,28 @@ impl ClipCell {
         }
     }
 
+    /// Create a new clip cell with an NDI source
+    pub fn from_ndi(ndi_name: impl Into<String>, url_address: Option<String>) -> Self {
+        let ndi_name_str = ndi_name.into();
+        // Parse display name from NDI format "MACHINE (SOURCE)"
+        let display_name = if let Some(paren_start) = ndi_name_str.find(" (") {
+            ndi_name_str[paren_start + 2..]
+                .trim_end_matches(')')
+                .to_string()
+        } else {
+            ndi_name_str.clone()
+        };
+        Self {
+            source: ClipSource::Ndi {
+                ndi_name: ndi_name_str,
+                url_address,
+            },
+            source_path: PathBuf::new(), // Empty for NDI sources
+            label: Some(display_name),
+            effects: EffectStack::new(),
+        }
+    }
+
     /// Get the display name for this cell (label or source name)
     pub fn display_name(&self) -> String {
         if let Some(ref label) = self.label {
@@ -354,6 +425,7 @@ impl ClipCell {
         match &self.source {
             ClipSource::File { path } => !path.as_os_str().is_empty(),
             ClipSource::Omt { address, .. } => !address.is_empty(),
+            ClipSource::Ndi { ndi_name, .. } => !ndi_name.is_empty(),
         }
     }
 
@@ -365,6 +437,11 @@ impl ClipCell {
     /// Check if this is a file source
     pub fn is_file(&self) -> bool {
         self.source.is_file()
+    }
+
+    /// Check if this is an NDI source
+    pub fn is_ndi(&self) -> bool {
+        self.source.is_ndi()
     }
 
     /// Get the type indicator for display
@@ -430,6 +507,27 @@ mod tests {
         assert!(!source.is_file());
         assert_eq!(source.display_name(), "My Stream");
         assert_eq!(source.type_indicator(), "📡");
+    }
+
+    #[test]
+    fn test_clip_source_ndi() {
+        let source = ClipSource::ndi("DESKTOP-ABC (OBS)", None);
+        assert!(source.is_ndi());
+        assert!(!source.is_file());
+        assert!(!source.is_omt());
+        assert_eq!(source.display_name(), "OBS");
+        assert_eq!(source.type_indicator(), "📺");
+    }
+
+    #[test]
+    fn test_clip_cell_ndi() {
+        let cell = ClipCell::from_ndi("MACBOOKPRO (NDI Output)", Some("192.168.1.100:5960".to_string()));
+        assert!(cell.is_ndi());
+        assert!(!cell.is_file());
+        assert!(!cell.is_omt());
+        assert_eq!(cell.display_name(), "NDI Output");
+        assert_eq!(cell.type_indicator(), "📺");
+        assert!(cell.is_valid());
     }
 
 }

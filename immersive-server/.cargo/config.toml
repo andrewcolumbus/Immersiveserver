@@ -1,23 +1,26 @@
 # Cargo configuration for immersive-server
 # FFmpeg 7 paths for macOS (Homebrew)
+# NDI SDK paths for macOS
 
 [env]
 # Point to FFmpeg 7 installation (required for ffmpeg-next crate)
 PKG_CONFIG_PATH = { value = "/opt/homebrew/opt/ffmpeg@7/lib/pkgconfig", force = true }
 FFMPEG_DIR = "/opt/homebrew/opt/ffmpeg@7"
-# libOMT runtime library path
-DYLD_LIBRARY_PATH = "/Users/andrewcolumbus/Documents/Code/Immersiveserver/external_libraries/OpenMediaTransport.Binaries.Release.v1.0.0.13/Libraries/MacOS"
+# libOMT and libndi runtime library paths
+DYLD_LIBRARY_PATH = "/Users/andrewcolumbus/Documents/Code/Immersiveserver/external_libraries/OpenMediaTransport.Binaries.Release.v1.0.0.13/Libraries/MacOS:/Library/NDI SDK for Apple/lib/macOS"
 
 [target.aarch64-apple-darwin]
 rustflags = [
     "-L", "/opt/homebrew/opt/ffmpeg@7/lib",
     "-L", "/Users/andrewcolumbus/Documents/Code/Immersiveserver/external_libraries/OpenMediaTransport.Binaries.Release.v1.0.0.13/Libraries/MacOS",
+    "-L", "/Library/NDI SDK for Apple/lib/macOS",
 ]
 
 [target.x86_64-apple-darwin]
 rustflags = [
     "-L", "/opt/homebrew/opt/ffmpeg@7/lib",
     "-L", "/Users/andrewcolumbus/Documents/Code/Immersiveserver/external_libraries/OpenMediaTransport.Binaries.Release.v1.0.0.13/Libraries/MacOS",
+    "-L", "/Library/NDI SDK for Apple/lib/macOS",
 ]
 
 

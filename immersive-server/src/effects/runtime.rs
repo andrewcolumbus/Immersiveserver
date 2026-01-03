@@ -361,6 +361,8 @@ impl EffectStackRuntime {
             // Process through runtime
             if let Some(entry) = self.effect_runtimes.get_mut(&effect.id) {
                 if let Some(gpu) = &mut entry.gpu {
+                    // Update runtime with non-numeric params (like strings)
+                    gpu.update_from_instance(effect, device, queue);
                     gpu.process(encoder, device, effect_input, effect_output, &params, queue);
                 }
             }

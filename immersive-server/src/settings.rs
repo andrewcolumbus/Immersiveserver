@@ -92,6 +92,14 @@ pub struct EnvironmentSettings {
     #[serde(rename = "omtCaptureFps", default = "default_omt_capture_fps")]
     pub omt_capture_fps: u32,
 
+    /// Whether NDI broadcast is enabled
+    #[serde(rename = "ndiBroadcastEnabled", default)]
+    pub ndi_broadcast_enabled: bool,
+
+    /// NDI capture frame rate (1-60, default 30)
+    #[serde(rename = "ndiCaptureFps", default = "default_ndi_capture_fps")]
+    pub ndi_capture_fps: u32,
+
     /// Whether Syphon (macOS) / Spout (Windows) texture sharing is enabled
     #[serde(rename = "textureShareEnabled", default)]
     pub texture_share_enabled: bool,
@@ -107,6 +115,11 @@ pub struct EnvironmentSettings {
 
 /// Default OMT capture FPS
 fn default_omt_capture_fps() -> u32 {
+    30
+}
+
+/// Default NDI capture FPS
+fn default_ndi_capture_fps() -> u32 {
     30
 }
 
@@ -128,6 +141,8 @@ impl Default for EnvironmentSettings {
             global_clip_count: default_clip_columns(),
             omt_broadcast_enabled: false,
             omt_capture_fps: default_omt_capture_fps(),
+            ndi_broadcast_enabled: false,
+            ndi_capture_fps: default_ndi_capture_fps(),
             texture_share_enabled: false,
             thumbnail_mode: ThumbnailMode::default(),
             effects: EffectStack::new(),

@@ -26,6 +26,8 @@ pub enum ParameterValue {
         index: usize,
         options: Vec<String>,
     },
+    /// String value (for file paths, text, etc.)
+    String(String),
 }
 
 /// Helper struct for ParameterValue serialization (quick-xml compatible)
@@ -49,6 +51,8 @@ struct ParameterValueHelper {
     enum_index: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     enum_options: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    string_val: Option<String>,
 }
 
 impl Serialize for ParameterValue {
@@ -67,6 +71,7 @@ impl Serialize for ParameterValue {
                 vec3_val: None,
                 enum_index: None,
                 enum_options: None,
+                string_val: None,
             },
             ParameterValue::Int(v) => ParameterValueHelper {
                 value_type: "Int".to_string(),
@@ -78,6 +83,7 @@ impl Serialize for ParameterValue {
                 vec3_val: None,
                 enum_index: None,
                 enum_options: None,
+                string_val: None,
             },
             ParameterValue::Bool(v) => ParameterValueHelper {
                 value_type: "Bool".to_string(),
@@ -89,6 +95,7 @@ impl Serialize for ParameterValue {
                 vec3_val: None,
                 enum_index: None,
                 enum_options: None,
+                string_val: None,
             },
             ParameterValue::Color(v) => ParameterValueHelper {
                 value_type: "Color".to_string(),
@@ -100,6 +107,7 @@ impl Serialize for ParameterValue {
                 vec3_val: None,
                 enum_index: None,
                 enum_options: None,
+                string_val: None,
             },
             ParameterValue::Vec2(v) => ParameterValueHelper {
                 value_type: "Vec2".to_string(),
@@ -111,6 +119,7 @@ impl Serialize for ParameterValue {
                 vec3_val: None,
                 enum_index: None,
                 enum_options: None,
+                string_val: None,
             },
             ParameterValue::Vec3(v) => ParameterValueHelper {
                 value_type: "Vec3".to_string(),
@@ -122,6 +131,7 @@ impl Serialize for ParameterValue {
                 vec3_val: Some(*v),
                 enum_index: None,
                 enum_options: None,
+                string_val: None,
             },
             ParameterValue::Enum { index, options } => ParameterValueHelper {
                 value_type: "Enum".to_string(),
@@ -133,6 +143,19 @@ impl Serialize for ParameterValue {
                 vec3_val: None,
                 enum_index: Some(*index),
                 enum_options: Some(options.clone()),
+                string_val: None,
+            },
+            ParameterValue::String(v) => ParameterValueHelper {
+                value_type: "String".to_string(),
+                float_val: None,
+                int_val: None,
+                bool_val: None,
+                color_val: None,
+                vec2_val: None,
+                vec3_val: None,
+                enum_index: None,
+                enum_options: None,
+                string_val: Some(v.clone()),
             },
         };
         helper.serialize(serializer)
@@ -156,6 +179,7 @@ impl<'de> Deserialize<'de> for ParameterValue {
                 index: helper.enum_index.unwrap_or(0),
                 options: helper.enum_options.unwrap_or_default(),
             }),
+            "String" => Ok(ParameterValue::String(helper.string_val.unwrap_or_default())),
             _ => Ok(ParameterValue::Float(helper.float_val.unwrap_or(0.0))),
         }
     }
@@ -190,6 +214,22 @@ impl ParameterValue {
             ParameterValue::Float(v) => *v > 0.5,
             ParameterValue::Int(v) => *v != 0,
             _ => false,
+        }
+    }
+
+    /// Get the value as String (returns empty string for non-string types)
+    pub fn as_string(&self) -> String {
+        match self {
+            ParameterValue::String(v) => v.clone(),
+            _ => String::new(),
+        }
+    }
+
+    /// Get the value as &str (returns empty string for non-string types)
+    pub fn as_str(&self) -> &str {
+        match self {
+            ParameterValue::String(v) => v.as_str(),
+            _ => "",
         }
     }
 }
@@ -266,6 +306,18 @@ impl ParameterMeta {
             name: name.into(),
             label: label.into(),
             default: ParameterValue::Enum { index: default_index, options },
+            min: None,
+            max: None,
+            step: None,
+        }
+    }
+
+    /// Create a new string parameter metadata (for file paths, text, etc.)
+    pub fn string(name: impl Into<String>, label: impl Into<String>, default: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            label: label.into(),
+            default: ParameterValue::String(default.into()),
             min: None,
             max: None,
             step: None,
@@ -511,6 +563,11 @@ impl EffectInstance {
     /// Get parameter value as bool by name
     pub fn get_bool(&self, name: &str) -> Option<bool> {
         self.get_parameter(name).map(|p| p.value.as_bool())
+    }
+
+    /// Get parameter value as string by name
+    pub fn get_string(&self, name: &str) -> Option<String> {
+        self.get_parameter(name).map(|p| p.value.as_string())
     }
 
     /// Set parameter value by name

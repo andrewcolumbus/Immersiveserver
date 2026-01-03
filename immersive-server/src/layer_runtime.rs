@@ -7,6 +7,7 @@
 use std::time::{Duration, Instant};
 
 use crate::compositor::ClipTransition;
+use crate::network::NdiReceiver;
 use crate::video::{VideoPlayer, VideoTexture};
 
 /// Runtime state for a layer, including GPU resources and video playback.
@@ -18,8 +19,11 @@ pub struct LayerRuntime {
     /// The layer ID this runtime belongs to
     pub layer_id: u32,
 
-    /// Video player for this layer (if source is a video)
+    /// Video player for this layer (if source is a video file)
     pub player: Option<VideoPlayer>,
+
+    /// NDI receiver for this layer (if source is an NDI stream)
+    pub ndi_receiver: Option<NdiReceiver>,
 
     /// GPU texture for video frames
     pub texture: Option<VideoTexture>,
@@ -71,6 +75,7 @@ impl LayerRuntime {
         Self {
             layer_id,
             player: None,
+            ndi_receiver: None,
             texture: None,
             bind_group: None,
             video_width: 0,
@@ -93,9 +98,14 @@ impl LayerRuntime {
         }
     }
 
-    /// Check if this runtime has an active video source
+    /// Check if this runtime has an active video source (file or NDI)
     pub fn has_video(&self) -> bool {
-        self.player.is_some()
+        self.player.is_some() || self.ndi_receiver.is_some()
+    }
+
+    /// Check if this runtime has an NDI source
+    pub fn has_ndi(&self) -> bool {
+        self.ndi_receiver.is_some()
     }
 
     /// Check if video is paused
@@ -124,34 +134,73 @@ impl LayerRuntime {
 
     /// Take the latest decoded frame (if any) and upload to texture.
     /// Returns true if a frame was uploaded, false if no new frame was available.
-    /// 
+    ///
     /// Note: For GPU-native frames, the texture format may need to be updated.
     /// This requires the device to recreate the texture with the right format.
     pub fn try_update_texture(&mut self, queue: &wgpu::Queue) -> bool {
-        let Some(player) = &self.player else { return false };
         let Some(texture) = &mut self.texture else { return false };
 
-        if let Some(frame) = player.take_frame() {
-            // Check if texture format matches frame format
-            if frame.is_gpu_native != texture.is_gpu_native() {
-                log::warn!(
-                    "Texture format mismatch: frame is_gpu_native={}, texture is_gpu_native={}",
-                    frame.is_gpu_native,
-                    texture.is_gpu_native()
-                );
-                return false;
+        // Try VideoPlayer first
+        if let Some(player) = &self.player {
+            if let Some(frame) = player.take_frame() {
+                // Check if texture format matches frame format
+                if frame.is_gpu_native != texture.is_gpu_native() {
+                    log::warn!(
+                        "Texture format mismatch: frame is_gpu_native={}, texture is_gpu_native={}",
+                        frame.is_gpu_native,
+                        texture.is_gpu_native()
+                    );
+                    return false;
+                }
+
+                texture.upload(queue, &frame);
+                self.has_frame = true;
+                return true;
             }
-            
-            texture.upload(queue, &frame);
-            self.has_frame = true;
-            return true;
         }
+
+        // Try NdiReceiver
+        if let Some(ndi_receiver) = &mut self.ndi_receiver {
+            if let Some(ndi_frame) = ndi_receiver.take_frame() {
+                // Convert NDI frame to DecodedFrame format (BGRA -> RGBA)
+                // NDI provides BGRA, our texture expects RGBA
+                let mut rgba_data = ndi_frame.data.to_vec();
+                for chunk in rgba_data.chunks_exact_mut(4) {
+                    chunk.swap(0, 2); // Swap B and R channels
+                }
+
+                // Update stored dimensions if they changed
+                if ndi_frame.width != self.video_width || ndi_frame.height != self.video_height {
+                    self.video_width = ndi_frame.width;
+                    self.video_height = ndi_frame.height;
+                    log::info!(
+                        "NDI frame resolution updated: {}x{}",
+                        ndi_frame.width,
+                        ndi_frame.height
+                    );
+                }
+
+                let decoded_frame = crate::video::DecodedFrame::new(
+                    rgba_data,
+                    ndi_frame.width,
+                    ndi_frame.height,
+                    ndi_frame.timestamp.as_secs_f64(),
+                    0, // NDI doesn't have frame indices
+                );
+
+                texture.upload(queue, &decoded_frame);
+                self.has_frame = true;
+                return true;
+            }
+        }
+
         false
     }
 
     /// Clear all resources
     pub fn clear(&mut self) {
         self.player = None;
+        self.ndi_receiver = None;
         self.texture = None;
         self.bind_group = None;
         self.video_width = 0;

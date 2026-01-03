@@ -2,7 +2,7 @@
 //!
 //! Displays available video sources that can be dragged onto the clip grid:
 //! - OMT (Open Media Transport) network sources
-//! - NDI sources (future)
+//! - NDI (Network Device Interface) network sources
 //! - Local video files (future)
 //!
 //! Drag sources from this panel and drop them onto clip grid cells.
@@ -23,8 +23,15 @@ pub enum DraggableSource {
         path: PathBuf,
         name: String,
     },
-    // Future: NDI source
-    // Ndi { source_name: String },
+    /// NDI network source
+    Ndi {
+        /// Full NDI name (format: "MACHINE (SOURCE)")
+        ndi_name: String,
+        /// Display name (extracted source name)
+        display_name: String,
+        /// Optional URL address for direct connection
+        url_address: Option<String>,
+    },
 }
 
 impl DraggableSource {
@@ -33,6 +40,7 @@ impl DraggableSource {
         match self {
             DraggableSource::Omt { name, .. } => name,
             DraggableSource::File { name, .. } => name,
+            DraggableSource::Ndi { display_name, .. } => display_name,
         }
     }
 
@@ -41,6 +49,7 @@ impl DraggableSource {
         match self {
             DraggableSource::Omt { .. } => "📡",
             DraggableSource::File { .. } => "📁",
+            DraggableSource::Ndi { .. } => "📺",
         }
     }
 
@@ -52,6 +61,10 @@ impl DraggableSource {
             }
             DraggableSource::File { path, .. } => {
                 format!("📁 Video File\n{}\n\nDrag to clip grid to assign", path.display())
+            }
+            DraggableSource::Ndi { ndi_name, url_address, .. } => {
+                let addr = url_address.as_deref().unwrap_or("auto-discovery");
+                format!("📺 NDI Source: {}\nAddress: {}\n\nDrag to clip grid to assign", ndi_name, addr)
             }
         }
     }
@@ -65,6 +78,12 @@ pub const DRAG_SOURCE_PAYLOAD: &str = "draggable_source";
 pub enum SourcesAction {
     /// Refresh OMT source discovery
     RefreshOmtSources,
+    /// Refresh NDI source discovery
+    RefreshNdiSources,
+    /// Start NDI discovery
+    StartNdiDiscovery,
+    /// Stop NDI discovery
+    StopNdiDiscovery,
 }
 
 /// State for the sources panel
@@ -74,6 +93,10 @@ pub struct SourcesPanel {
     pub open: bool,
     /// Discovered OMT sources
     omt_sources: Vec<DraggableSource>,
+    /// Discovered NDI sources
+    ndi_sources: Vec<DraggableSource>,
+    /// Whether NDI discovery is enabled
+    ndi_discovery_enabled: bool,
 }
 
 impl SourcesPanel {
@@ -82,6 +105,8 @@ impl SourcesPanel {
         Self {
             open: true,
             omt_sources: Vec::new(),
+            ndi_sources: Vec::new(),
+            ndi_discovery_enabled: false,
         }
     }
 
@@ -91,6 +116,29 @@ impl SourcesPanel {
             .into_iter()
             .map(|(id, name, address)| DraggableSource::Omt { id, name, address })
             .collect();
+    }
+
+    /// Update the list of NDI sources
+    /// Each tuple is (ndi_name, display_name, url_address)
+    pub fn set_ndi_sources(&mut self, sources: Vec<(String, String, Option<String>)>) {
+        self.ndi_sources = sources
+            .into_iter()
+            .map(|(ndi_name, display_name, url_address)| DraggableSource::Ndi {
+                ndi_name,
+                display_name,
+                url_address,
+            })
+            .collect();
+    }
+
+    /// Set whether NDI discovery is enabled
+    pub fn set_ndi_discovery_enabled(&mut self, enabled: bool) {
+        self.ndi_discovery_enabled = enabled;
+    }
+
+    /// Check if NDI discovery is enabled
+    pub fn is_ndi_discovery_enabled(&self) -> bool {
+        self.ndi_discovery_enabled
     }
 
     /// Render the sources panel contents
@@ -121,6 +169,42 @@ impl SourcesPanel {
                 for source in &omt_sources {
                     self.render_draggable_source(ui, source.clone());
                 }
+            }
+        });
+
+        ui.add_space(4.0);
+
+        // NDI Sources section
+        let ndi_sources = self.ndi_sources.clone();
+        let ndi_enabled = self.ndi_discovery_enabled;
+        ui.collapsing("📺 NDI Sources", |ui| {
+            // Toggle for NDI discovery
+            ui.horizontal(|ui| {
+                let mut enabled = ndi_enabled;
+                if ui.checkbox(&mut enabled, "Enable NDI Discovery").changed() {
+                    if enabled {
+                        actions.push(SourcesAction::StartNdiDiscovery);
+                    } else {
+                        actions.push(SourcesAction::StopNdiDiscovery);
+                    }
+                }
+            });
+
+            if ndi_enabled {
+                ui.add_space(4.0);
+                if ndi_sources.is_empty() {
+                    ui.label(egui::RichText::new("No NDI sources found").italics().color(egui::Color32::GRAY));
+                    ui.add_space(4.0);
+                    if ui.small_button("🔄 Refresh").clicked() {
+                        actions.push(SourcesAction::RefreshNdiSources);
+                    }
+                } else {
+                    for source in &ndi_sources {
+                        self.render_draggable_source(ui, source.clone());
+                    }
+                }
+            } else {
+                ui.label(egui::RichText::new("Discovery disabled").italics().color(egui::Color32::GRAY));
             }
         });
 

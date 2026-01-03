@@ -47,6 +47,13 @@ pub enum ClipGridAction {
         address: String,
         name: String,
     },
+    /// User wants to assign an NDI source to a cell
+    AssignNdiSource {
+        layer_id: u32,
+        slot: usize,
+        ndi_name: String,
+        url_address: Option<String>,
+    },
     /// User wants to clear a clip from a cell
     ClearClip {
         layer_id: u32,
@@ -212,6 +219,14 @@ impl ClipGridPanel {
                             layer_id,
                             slot,
                             path,
+                        });
+                    }
+                    crate::ui::DraggableSource::Ndi { ndi_name, url_address, .. } => {
+                        actions.push(ClipGridAction::AssignNdiSource {
+                            layer_id,
+                            slot,
+                            ndi_name,
+                            url_address,
                         });
                     }
                 }
@@ -696,6 +711,7 @@ impl ClipGridPanel {
             let source_info = match &clip.source {
                 crate::compositor::ClipSource::File { path } => format!("📁 {}", path.display()),
                 crate::compositor::ClipSource::Omt { address, .. } => format!("📡 OMT: {}", address),
+                crate::compositor::ClipSource::Ndi { ndi_name, .. } => format!("📺 NDI: {}", ndi_name),
             };
             response.on_hover_text(format!(
                 "{}{}\n{}",

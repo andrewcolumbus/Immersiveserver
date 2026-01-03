@@ -34,6 +34,7 @@ quick-xml = { version = "0.37", features = ["serialize"] }
 # Utilities
 bytemuck = { version = "1", features = ["derive"] }
 dirs = "6"
+rand = "0.9"
 
 # File watching (for shader hot-reload)
 notify = "7"
@@ -54,6 +55,9 @@ mdns-sd = "0.10"
 
 # Hostname detection for mDNS registration
 hostname = "0.4"
+
+# Image loading for effect textures
+image = "0.25"
 
 # Syphon/Spout texture sharing (platform-specific)
 [target.'cfg(target_os = "macos")'.dependencies]
