@@ -305,6 +305,37 @@ impl PreferencesWindow {
         ui.add_space(16.0);
         ui.separator();
 
+        // ========== PERFORMANCE MODE ==========
+        ui.add_space(8.0);
+        ui.heading("Performance Mode");
+        ui.add_space(4.0);
+
+        let mut floor_sync = settings.floor_sync_enabled;
+        if ui
+            .checkbox(&mut floor_sync, "Floor Sync")
+            .on_hover_text("When enabled, triggering clips on any layer also triggers the corresponding column clip on the floor layer")
+            .changed()
+        {
+            actions.push(PropertiesAction::SetFloorSyncEnabled { enabled: floor_sync });
+        }
+
+        ui.add_enabled_ui(floor_sync, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Floor Layer:");
+                let mut layer_idx = settings.floor_layer_index;
+                if ui
+                    .add(egui::DragValue::new(&mut layer_idx).range(0..=15).speed(0.1))
+                    .changed()
+                {
+                    actions.push(PropertiesAction::SetFloorLayerIndex { index: layer_idx });
+                }
+                ui.label(egui::RichText::new("(0 = first layer)").small().weak());
+            });
+        });
+
+        ui.add_space(16.0);
+        ui.separator();
+
         // ========== OMT BROADCAST ==========
         ui.add_space(8.0);
         ui.heading("OMT Broadcast");
@@ -328,18 +359,6 @@ impl PreferencesWindow {
                     .color(egui::Color32::GREEN),
             );
         }
-
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            ui.label("Capture FPS:");
-            let mut fps = settings.omt_capture_fps;
-            let slider = egui::Slider::new(&mut fps, 10..=60)
-                .suffix(" fps")
-                .clamping(egui::SliderClamping::Always);
-            if ui.add(slider).changed() {
-                actions.push(PropertiesAction::SetOmtCaptureFps { fps });
-            }
-        });
 
         ui.add_space(16.0);
         ui.separator();
@@ -367,15 +386,6 @@ impl PreferencesWindow {
                     .color(egui::Color32::from_rgb(100, 149, 237)), // Cornflower blue for NDI
             );
         }
-
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            ui.label("Output FPS:");
-            ui.label(
-                egui::RichText::new(format!("{} fps (synced to environment)", settings.target_fps))
-                    .weak(),
-            );
-        });
 
         ui.add_space(16.0);
         ui.separator();

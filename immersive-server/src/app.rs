@@ -602,6 +602,112 @@ impl App {
         Arc::clone(&self.gpu)
     }
 
+    /// Get the egui context for creating additional viewports.
+    ///
+    /// This is needed when creating panel windows that need egui rendering.
+    pub fn egui_context(&self) -> &egui::Context {
+        &self.egui_ctx
+    }
+
+    /// Render an undocked panel's content to the given UI.
+    ///
+    /// This is used when a panel is displayed in its own native window.
+    /// Returns true if the user requested to re-dock the panel.
+    pub fn render_undocked_panel(&mut self, panel_id: &str, ui: &mut egui::Ui) -> bool {
+        use crate::ui::dock::panel_ids;
+
+        // Small dock button bar at top (window title bar already shows panel name)
+        let mut should_redock = false;
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("⊟ Dock to Main").on_hover_text("Return panel to main window").clicked() {
+                    should_redock = true;
+                }
+            });
+        });
+
+        // Render panel content based on panel_id
+        match panel_id {
+            panel_ids::SOURCES => {
+                let actions = self.sources_panel.render_contents(ui);
+                for action in actions {
+                    self.handle_sources_action(action);
+                }
+            }
+            panel_ids::EFFECTS_BROWSER => {
+                let _actions = self.effects_browser_panel.render_contents(ui, self.effect_manager.registry());
+                // Effects actions are typically drag-drop which is handled elsewhere
+            }
+            panel_ids::FILES => {
+                self.file_browser_panel.render_contents(ui);
+            }
+            panel_ids::CLIP_GRID => {
+                let layers: Vec<_> = self.environment.layers().to_vec();
+                let actions = self.clip_grid_panel.render_contents(ui, &layers, &mut self.thumbnail_cache);
+                for action in actions {
+                    self.handle_clip_action(action);
+                }
+            }
+            panel_ids::PROPERTIES => {
+                let layers: Vec<_> = self.environment.layers().to_vec();
+                let omt_broadcasting = self.is_omt_broadcasting();
+                let ndi_broadcasting = self.is_ndi_broadcasting();
+                let layer_video_info = self.layer_video_info();
+                let actions = self.properties_panel.render(
+                    ui,
+                    &self.environment,
+                    &layers,
+                    &self.settings,
+                    omt_broadcasting,
+                    ndi_broadcasting,
+                    self.texture_share_enabled,
+                    self.api_server_running,
+                    self.effect_manager.registry(),
+                    self.effect_manager.bpm_clock(),
+                    self.effect_manager.time(),
+                    Some(&self.audio_manager),
+                    &layer_video_info,
+                );
+                for action in actions {
+                    self.handle_properties_action(action);
+                }
+            }
+            panel_ids::PREVIEW_MONITOR => {
+                let has_frame = self.preview_player.has_frame();
+                let is_playing = !self.preview_player.is_paused();
+                let video_info = self.preview_player.video_info();
+                let actions = self.preview_monitor_panel.render_contents(
+                    ui,
+                    has_frame,
+                    is_playing,
+                    video_info,
+                    |_ui, _rect| {
+                        // Preview texture rendering in undocked window not yet supported
+                        // Would need to share the texture between windows
+                    },
+                );
+                for action in actions {
+                    self.handle_preview_action(action);
+                }
+            }
+            panel_ids::PREVIS => {
+                if let Some(renderer) = &mut self.previs_renderer {
+                    let actions = self.previs_panel.render(ui, &self.settings.previs_settings, renderer);
+                    for action in actions {
+                        self.handle_previs_action(action);
+                    }
+                } else {
+                    ui.label("3D Previs renderer not available");
+                }
+            }
+            _ => {
+                ui.label(format!("Unknown panel: {}", panel_id));
+            }
+        }
+
+        should_redock
+    }
+
     /// Create the Tokio runtime for async OMT operations
     fn create_tokio_runtime() -> Option<tokio::runtime::Runtime> {
         match tokio::runtime::Builder::new_multi_thread()
@@ -1201,6 +1307,17 @@ impl App {
             ),
         ];
 
+        // Get BPM info from effect manager
+        let bpm_info = {
+            let clock = self.effect_manager.bpm_clock();
+            crate::ui::menu_bar::BpmInfo {
+                bpm: clock.bpm(),
+                beats_per_bar: clock.beats_per_bar(),
+                beat_phase: clock.beat_phase(),
+                current_beat_in_bar: (clock.current_beat() % clock.beats_per_bar() as f32).floor() as u32,
+            }
+        };
+
         // Render menu bar with appropriate FPS (skip when using native OS menus)
         let settings_changed = if self.use_native_menu {
             // Native menus handle most UI, but still render a slim status bar
@@ -1215,6 +1332,7 @@ impl App {
                 display_frame_time_ms,
                 &panel_states,
                 Some(&self.layout_preset_manager),
+                Some(bpm_info),
             )
         };
 
@@ -1268,6 +1386,19 @@ impl App {
                         self.menu_bar.set_status("Reset to default layout");
                     }
                 }
+                crate::ui::menu_bar::MenuAction::SetBpm { bpm } => {
+                    self.effect_manager.bpm_clock_mut().set_bpm(bpm);
+                    tracing::debug!("Set BPM to {:.1}", bpm);
+                }
+                crate::ui::menu_bar::MenuAction::TapTempo => {
+                    self.effect_manager.bpm_clock_mut().tap();
+                    let new_bpm = self.effect_manager.bpm_clock().bpm();
+                    tracing::debug!("Tap tempo: BPM now {:.1}", new_bpm);
+                }
+                crate::ui::menu_bar::MenuAction::ResyncBpm => {
+                    self.effect_manager.bpm_clock_mut().resync_to_bar();
+                    tracing::debug!("Resync to bar start");
+                }
             }
         }
 
@@ -1299,10 +1430,11 @@ impl App {
         let layers: Vec<_> = self.environment.layers().to_vec();
         let omt_broadcasting = self.is_omt_broadcasting();
         let ndi_broadcasting = self.is_ndi_broadcasting();
+        let layer_video_info = self.layer_video_info();
 
-        // Render properties panel (left panel or floating)
+        // Render properties panel (left panel or floating) - skip if undocked to separate window
         let prop_actions = if let Some(panel) = self.dock_manager.get_panel(crate::ui::dock::panel_ids::PROPERTIES) {
-            if panel.open {
+            if panel.open && !panel.is_undocked() {
                 let zone = panel.zone;
                 let floating_pos = panel.floating_pos;
                 let floating_size = panel.floating_size;
@@ -1315,11 +1447,16 @@ impl App {
                             .default_width(dock_width)
                             .resizable(true)
                             .show(&self.egui_ctx, |ui| {
-                                // Panel header with undock button
+                                // Panel header with float/undock buttons
                                 ui.horizontal(|ui| {
                                     ui.heading("Properties");
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        if ui.button("⊞").on_hover_text("Undock panel").clicked() {
+                                        // Undock to separate window
+                                        if ui.button("⧉").on_hover_text("Undock to separate window").clicked() {
+                                            self.dock_manager.request_undock(crate::ui::dock::panel_ids::PROPERTIES);
+                                        }
+                                        // Float within main window
+                                        if ui.button("⊞").on_hover_text("Float panel").clicked() {
                                             if let Some(p) = self.dock_manager.get_panel_mut(crate::ui::dock::panel_ids::PROPERTIES) {
                                                 p.zone = crate::ui::DockZone::Floating;
                                                 p.floating_pos = Some((100.0, 100.0));
@@ -1329,7 +1466,7 @@ impl App {
                                     });
                                 });
                                 ui.separator();
-                                actions = self.properties_panel.render(ui, &self.environment, &layers, &self.settings, omt_broadcasting, ndi_broadcasting, self.texture_share_enabled, self.api_server_running, self.effect_manager.registry(), self.effect_manager.bpm_clock(), self.effect_manager.time(), Some(&self.audio_manager));
+                                actions = self.properties_panel.render(ui, &self.environment, &layers, &self.settings, omt_broadcasting, ndi_broadcasting, self.texture_share_enabled, self.api_server_running, self.effect_manager.registry(), self.effect_manager.bpm_clock(), self.effect_manager.time(), Some(&self.audio_manager), &layer_video_info);
                             });
                         actions
                     }
@@ -1368,7 +1505,7 @@ impl App {
                                     });
                                 });
                                 ui.separator();
-                                actions = self.properties_panel.render(ui, &self.environment, &layers, &self.settings, omt_broadcasting, ndi_broadcasting, self.texture_share_enabled, self.api_server_running, self.effect_manager.registry(), self.effect_manager.bpm_clock(), self.effect_manager.time(), Some(&self.audio_manager));
+                                actions = self.properties_panel.render(ui, &self.environment, &layers, &self.settings, omt_broadcasting, ndi_broadcasting, self.texture_share_enabled, self.api_server_running, self.effect_manager.registry(), self.effect_manager.bpm_clock(), self.effect_manager.time(), Some(&self.audio_manager), &layer_video_info);
                             });
 
                         // Track window dragging for dock zone snapping
@@ -1417,9 +1554,9 @@ impl App {
             self.handle_properties_action(action);
         }
         
-        // Render clip grid panel (right panel or floating)
+        // Render clip grid panel (right panel or floating) - skip if undocked
         let clip_actions = if let Some(panel) = self.dock_manager.get_panel(crate::ui::dock::panel_ids::CLIP_GRID) {
-            if panel.open {
+            if panel.open && !panel.is_undocked() {
                 let zone = panel.zone;
                 let floating_pos = panel.floating_pos;
                 let floating_size = panel.floating_size;
@@ -1432,11 +1569,16 @@ impl App {
                             .default_width(dock_width)
                             .resizable(true)
                             .show(&self.egui_ctx, |ui| {
-                                // Panel header with undock button
+                                // Panel header with float/undock buttons
                                 ui.horizontal(|ui| {
                                     ui.heading("Clip Grid");
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        if ui.button("⊞").on_hover_text("Undock panel").clicked() {
+                                        // Undock to separate window
+                                        if ui.button("⧉").on_hover_text("Undock to separate window").clicked() {
+                                            self.dock_manager.request_undock(crate::ui::dock::panel_ids::CLIP_GRID);
+                                        }
+                                        // Float within main window
+                                        if ui.button("⊞").on_hover_text("Float panel").clicked() {
                                             if let Some(p) = self.dock_manager.get_panel_mut(crate::ui::dock::panel_ids::CLIP_GRID) {
                                                 p.zone = crate::ui::DockZone::Floating;
                                                 p.floating_pos = Some((400.0, 100.0));
@@ -1530,9 +1672,9 @@ impl App {
             self.clip_grid_panel.render(&self.egui_ctx, &layers, &mut self.thumbnail_cache)
         };
 
-        // Render sources panel (floating window for now)
+        // Render sources panel (floating window for now) - skip if undocked
         let sources_actions = if let Some(panel) = self.dock_manager.get_panel(crate::ui::dock::panel_ids::SOURCES) {
-            if panel.open {
+            if panel.open && !panel.is_undocked() {
                 let floating_pos = panel.floating_pos;
                 let floating_size = panel.floating_size;
                 let mut actions = Vec::new();
@@ -1548,6 +1690,15 @@ impl App {
                     .collapsible(true)
                     .open(&mut open)
                     .show(&self.egui_ctx, |ui| {
+                        // Undock button in header
+                        ui.horizontal(|ui| {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.small_button("⧉").on_hover_text("Undock to separate window").clicked() {
+                                    self.dock_manager.request_undock(crate::ui::dock::panel_ids::SOURCES);
+                                }
+                            });
+                        });
+                        ui.separator();
                         actions = self.sources_panel.render_contents(ui);
                     });
                 
@@ -1573,9 +1724,9 @@ impl App {
             Vec::new()
         };
 
-        // Render effects browser panel (floating window)
+        // Render effects browser panel (floating window) - skip if undocked
         let _effects_actions = if let Some(panel) = self.dock_manager.get_panel(crate::ui::dock::panel_ids::EFFECTS_BROWSER) {
-            if panel.open {
+            if panel.open && !panel.is_undocked() {
                 let floating_pos = panel.floating_pos;
                 let floating_size = panel.floating_size;
                 let mut actions = Vec::new();
@@ -1591,6 +1742,15 @@ impl App {
                     .collapsible(true)
                     .open(&mut open)
                     .show(&self.egui_ctx, |ui| {
+                        // Undock button in header
+                        ui.horizontal(|ui| {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.small_button("⧉").on_hover_text("Undock to separate window").clicked() {
+                                    self.dock_manager.request_undock(crate::ui::dock::panel_ids::EFFECTS_BROWSER);
+                                }
+                            });
+                        });
+                        ui.separator();
                         actions = self.effects_browser_panel.render_contents(ui, self.effect_manager.registry());
                     });
 
@@ -1616,9 +1776,9 @@ impl App {
             Vec::new()
         };
 
-        // Render file browser panel (floating window)
+        // Render file browser panel (floating window) - skip if undocked
         if let Some(panel) = self.dock_manager.get_panel(crate::ui::dock::panel_ids::FILES) {
-            if panel.open {
+            if panel.open && !panel.is_undocked() {
                 let floating_pos = panel.floating_pos;
                 let floating_size = panel.floating_size;
                 let pos = floating_pos.unwrap_or((350.0, 100.0));
@@ -1633,6 +1793,15 @@ impl App {
                     .collapsible(true)
                     .open(&mut open)
                     .show(&self.egui_ctx, |ui| {
+                        // Undock button in header
+                        ui.horizontal(|ui| {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.small_button("⧉").on_hover_text("Undock to separate window").clicked() {
+                                    self.dock_manager.request_undock(crate::ui::dock::panel_ids::FILES);
+                                }
+                            });
+                        });
+                        ui.separator();
                         self.file_browser_panel.render_contents(ui);
                     });
 
@@ -1653,9 +1822,9 @@ impl App {
             }
         }
 
-        // Render preview monitor panel (floating window)
+        // Render preview monitor panel (floating window) - skip if undocked
         let preview_actions = if let Some(panel) = self.dock_manager.get_panel(crate::ui::dock::panel_ids::PREVIEW_MONITOR) {
-            if panel.open {
+            if panel.open && !panel.is_undocked() {
                 let floating_pos = panel.floating_pos;
                 let floating_size = panel.floating_size;
                 let mut actions = Vec::new();
@@ -1675,6 +1844,15 @@ impl App {
                     .collapsible(true)
                     .open(&mut open)
                     .show(&self.egui_ctx, |ui| {
+                        // Undock button in header
+                        ui.horizontal(|ui| {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.small_button("⧉").on_hover_text("Undock to separate window").clicked() {
+                                    self.dock_manager.request_undock(crate::ui::dock::panel_ids::PREVIEW_MONITOR);
+                                }
+                            });
+                        });
+                        ui.separator();
                         actions = self.preview_monitor_panel.render_contents(
                             ui,
                             has_frame,
@@ -1731,9 +1909,9 @@ impl App {
             Vec::new()
         };
 
-        // Render 3D previs panel (floating window)
+        // Render 3D previs panel (floating window) - skip if undocked
         let previs_actions = if let Some(panel) = self.dock_manager.get_panel(crate::ui::dock::panel_ids::PREVIS) {
-            if panel.open {
+            if panel.open && !panel.is_undocked() {
                 let floating_pos = panel.floating_pos;
                 let floating_size = panel.floating_size;
                 let mut actions = Vec::new();
@@ -1749,6 +1927,15 @@ impl App {
                     .collapsible(true)
                     .open(&mut open)
                     .show(&self.egui_ctx, |ui| {
+                        // Undock button in header
+                        ui.horizontal(|ui| {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.small_button("⧉").on_hover_text("Undock to separate window").clicked() {
+                                    self.dock_manager.request_undock(crate::ui::dock::panel_ids::PREVIS);
+                                }
+                            });
+                        });
+                        ui.separator();
                         if let Some(renderer) = &mut self.previs_renderer {
                             actions = self.previs_panel.render(ui, &self.settings.previs_settings, renderer);
                         }
@@ -2175,6 +2362,91 @@ impl App {
             }
         }
 
+        // ========== PREVIEW EFFECT PROCESSING ==========
+        // Process effects for the preview clip if the clip has effects
+        if self.preview_player.has_frame() {
+            if let Some(preview_clip_info) = self.preview_monitor_panel.current_clip() {
+                // Get the clip's effects from the environment
+                if let Some(layer) = self.environment.get_layer(preview_clip_info.layer_id) {
+                    if let Some(clip) = layer.get_clip(preview_clip_info.slot) {
+                        let active_effect_count = clip.effects.active_effects().count();
+
+                        if active_effect_count > 0 {
+                            let (width, height) = self.preview_player.dimensions();
+
+                            // 1. Ensure preview runtime exists
+                            self.effect_manager.ensure_preview_runtime(
+                                &self.device,
+                                width,
+                                height,
+                                self.config.format,
+                            );
+
+                            // 2. Sync preview effects with the clip's effect stack
+                            self.effect_manager.sync_preview_effects(
+                                &clip.effects,
+                                &self.device,
+                                &self.queue,
+                                self.config.format,
+                            );
+
+                            // 3. Copy video texture to preview effect input
+                            if let Some(video_view) = self.preview_player.texture_view() {
+                                if let Some(preview_runtime) = self.effect_manager.get_preview_runtime_mut() {
+                                    preview_runtime.copy_input_texture(
+                                        &mut encoder,
+                                        &self.device,
+                                        video_view,
+                                    );
+                                }
+                            }
+
+                            // 4. Process preview effects
+                            let effect_params = self.effect_manager.build_params();
+                            let bpm_clock = self.effect_manager.bpm_clock().clone();
+                            if let Some(preview_runtime) = self.effect_manager.get_preview_runtime_mut() {
+                                if let (Some(input_view), Some(output_view)) = (
+                                    preview_runtime.input_view().map(|v| v as *const _),
+                                    preview_runtime.output_view(active_effect_count).map(|v| v as *const _),
+                                ) {
+                                    unsafe {
+                                        preview_runtime.process_with_automation(
+                                            &mut encoder,
+                                            &self.queue,
+                                            &self.device,
+                                            &*input_view,
+                                            &*output_view,
+                                            &clip.effects,
+                                            &effect_params,
+                                            &bpm_clock,
+                                            Some(&self.audio_manager),
+                                        );
+                                    }
+                                }
+                            }
+
+                            // 5. Update egui texture to use effect output
+                            if let Some(preview_runtime) = self.effect_manager.get_preview_runtime() {
+                                if let Some(output_view) = preview_runtime.output_view(active_effect_count) {
+                                    // Free old texture if exists
+                                    if let Some(old_id) = self.preview_player.egui_texture_id.take() {
+                                        self.egui_renderer.free_texture(&old_id);
+                                    }
+                                    // Register effect output
+                                    let texture_id = self.egui_renderer.register_native_texture(
+                                        &self.device,
+                                        output_view,
+                                        wgpu::FilterMode::Linear,
+                                    );
+                                    self.preview_player.egui_texture_id = Some(texture_id);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Capture environment texture for OMT output (before we move on to present)
         if self.omt_broadcast_enabled {
             if let Some(capture) = &mut self.omt_capture {
@@ -2227,12 +2499,29 @@ impl App {
                             renderer.load_camera_state(&self.settings.previs_settings);
                         }
 
+                        // Get floor texture from specified layer if floor mode is enabled
+                        let floor_texture_view: Option<&wgpu::TextureView> = if self.settings.previs_settings.floor_enabled {
+                            let floor_layer_idx = self.settings.previs_settings.floor_layer_index;
+                            let layers = self.environment.layers();
+                            if floor_layer_idx < layers.len() {
+                                let layer_id = layers[floor_layer_idx].id;
+                                self.layer_runtimes.get(&layer_id).and_then(|runtime| {
+                                    runtime.texture.as_ref().map(|tex| tex.view())
+                                })
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+
                         // Render the 3D scene
                         renderer.render(
                             &mut encoder,
                             &self.device,
                             &self.queue,
                             self.environment.texture_view(),
+                            floor_texture_view,
                             &self.settings.previs_settings,
                         );
 
@@ -2388,8 +2677,19 @@ impl App {
     }
 
     /// Render a slim status bar when using native menus
-    /// Shows FPS and status messages without the full egui menu bar
+    /// Shows FPS, BPM, and status messages without the full egui menu bar
     fn render_status_bar(&mut self, ctx: &egui::Context, fps: f64, frame_time_ms: f64) {
+        // Get BPM info
+        let bpm_info = {
+            let clock = self.effect_manager.bpm_clock();
+            crate::ui::menu_bar::BpmInfo {
+                bpm: clock.bpm(),
+                beats_per_bar: clock.beats_per_bar(),
+                beat_phase: clock.beat_phase(),
+                current_beat_in_bar: (clock.current_beat() % clock.beats_per_bar() as f32).floor() as u32,
+            }
+        };
+
         egui::TopBottomPanel::top("status_bar")
             .exact_height(24.0)
             .show(ctx, |ui| {
@@ -2401,6 +2701,95 @@ impl App {
                                     .monospace()
                                     .color(egui::Color32::from_rgb(120, 200, 120)),
                             );
+                            ui.separator();
+                        }
+
+                        // BPM display with beat indicators
+                        if self.settings.show_bpm {
+                            // Beat indicator dots
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 3.0;
+
+                                for beat in 0..bpm_info.beats_per_bar {
+                                    let is_current = beat == bpm_info.current_beat_in_bar;
+                                    let is_downbeat = beat == 0;
+
+                                    let pulse = if is_current {
+                                        1.0 - bpm_info.beat_phase * 0.5
+                                    } else {
+                                        0.5
+                                    };
+
+                                    let color = if is_current {
+                                        if is_downbeat {
+                                            egui::Color32::from_rgb(
+                                                (255.0 * pulse) as u8,
+                                                (180.0 * pulse) as u8,
+                                                50,
+                                            )
+                                        } else {
+                                            egui::Color32::from_rgb(
+                                                50,
+                                                (200.0 * pulse) as u8,
+                                                (255.0 * pulse) as u8,
+                                            )
+                                        }
+                                    } else {
+                                        egui::Color32::from_gray(60)
+                                    };
+
+                                    let size = if is_current { 8.0 } else { 6.0 };
+                                    let (rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(size, size),
+                                        egui::Sense::hover(),
+                                    );
+                                    ui.painter().circle_filled(rect.center(), size / 2.0, color);
+                                }
+                            });
+
+                            ui.add_space(4.0);
+
+                            // Time signature
+                            ui.label(
+                                egui::RichText::new(format!("{}/4", bpm_info.beats_per_bar))
+                                    .small()
+                                    .weak(),
+                            );
+
+                            ui.add_space(2.0);
+
+                            // Editable BPM value
+                            let mut bpm = bpm_info.bpm;
+                            let response = ui.add(
+                                egui::DragValue::new(&mut bpm)
+                                    .speed(0.5)
+                                    .range(20.0..=300.0)
+                                    .suffix(" BPM")
+                                    .custom_formatter(|n, _| format!("{:.1}", n))
+                            );
+
+                            if response.changed() {
+                                self.effect_manager.bpm_clock_mut().set_bpm(bpm);
+                            }
+
+                            // Tap tempo button
+                            if ui
+                                .add(egui::Button::new("TAP").small())
+                                .on_hover_text("Tap to set tempo")
+                                .clicked()
+                            {
+                                self.effect_manager.bpm_clock_mut().tap();
+                            }
+
+                            // Resync button
+                            if ui
+                                .add(egui::Button::new("⟲").small())
+                                .on_hover_text("Resync to bar start")
+                                .clicked()
+                            {
+                                self.effect_manager.bpm_clock_mut().resync_to_bar();
+                            }
+
                             ui.separator();
                         }
 
@@ -3077,6 +3466,28 @@ impl App {
             }
         }
 
+        // Floor sync: trigger corresponding clip on floor layer
+        // Only sync if floor sync is enabled and this is not the floor layer itself
+        if self.settings.floor_sync_enabled {
+            let floor_layer_idx = self.settings.floor_layer_index;
+            let layers = self.environment.layers();
+            if floor_layer_idx < layers.len() {
+                let floor_layer_id = layers[floor_layer_idx].id;
+                // Only sync if this isn't already the floor layer (prevents recursion)
+                if floor_layer_id != layer_id {
+                    // Check if floor layer has a clip at this slot before triggering
+                    if layers[floor_layer_idx].get_clip(slot).is_some() {
+                        tracing::debug!(
+                            "🔄 Floor sync: triggering clip {} on floor layer {} (index {})",
+                            slot, floor_layer_id, floor_layer_idx
+                        );
+                        // Ignore errors - it's okay if the floor layer doesn't have a clip
+                        let _ = self.trigger_clip(floor_layer_id, slot);
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -3284,7 +3695,7 @@ impl App {
                     tracing::info!("📡 OMT: Creating capture pipeline for {}x{}", w, h);
 
                     let mut capture = crate::network::OmtCapture::new(&self.device, w, h);
-                    capture.set_target_fps(self.settings.omt_capture_fps);
+                    capture.set_target_fps(self.settings.target_fps);
                     capture.start_sender_thread(sender, rt.handle().clone());
                     self.omt_capture = Some(capture);
                     self.omt_broadcast_enabled = true;
@@ -4112,6 +4523,16 @@ impl App {
         self.ndi_capture.as_ref().map(|c| c.is_sender_running()).unwrap_or(false)
     }
 
+    /// Collect video info for all layers (for transport controls in UI)
+    pub fn layer_video_info(&self) -> HashMap<u32, crate::layer_runtime::LayerVideoInfo> {
+        self.layer_runtimes
+            .iter()
+            .filter_map(|(id, runtime)| {
+                runtime.video_info().map(|info| (*id, info))
+            })
+            .collect()
+    }
+
     // =========================================
     // Syphon/Spout Texture Sharing
     // =========================================
@@ -4545,6 +4966,16 @@ impl App {
                     }
                 }
             }
+            ClipGridAction::LaunchColumn { column_index } => {
+                // Launch all clips in a column (like Resolume's column launch)
+                let layer_ids: Vec<u32> = self.environment.layers().iter().map(|l| l.id).collect();
+                for layer_id in layer_ids {
+                    if let Err(e) = self.trigger_clip(layer_id, column_index) {
+                        tracing::debug!("Skipping layer {} column {}: {}", layer_id, column_index, e);
+                    }
+                }
+                self.menu_bar.set_status(format!("Launched column {}", column_index + 1));
+            }
         }
     }
 
@@ -4906,12 +5337,23 @@ impl App {
                     }
                 }
             }
+            PropertiesAction::SeekClip { layer_id, time_secs } => {
+                if let Some(runtime) = self.layer_runtimes.get(&layer_id) {
+                    runtime.seek(time_secs);
+                }
+            }
             PropertiesAction::PreviewClip { layer_id, slot } => {
                 // Trigger the same action as right-click preview in clip grid
                 self.handle_clip_action(crate::ui::ClipGridAction::SelectClipForPreview {
                     layer_id,
                     slot,
                 });
+            }
+            PropertiesAction::SetFloorSyncEnabled { enabled } => {
+                self.settings.floor_sync_enabled = enabled;
+            }
+            PropertiesAction::SetFloorLayerIndex { index } => {
+                self.settings.floor_layer_index = index;
             }
         }
     }
@@ -4946,6 +5388,9 @@ impl App {
             }
             PreviewMonitorAction::RestartPreview => {
                 self.preview_player.restart();
+            }
+            PreviewMonitorAction::SeekTo { time_secs } => {
+                self.preview_player.seek(time_secs);
             }
             PreviewMonitorAction::TriggerToLayer { layer_id, slot } => {
                 // Trigger the previewed clip to its layer (go live)
@@ -5023,6 +5468,12 @@ impl App {
                     self.settings.previs_settings.camera_pitch = 0.3;
                     self.settings.previs_settings.camera_distance = 10.0;
                 }
+            }
+            PrevisAction::SetFloorEnabled(enabled) => {
+                self.settings.previs_settings.floor_enabled = enabled;
+            }
+            PrevisAction::SetFloorLayerIndex(index) => {
+                self.settings.previs_settings.floor_layer_index = index;
             }
         }
     }
