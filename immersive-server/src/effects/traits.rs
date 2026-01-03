@@ -5,7 +5,7 @@
 //! - `GpuEffectRuntime` - Runtime trait for GPU shader-based effects
 //! - `CpuEffectRuntime` - Runtime trait for CPU-based effects
 
-use super::{Parameter, ParameterMeta, ParameterValue};
+use super::{Parameter, ParameterMeta, ParameterValue, EffectInstance};
 
 /// The type of effect processor
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,6 +135,9 @@ impl EffectParams {
                     self.set_float(offset, *index as f32);
                     offset += 1;
                 }
+                ParameterValue::String(_) => {
+                    // String parameters are not passed to shaders
+                }
             }
             if offset >= self.params.len() {
                 break;
@@ -212,6 +215,21 @@ pub trait GpuEffectRuntime: Send {
 
     /// Get the effect type identifier
     fn effect_type(&self) -> &'static str;
+
+    /// Update runtime state from effect instance parameters.
+    ///
+    /// Called before process() to allow effects to extract non-numeric parameters
+    /// like strings that aren't packed into EffectParams.
+    ///
+    /// Default implementation is a no-op.
+    fn update_from_instance(
+        &mut self,
+        _instance: &EffectInstance,
+        _device: &wgpu::Device,
+        _queue: &wgpu::Queue,
+    ) {
+        // Default: no-op
+    }
 }
 
 /// Runtime trait for CPU-based effects

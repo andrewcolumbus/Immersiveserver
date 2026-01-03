@@ -4,7 +4,7 @@
 //! Includes transform controls, tiling (multiplexing), effects, and other settings.
 
 use crate::compositor::{BlendMode, ClipTransition, Environment, Layer};
-use crate::effects::{EffectRegistry, ParameterValue};
+use crate::effects::{EffectRegistry, EffectStack, ParameterValue};
 use crate::settings::{EnvironmentSettings, ThumbnailMode};
 use crate::ui::effects_browser_panel::DraggableEffect;
 
@@ -49,6 +49,10 @@ pub enum PropertiesAction {
     SetOmtBroadcast { enabled: bool },
     /// OMT capture FPS changed
     SetOmtCaptureFps { fps: u32 },
+    /// NDI broadcast toggle changed
+    SetNdiBroadcast { enabled: bool },
+    /// NDI capture FPS changed
+    SetNdiCaptureFps { fps: u32 },
     /// Syphon/Spout texture sharing toggle changed
     SetTextureShare { enabled: bool },
     /// Thumbnail mode changed
@@ -67,6 +71,8 @@ pub enum PropertiesAction {
     SetLayerEffectParameter { layer_id: u32, effect_id: u32, param_name: String, value: ParameterValue },
     /// Reorder effect (move up/down)
     ReorderLayerEffect { layer_id: u32, effect_id: u32, new_index: usize },
+    /// Toggle effect expanded/collapsed state
+    SetLayerEffectExpanded { layer_id: u32, effect_id: u32, expanded: bool },
 
     // Clip effect-related actions
     /// Add effect to clip
@@ -81,6 +87,8 @@ pub enum PropertiesAction {
     SetClipEffectParameter { layer_id: u32, slot: usize, effect_id: u32, param_name: String, value: ParameterValue },
     /// Reorder clip effect (move up/down)
     ReorderClipEffect { layer_id: u32, slot: usize, effect_id: u32, new_index: usize },
+    /// Toggle clip effect expanded/collapsed state
+    SetClipEffectExpanded { layer_id: u32, slot: usize, effect_id: u32, expanded: bool },
 
     // Environment effect-related actions
     /// Add effect to environment (master effects)
@@ -95,6 +103,19 @@ pub enum PropertiesAction {
     SetEnvironmentEffectParameter { effect_id: u32, param_name: String, value: ParameterValue },
     /// Reorder environment effect (move up/down)
     ReorderEnvironmentEffect { effect_id: u32, new_index: usize },
+    /// Toggle environment effect expanded/collapsed state
+    SetEnvironmentEffectExpanded { effect_id: u32, expanded: bool },
+}
+
+/// Context for rendering effect stacks (determines which PropertiesAction variants to emit)
+#[derive(Debug, Clone, Copy)]
+enum EffectContext {
+    /// Effects on a layer
+    Layer { layer_id: u32 },
+    /// Effects on a clip within a layer
+    Clip { layer_id: u32, slot: usize },
+    /// Effects on the environment (master effects)
+    Environment,
 }
 
 /// Properties panel state
@@ -170,6 +191,7 @@ impl PropertiesPanel {
         layers: &[Layer],
         settings: &EnvironmentSettings,
         omt_broadcasting: bool,
+        ndi_broadcasting: bool,
         texture_sharing_active: bool,
         effect_registry: &EffectRegistry,
     ) -> Vec<PropertiesAction> {
@@ -205,7 +227,7 @@ impl PropertiesPanel {
             .show(ui, |ui| {
                 match self.active_tab {
                     PropertiesTab::Environment => {
-                        self.render_environment_tab(ui, environment, settings, omt_broadcasting, texture_sharing_active, effect_registry, &mut actions);
+                        self.render_environment_tab(ui, environment, settings, omt_broadcasting, ndi_broadcasting, texture_sharing_active, effect_registry, &mut actions);
                     }
                     PropertiesTab::Layer => {
                         self.render_layer_tab(ui, layers, effect_registry, &mut actions);
@@ -226,6 +248,7 @@ impl PropertiesPanel {
         environment: &Environment,
         settings: &EnvironmentSettings,
         omt_broadcasting: bool,
+        ndi_broadcasting: bool,
         texture_sharing_active: bool,
         effect_registry: &EffectRegistry,
         actions: &mut Vec<PropertiesAction>,
@@ -477,6 +500,40 @@ impl PropertiesPanel {
         ui.add_space(16.0);
         ui.separator();
 
+        // NDI Broadcast section
+        ui.add_space(8.0);
+        ui.heading("NDI Broadcast");
+        ui.add_space(4.0);
+
+        let mut ndi_enabled = settings.ndi_broadcast_enabled;
+        if ui.checkbox(&mut ndi_enabled, "Broadcast Output via NDI").changed() {
+            actions.push(PropertiesAction::SetNdiBroadcast { enabled: ndi_enabled });
+        }
+
+        if ndi_broadcasting {
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new("Broadcasting...")
+                    .small()
+                    .color(egui::Color32::from_rgb(100, 149, 237)), // Cornflower blue for NDI
+            );
+        }
+
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.label("Capture FPS:");
+            let mut fps = settings.ndi_capture_fps;
+            let slider = egui::Slider::new(&mut fps, 10..=60)
+                .suffix(" fps")
+                .clamping(egui::SliderClamping::Always);
+            if ui.add(slider).changed() {
+                actions.push(PropertiesAction::SetNdiCaptureFps { fps });
+            }
+        });
+
+        ui.add_space(16.0);
+        ui.separator();
+
         // Syphon/Spout Texture Sharing section
         ui.add_space(8.0);
         #[cfg(target_os = "macos")]
@@ -532,176 +589,7 @@ impl PropertiesPanel {
         ui.heading("Master Effects");
         ui.add_space(8.0);
 
-        // Render effect stack for the environment
-        let env_effects = environment.effects();
-        let effect_count = env_effects.len();
-
-        if effect_count == 0 {
-            ui.label("No master effects. Drag effects here from the Effects Browser.");
-        } else {
-            // Render each effect in the stack
-            for (index, effect) in env_effects.effects.iter().enumerate() {
-                ui.horizontal(|ui| {
-                    // Bypass toggle
-                    let mut bypassed = effect.bypassed;
-                    if ui.checkbox(&mut bypassed, "").changed() {
-                        actions.push(PropertiesAction::SetEnvironmentEffectBypassed {
-                            effect_id: effect.id,
-                            bypassed,
-                        });
-                    }
-
-                    // Solo toggle
-                    let solo_text = if effect.soloed { "S" } else { "s" };
-                    if ui.selectable_label(effect.soloed, solo_text).clicked() {
-                        actions.push(PropertiesAction::SetEnvironmentEffectSoloed {
-                            effect_id: effect.id,
-                            soloed: !effect.soloed,
-                        });
-                    }
-
-                    // Effect name
-                    let effect_label = if effect.bypassed {
-                        format!("⊘ {}", effect.name)
-                    } else {
-                        effect.name.clone()
-                    };
-                    ui.label(&effect_label);
-
-                    // Spacer
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // Remove button
-                        if ui.small_button("✕").clicked() {
-                            actions.push(PropertiesAction::RemoveEnvironmentEffect {
-                                effect_id: effect.id,
-                            });
-                        }
-
-                        // Move down
-                        if index < effect_count - 1 && ui.small_button("↓").clicked() {
-                            actions.push(PropertiesAction::ReorderEnvironmentEffect {
-                                effect_id: effect.id,
-                                new_index: index + 1,
-                            });
-                        }
-
-                        // Move up
-                        if index > 0 && ui.small_button("↑").clicked() {
-                            actions.push(PropertiesAction::ReorderEnvironmentEffect {
-                                effect_id: effect.id,
-                                new_index: index - 1,
-                            });
-                        }
-                    });
-                });
-
-                // Render parameters if effect is expanded
-                if effect.expanded && !effect.parameters.is_empty() {
-                    ui.indent(effect.id, |ui| {
-                        self.render_environment_effect_parameters(ui, effect, actions);
-                    });
-                }
-            }
-        }
-
-        // Drop target for adding effects via drag and drop
-        let drop_response = ui.allocate_response(
-            egui::vec2(ui.available_width(), 30.0),
-            egui::Sense::hover(),
-        );
-
-        // Check for drag and drop
-        if let Some(_payload) = drop_response.dnd_hover_payload::<DraggableEffect>() {
-            ui.painter().rect_filled(
-                drop_response.rect,
-                4.0,
-                egui::Color32::from_rgba_unmultiplied(100, 150, 255, 50),
-            );
-            if drop_response.hovered() {
-                // Accept the drop
-                if let Some(effect) = egui::DragAndDrop::payload::<DraggableEffect>(ui.ctx()) {
-                    if ui.input(|i| i.pointer.any_released()) {
-                        actions.push(PropertiesAction::AddEnvironmentEffect {
-                            effect_type: effect.effect_type.clone(),
-                        });
-                    }
-                }
-            }
-        }
-
-        // Add effect button
-        ui.add_space(8.0);
-        egui::ComboBox::from_label("Add Master Effect")
-            .selected_text("Select...")
-            .show_ui(ui, |ui| {
-                for category in effect_registry.categories() {
-                    ui.menu_button(category, |ui| {
-                        if let Some(effect_types) = effect_registry.effects_in_category(category) {
-                            for effect_type in effect_types {
-                                if let Some(def) = effect_registry.get(effect_type) {
-                                    if ui.button(def.display_name()).clicked() {
-                                        actions.push(PropertiesAction::AddEnvironmentEffect {
-                                            effect_type: effect_type.clone(),
-                                        });
-                                        ui.close_menu();
-                                    }
-                                }
-                            }
-                        }
-                    });
-                }
-            });
-    }
-
-    /// Render parameters for an environment effect
-    fn render_environment_effect_parameters(
-        &self,
-        ui: &mut egui::Ui,
-        effect: &crate::effects::EffectInstance,
-        actions: &mut Vec<PropertiesAction>,
-    ) {
-        for param in &effect.parameters {
-            ui.horizontal(|ui| {
-                ui.label(&param.meta.label);
-                match &param.value {
-                    ParameterValue::Float(val) => {
-                        let mut v = *val;
-                        let range = param.meta.min.unwrap_or(0.0)..=param.meta.max.unwrap_or(1.0);
-                        if ui.add(egui::Slider::new(&mut v, range)).changed() {
-                            actions.push(PropertiesAction::SetEnvironmentEffectParameter {
-                                effect_id: effect.id,
-                                param_name: param.meta.name.clone(),
-                                value: ParameterValue::Float(v),
-                            });
-                        }
-                    }
-                    ParameterValue::Int(val) => {
-                        let mut v = *val;
-                        let range = param.meta.min.unwrap_or(0.0) as i32..=param.meta.max.unwrap_or(100.0) as i32;
-                        if ui.add(egui::Slider::new(&mut v, range)).changed() {
-                            actions.push(PropertiesAction::SetEnvironmentEffectParameter {
-                                effect_id: effect.id,
-                                param_name: param.meta.name.clone(),
-                                value: ParameterValue::Int(v),
-                            });
-                        }
-                    }
-                    ParameterValue::Bool(val) => {
-                        let mut v = *val;
-                        if ui.checkbox(&mut v, "").changed() {
-                            actions.push(PropertiesAction::SetEnvironmentEffectParameter {
-                                effect_id: effect.id,
-                                param_name: param.meta.name.clone(),
-                                value: ParameterValue::Bool(v),
-                            });
-                        }
-                    }
-                    _ => {
-                        ui.label("(unsupported parameter type)");
-                    }
-                }
-            });
-        }
+        self.render_effect_stack_generic(ui, EffectContext::Environment, environment.effects(), effect_registry, actions);
     }
 
     /// Render the Layer tab
@@ -1066,21 +954,21 @@ impl PropertiesPanel {
         ui.heading("Effects");
         ui.add_space(8.0);
 
-        self.render_effect_stack(ui, layer_id, layer, effect_registry, actions);
+        self.render_effect_stack_generic(ui, EffectContext::Layer { layer_id }, &layer.effects, effect_registry, actions);
     }
 
-    /// Render effect stack for a layer
-    fn render_effect_stack(
+    /// Render an effect stack for any context (layer, clip, or environment)
+    ///
+    /// Clean design with collapsible effect sections and aligned parameter rows.
+    fn render_effect_stack_generic(
         &self,
         ui: &mut egui::Ui,
-        layer_id: u32,
-        layer: &Layer,
+        context: EffectContext,
+        effects: &EffectStack,
         effect_registry: &EffectRegistry,
         actions: &mut Vec<PropertiesAction>,
     ) {
-        let effects = &layer.effects;
-
-        // Check if a DraggableEffect is specifically being dragged (not just any widget interaction)
+        // Check if a DraggableEffect is specifically being dragged
         let is_dragging_effect = egui::DragAndDrop::payload::<DraggableEffect>(ui.ctx()).is_some();
 
         // Visual feedback for drop zone only when dragging an effect
@@ -1097,102 +985,118 @@ impl PropertiesPanel {
         let drop_response = frame.show(ui, |ui| {
             ui.dnd_drop_zone::<DraggableEffect, ()>(egui::Frame::NONE, |ui| {
                 if effects.is_empty() {
-                    ui.add_space(20.0);
+                    ui.add_space(12.0);
                     ui.label(
-                        egui::RichText::new("Drop effects here or use + button below")
-                            .italics()
-                            .color(egui::Color32::GRAY),
+                        egui::RichText::new("Drop effect or mask. Double click to search.")
+                            .color(egui::Color32::from_gray(100)),
                     );
-                    ui.add_space(20.0);
+                    ui.add_space(12.0);
                 } else {
-                    // Render each effect
+                    let effect_count = effects.effects.len();
+
+                    // Render each effect as a collapsible section
                     for (index, effect) in effects.effects.iter().enumerate() {
                         ui.push_id(effect.id, |ui| {
-                            // Effect header
-                            ui.horizontal(|ui| {
-                                // Bypass button (B)
-                                let bypass_color = if effect.bypassed {
-                                    egui::Color32::GRAY
-                                } else {
-                                    egui::Color32::GREEN
-                                };
-                                if ui
-                                    .small_button(egui::RichText::new("B").color(bypass_color))
-                                    .on_hover_text(if effect.bypassed { "Enable effect" } else { "Bypass effect" })
-                                    .clicked()
-                                {
-                                    actions.push(PropertiesAction::SetLayerEffectBypassed {
-                                        layer_id,
-                                        effect_id: effect.id,
-                                        bypassed: !effect.bypassed,
-                                    });
-                                }
+                            // Header background color - darker for section headers
+                            let header_bg = if effect.bypassed {
+                                egui::Color32::from_gray(35)
+                            } else {
+                                egui::Color32::from_rgb(45, 65, 55) // Subtle green tint when active
+                            };
 
-                                // Solo button (S)
-                                let solo_color = if effect.soloed {
-                                    egui::Color32::YELLOW
-                                } else {
-                                    egui::Color32::GRAY
-                                };
-                                if ui
-                                    .small_button(egui::RichText::new("S").color(solo_color))
-                                    .on_hover_text(if effect.soloed { "Unsolo effect" } else { "Solo this effect" })
-                                    .clicked()
-                                {
-                                    actions.push(PropertiesAction::SetLayerEffectSoloed {
-                                        layer_id,
-                                        effect_id: effect.id,
-                                        soloed: !effect.soloed,
-                                    });
-                                }
+                            // Effect header with collapsible state
+                            let header_response = egui::Frame::new()
+                                .fill(header_bg)
+                                .inner_margin(egui::Margin::symmetric(6, 4))
+                                .corner_radius(2.0)
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        // Disclosure triangle
+                                        let arrow = if effect.expanded { "▼" } else { "▶" };
+                                        let arrow_response = ui.add(
+                                            egui::Label::new(egui::RichText::new(arrow).size(10.0).color(egui::Color32::GRAY))
+                                                .sense(egui::Sense::click())
+                                        );
 
-                                // Effect name
-                                let name_style = if effect.bypassed {
-                                    egui::RichText::new(&effect.name).strikethrough().color(egui::Color32::GRAY)
-                                } else {
-                                    egui::RichText::new(&effect.name)
-                                };
-                                ui.label(name_style);
+                                        // Effect name
+                                        let name_color = if effect.bypassed {
+                                            egui::Color32::from_gray(100)
+                                        } else {
+                                            egui::Color32::from_gray(200)
+                                        };
+                                        let name_text = egui::RichText::new(&effect.name).color(name_color);
+                                        ui.label(name_text);
 
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    // Remove button
-                                    if ui.small_button("✕").on_hover_text("Remove effect").clicked() {
-                                        actions.push(PropertiesAction::RemoveLayerEffect {
-                                            layer_id,
-                                            effect_id: effect.id,
+                                        // Status indicators on the right
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            // Bypass indicator
+                                            if effect.bypassed {
+                                                ui.label(egui::RichText::new("B").size(10.0).color(egui::Color32::from_gray(80)));
+                                            }
+                                            // Solo indicator
+                                            if effect.soloed {
+                                                ui.label(egui::RichText::new("S").size(10.0).color(egui::Color32::YELLOW));
+                                            }
                                         });
-                                    }
 
-                                    // Move up/down buttons
-                                    if index > 0 && ui.small_button("▲").on_hover_text("Move up").clicked() {
-                                        actions.push(PropertiesAction::ReorderLayerEffect {
-                                            layer_id,
-                                            effect_id: effect.id,
-                                            new_index: index - 1,
-                                        });
-                                    }
-                                    if index < effects.effects.len() - 1
-                                        && ui.small_button("▼").on_hover_text("Move down").clicked()
-                                    {
-                                        actions.push(PropertiesAction::ReorderLayerEffect {
-                                            layer_id,
-                                            effect_id: effect.id,
-                                            new_index: index + 1,
-                                        });
-                                    }
+                                        arrow_response
+                                    })
                                 });
-                            });
 
-                            // Render parameters if not bypassed
-                            if !effect.bypassed {
-                                ui.indent(effect.id, |ui| {
-                                    for param in &effect.parameters {
-                                        self.render_effect_parameter(ui, layer_id, effect.id, param, actions);
-                                    }
-                                });
+                            // Handle click on arrow or header to toggle expanded state
+                            if header_response.inner.inner.clicked() || header_response.response.clicked() {
+                                self.push_expanded_action(actions, context, effect.id, !effect.expanded);
                             }
 
-                            ui.add_space(4.0);
+                            // Right-click context menu for effect controls
+                            header_response.response.context_menu(|ui| {
+                                // Bypass toggle
+                                let bypass_label = if effect.bypassed { "Enable" } else { "Bypass" };
+                                if ui.button(bypass_label).clicked() {
+                                    self.push_bypass_action(actions, context, effect.id, !effect.bypassed);
+                                    ui.close_menu();
+                                }
+
+                                // Solo toggle
+                                let solo_label = if effect.soloed { "Unsolo" } else { "Solo" };
+                                if ui.button(solo_label).clicked() {
+                                    self.push_solo_action(actions, context, effect.id, !effect.soloed);
+                                    ui.close_menu();
+                                }
+
+                                ui.separator();
+
+                                // Reorder options
+                                if index > 0 {
+                                    if ui.button("Move Up").clicked() {
+                                        self.push_reorder_action(actions, context, effect.id, index - 1);
+                                        ui.close_menu();
+                                    }
+                                }
+                                if index < effect_count - 1 {
+                                    if ui.button("Move Down").clicked() {
+                                        self.push_reorder_action(actions, context, effect.id, index + 1);
+                                        ui.close_menu();
+                                    }
+                                }
+
+                                ui.separator();
+
+                                // Remove
+                                if ui.button(egui::RichText::new("Remove").color(egui::Color32::from_rgb(200, 80, 80))).clicked() {
+                                    self.push_remove_action(actions, context, effect.id);
+                                    ui.close_menu();
+                                }
+                            });
+
+                            // Render parameters if expanded and not bypassed
+                            if effect.expanded && !effect.bypassed {
+                                for param in &effect.parameters {
+                                    self.render_effect_parameter_generic(ui, context, effect.id, param, actions);
+                                }
+                            }
+
+                            ui.add_space(2.0);
                         });
                     }
                 }
@@ -1200,17 +1104,13 @@ impl PropertiesPanel {
         });
 
         // Handle dropped effect
-        // dnd_drop_zone returns (InnerResponse<R>, Option<Arc<T>>)
         if let Some(dragged_effect) = drop_response.inner.1 {
-            actions.push(PropertiesAction::AddLayerEffect {
-                layer_id,
-                effect_type: dragged_effect.effect_type.clone(),
-            });
+            self.push_add_action(actions, context, dragged_effect.effect_type.clone());
         }
 
-        ui.add_space(8.0);
+        ui.add_space(4.0);
 
-        // Add effect button with dropdown
+        // Add effect dropdown - cleaner style
         ui.horizontal(|ui| {
             ui.menu_button("+ Add Effect", |ui| {
                 for category in effect_registry.categories() {
@@ -1219,10 +1119,7 @@ impl PropertiesPanel {
                             for effect_type in effect_types {
                                 if let Some(def) = effect_registry.get(effect_type) {
                                     if ui.button(def.display_name()).clicked() {
-                                        actions.push(PropertiesAction::AddLayerEffect {
-                                            layer_id,
-                                            effect_type: effect_type.clone(),
-                                        });
+                                        self.push_add_action(actions, context, effect_type.clone());
                                         ui.close_menu();
                                     }
                                 }
@@ -1234,115 +1131,300 @@ impl PropertiesPanel {
         });
     }
 
-    /// Render a single effect parameter
-    fn render_effect_parameter(
+    /// Render a single effect parameter with clean aligned layout
+    ///
+    /// Layout: [Label (right-aligned, fixed width)] [Value] [Slider]
+    fn render_effect_parameter_generic(
         &self,
         ui: &mut egui::Ui,
-        layer_id: u32,
+        context: EffectContext,
         effect_id: u32,
         param: &crate::effects::Parameter,
         actions: &mut Vec<PropertiesAction>,
     ) {
-        use crate::effects::ParameterValue;
+        const LABEL_WIDTH: f32 = 80.0;
 
         ui.horizontal(|ui| {
-            ui.label(&param.meta.label);
+            // Fixed-width right-aligned label
+            ui.allocate_ui_with_layout(
+                egui::vec2(LABEL_WIDTH, ui.spacing().interact_size.y),
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| {
+                    ui.label(egui::RichText::new(&param.meta.label).color(egui::Color32::from_gray(180)));
+                },
+            );
+
+            ui.add_space(8.0);
 
             match &param.value {
                 ParameterValue::Float(value) => {
                     let mut val = *value;
-                    let range = param.meta.min.unwrap_or(0.0)..=param.meta.max.unwrap_or(1.0);
-                    let response = ui.add(egui::Slider::new(&mut val, range))
-                        .on_hover_text("Right-click to reset to default");
+                    let min = param.meta.min.unwrap_or(0.0);
+                    let max = param.meta.max.unwrap_or(1.0);
+
+                    // Value display with +/- would be nice, but slider is cleaner
+                    // Show value as text
+                    ui.label(
+                        egui::RichText::new(format!("{:.1}", val))
+                            .color(egui::Color32::from_gray(200))
+                            .monospace()
+                    );
+
+                    // Slider takes remaining width
+                    let response = ui.add(
+                        egui::Slider::new(&mut val, min..=max)
+                            .show_value(false)
+                            .clamping(egui::SliderClamping::Always)
+                    );
 
                     if response.changed() {
-                        actions.push(PropertiesAction::SetLayerEffectParameter {
-                            layer_id,
-                            effect_id,
-                            param_name: param.meta.name.clone(),
-                            value: ParameterValue::Float(val),
-                        });
-                    }
-
-                    // Right-click to reset to default (check rect for slider bar clicks)
-                    let clicked_in_rect = ui.input(|i| {
-                        i.pointer.secondary_clicked() &&
-                        response.rect.contains(i.pointer.interact_pos().unwrap_or_default())
-                    });
-                    if response.secondary_clicked() || clicked_in_rect {
-                        if let ParameterValue::Float(default_val) = param.meta.default {
-                            actions.push(PropertiesAction::SetLayerEffectParameter {
-                                layer_id,
-                                effect_id,
-                                param_name: param.meta.name.clone(),
-                                value: ParameterValue::Float(default_val),
-                            });
-                        }
-                    }
-                }
-                ParameterValue::Int(value) => {
-                    let mut val = *value;
-                    let range = param.meta.min.unwrap_or(0.0) as i32..=param.meta.max.unwrap_or(100.0) as i32;
-                    let response = ui.add(egui::Slider::new(&mut val, range))
-                        .on_hover_text("Right-click to reset to default");
-
-                    if response.changed() {
-                        actions.push(PropertiesAction::SetLayerEffectParameter {
-                            layer_id,
-                            effect_id,
-                            param_name: param.meta.name.clone(),
-                            value: ParameterValue::Int(val),
-                        });
-                    }
-
-                    // Right-click to reset to default (check rect for slider bar clicks)
-                    let clicked_in_rect = ui.input(|i| {
-                        i.pointer.secondary_clicked() &&
-                        response.rect.contains(i.pointer.interact_pos().unwrap_or_default())
-                    });
-                    if response.secondary_clicked() || clicked_in_rect {
-                        if let ParameterValue::Int(default_val) = param.meta.default {
-                            actions.push(PropertiesAction::SetLayerEffectParameter {
-                                layer_id,
-                                effect_id,
-                                param_name: param.meta.name.clone(),
-                                value: ParameterValue::Int(default_val),
-                            });
-                        }
-                    }
-                }
-                ParameterValue::Bool(value) => {
-                    let mut val = *value;
-                    let response = ui.checkbox(&mut val, "")
-                        .on_hover_text("Right-click to reset to default");
-
-                    if response.changed() {
-                        actions.push(PropertiesAction::SetLayerEffectParameter {
-                            layer_id,
-                            effect_id,
-                            param_name: param.meta.name.clone(),
-                            value: ParameterValue::Bool(val),
-                        });
+                        self.push_param_action(actions, context, effect_id, param.meta.name.clone(), ParameterValue::Float(val));
                     }
 
                     // Right-click to reset to default
-                    if response.secondary_clicked() {
-                        if let ParameterValue::Bool(default_val) = param.meta.default {
-                            actions.push(PropertiesAction::SetLayerEffectParameter {
-                                layer_id,
-                                effect_id,
-                                param_name: param.meta.name.clone(),
-                                value: ParameterValue::Bool(default_val),
-                            });
+                    response.context_menu(|ui| {
+                        if ui.button("Reset to Default").clicked() {
+                            if let ParameterValue::Float(default_val) = param.meta.default {
+                                self.push_param_action(actions, context, effect_id, param.meta.name.clone(), ParameterValue::Float(default_val));
+                            }
+                            ui.close_menu();
                         }
+                    });
+                }
+                ParameterValue::Int(value) => {
+                    let mut val = *value;
+                    let min = param.meta.min.unwrap_or(0.0) as i32;
+                    let max = param.meta.max.unwrap_or(100.0) as i32;
+
+                    // Value display
+                    ui.label(
+                        egui::RichText::new(format!("{}", val))
+                            .color(egui::Color32::from_gray(200))
+                            .monospace()
+                    );
+
+                    // Slider
+                    let response = ui.add(
+                        egui::Slider::new(&mut val, min..=max)
+                            .show_value(false)
+                            .clamping(egui::SliderClamping::Always)
+                    );
+
+                    if response.changed() {
+                        self.push_param_action(actions, context, effect_id, param.meta.name.clone(), ParameterValue::Int(val));
+                    }
+
+                    response.context_menu(|ui| {
+                        if ui.button("Reset to Default").clicked() {
+                            if let ParameterValue::Int(default_val) = param.meta.default {
+                                self.push_param_action(actions, context, effect_id, param.meta.name.clone(), ParameterValue::Int(default_val));
+                            }
+                            ui.close_menu();
+                        }
+                    });
+                }
+                ParameterValue::Bool(value) => {
+                    let mut val = *value;
+
+                    // Value display
+                    let val_text = if val { "On" } else { "Off" };
+                    ui.label(
+                        egui::RichText::new(val_text)
+                            .color(egui::Color32::from_gray(200))
+                            .monospace()
+                    );
+
+                    // Checkbox
+                    let response = ui.checkbox(&mut val, "");
+
+                    if response.changed() {
+                        self.push_param_action(actions, context, effect_id, param.meta.name.clone(), ParameterValue::Bool(val));
+                    }
+
+                    response.context_menu(|ui| {
+                        if ui.button("Reset to Default").clicked() {
+                            if let ParameterValue::Bool(default_val) = param.meta.default {
+                                self.push_param_action(actions, context, effect_id, param.meta.name.clone(), ParameterValue::Bool(default_val));
+                            }
+                            ui.close_menu();
+                        }
+                    });
+                }
+                ParameterValue::Enum { index, options } => {
+                    let mut current_index = *index;
+                    let selected_text = options.get(current_index).cloned().unwrap_or_default();
+
+                    egui::ComboBox::from_id_salt(format!("enum_{}_{}", effect_id, param.meta.name))
+                        .selected_text(&selected_text)
+                        .width(120.0)
+                        .show_ui(ui, |ui| {
+                            for (i, option) in options.iter().enumerate() {
+                                if ui.selectable_value(&mut current_index, i, option).changed() {
+                                    self.push_param_action(
+                                        actions,
+                                        context,
+                                        effect_id,
+                                        param.meta.name.clone(),
+                                        ParameterValue::Enum {
+                                            index: current_index,
+                                            options: options.clone(),
+                                        },
+                                    );
+                                }
+                            }
+                        });
+                }
+                ParameterValue::String(value) => {
+                    let mut text = value.clone();
+
+                    // Show filename only if path exists
+                    let display_text = if text.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        std::path::Path::new(&text)
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or(&text)
+                            .to_string()
+                    };
+
+                    ui.label(
+                        egui::RichText::new(&display_text)
+                            .color(egui::Color32::from_gray(200))
+                    );
+
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut text)
+                            .desired_width(100.0)
+                            .hint_text("path...")
+                    );
+
+                    if response.changed() {
+                        self.push_param_action(
+                            actions,
+                            context,
+                            effect_id,
+                            param.meta.name.clone(),
+                            ParameterValue::String(text.clone()),
+                        );
+                    }
+
+                    // Clear button
+                    if !value.is_empty() && ui.small_button("×").on_hover_text("Clear").clicked() {
+                        self.push_param_action(
+                            actions,
+                            context,
+                            effect_id,
+                            param.meta.name.clone(),
+                            ParameterValue::String(String::new()),
+                        );
                     }
                 }
                 _ => {
-                    // Other parameter types (Color, Vec2, Enum) can be added later
-                    ui.label("(unsupported type)");
+                    ui.label(egui::RichText::new("—").color(egui::Color32::from_gray(100)));
                 }
             }
         });
+    }
+
+    // Helper methods for generating context-specific actions
+
+    fn push_add_action(&self, actions: &mut Vec<PropertiesAction>, context: EffectContext, effect_type: String) {
+        match context {
+            EffectContext::Layer { layer_id } => {
+                actions.push(PropertiesAction::AddLayerEffect { layer_id, effect_type });
+            }
+            EffectContext::Clip { layer_id, slot } => {
+                actions.push(PropertiesAction::AddClipEffect { layer_id, slot, effect_type });
+            }
+            EffectContext::Environment => {
+                actions.push(PropertiesAction::AddEnvironmentEffect { effect_type });
+            }
+        }
+    }
+
+    fn push_remove_action(&self, actions: &mut Vec<PropertiesAction>, context: EffectContext, effect_id: u32) {
+        match context {
+            EffectContext::Layer { layer_id } => {
+                actions.push(PropertiesAction::RemoveLayerEffect { layer_id, effect_id });
+            }
+            EffectContext::Clip { layer_id, slot } => {
+                actions.push(PropertiesAction::RemoveClipEffect { layer_id, slot, effect_id });
+            }
+            EffectContext::Environment => {
+                actions.push(PropertiesAction::RemoveEnvironmentEffect { effect_id });
+            }
+        }
+    }
+
+    fn push_bypass_action(&self, actions: &mut Vec<PropertiesAction>, context: EffectContext, effect_id: u32, bypassed: bool) {
+        match context {
+            EffectContext::Layer { layer_id } => {
+                actions.push(PropertiesAction::SetLayerEffectBypassed { layer_id, effect_id, bypassed });
+            }
+            EffectContext::Clip { layer_id, slot } => {
+                actions.push(PropertiesAction::SetClipEffectBypassed { layer_id, slot, effect_id, bypassed });
+            }
+            EffectContext::Environment => {
+                actions.push(PropertiesAction::SetEnvironmentEffectBypassed { effect_id, bypassed });
+            }
+        }
+    }
+
+    fn push_solo_action(&self, actions: &mut Vec<PropertiesAction>, context: EffectContext, effect_id: u32, soloed: bool) {
+        match context {
+            EffectContext::Layer { layer_id } => {
+                actions.push(PropertiesAction::SetLayerEffectSoloed { layer_id, effect_id, soloed });
+            }
+            EffectContext::Clip { layer_id, slot } => {
+                actions.push(PropertiesAction::SetClipEffectSoloed { layer_id, slot, effect_id, soloed });
+            }
+            EffectContext::Environment => {
+                actions.push(PropertiesAction::SetEnvironmentEffectSoloed { effect_id, soloed });
+            }
+        }
+    }
+
+    fn push_reorder_action(&self, actions: &mut Vec<PropertiesAction>, context: EffectContext, effect_id: u32, new_index: usize) {
+        match context {
+            EffectContext::Layer { layer_id } => {
+                actions.push(PropertiesAction::ReorderLayerEffect { layer_id, effect_id, new_index });
+            }
+            EffectContext::Clip { layer_id, slot } => {
+                actions.push(PropertiesAction::ReorderClipEffect { layer_id, slot, effect_id, new_index });
+            }
+            EffectContext::Environment => {
+                actions.push(PropertiesAction::ReorderEnvironmentEffect { effect_id, new_index });
+            }
+        }
+    }
+
+    fn push_param_action(&self, actions: &mut Vec<PropertiesAction>, context: EffectContext, effect_id: u32, param_name: String, value: ParameterValue) {
+        match context {
+            EffectContext::Layer { layer_id } => {
+                actions.push(PropertiesAction::SetLayerEffectParameter { layer_id, effect_id, param_name, value });
+            }
+            EffectContext::Clip { layer_id, slot } => {
+                actions.push(PropertiesAction::SetClipEffectParameter { layer_id, slot, effect_id, param_name, value });
+            }
+            EffectContext::Environment => {
+                actions.push(PropertiesAction::SetEnvironmentEffectParameter { effect_id, param_name, value });
+            }
+        }
+    }
+
+    fn push_expanded_action(&self, actions: &mut Vec<PropertiesAction>, context: EffectContext, effect_id: u32, expanded: bool) {
+        match context {
+            EffectContext::Layer { layer_id } => {
+                actions.push(PropertiesAction::SetLayerEffectExpanded { layer_id, effect_id, expanded });
+            }
+            EffectContext::Clip { layer_id, slot } => {
+                actions.push(PropertiesAction::SetClipEffectExpanded { layer_id, slot, effect_id, expanded });
+            }
+            EffectContext::Environment => {
+                actions.push(PropertiesAction::SetEnvironmentEffectExpanded { effect_id, expanded });
+            }
+        }
     }
 
     /// Render the Clip tab
@@ -1425,198 +1507,7 @@ impl PropertiesPanel {
         ui.heading("Clip Effects");
         ui.add_space(8.0);
 
-        // Render effect stack for this clip
-        let effect_count = clip.effects.len();
-
-        if effect_count == 0 {
-            ui.label("No effects. Drag effects here from the Effects Browser.");
-        } else {
-            // Render each effect in the stack
-            for (index, effect) in clip.effects.effects.iter().enumerate() {
-                ui.horizontal(|ui| {
-                    // Bypass toggle
-                    let mut bypassed = effect.bypassed;
-                    if ui.checkbox(&mut bypassed, "").changed() {
-                        actions.push(PropertiesAction::SetClipEffectBypassed {
-                            layer_id,
-                            slot,
-                            effect_id: effect.id,
-                            bypassed,
-                        });
-                    }
-
-                    // Solo toggle
-                    let mut soloed = effect.soloed;
-                    let solo_text = if soloed { "S" } else { "s" };
-                    if ui.selectable_label(soloed, solo_text).clicked() {
-                        actions.push(PropertiesAction::SetClipEffectSoloed {
-                            layer_id,
-                            slot,
-                            effect_id: effect.id,
-                            soloed: !soloed,
-                        });
-                    }
-
-                    // Effect name
-                    let effect_label = if effect.bypassed {
-                        format!("⊘ {}", effect.name)
-                    } else {
-                        effect.name.clone()
-                    };
-                    ui.label(&effect_label);
-
-                    // Spacer
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // Remove button
-                        if ui.small_button("✕").clicked() {
-                            actions.push(PropertiesAction::RemoveClipEffect {
-                                layer_id,
-                                slot,
-                                effect_id: effect.id,
-                            });
-                        }
-
-                        // Move down
-                        if index < effect_count - 1 && ui.small_button("↓").clicked() {
-                            actions.push(PropertiesAction::ReorderClipEffect {
-                                layer_id,
-                                slot,
-                                effect_id: effect.id,
-                                new_index: index + 1,
-                            });
-                        }
-
-                        // Move up
-                        if index > 0 && ui.small_button("↑").clicked() {
-                            actions.push(PropertiesAction::ReorderClipEffect {
-                                layer_id,
-                                slot,
-                                effect_id: effect.id,
-                                new_index: index - 1,
-                            });
-                        }
-                    });
-                });
-
-                // Render parameters if effect is expanded
-                if effect.expanded && !effect.parameters.is_empty() {
-                    ui.indent(effect.id, |ui| {
-                        self.render_clip_effect_parameters(ui, layer_id, slot, effect, actions);
-                    });
-                }
-            }
-        }
-
-        // Drop target for adding effects via drag and drop
-        let drop_response = ui.allocate_response(
-            egui::vec2(ui.available_width(), 30.0),
-            egui::Sense::hover(),
-        );
-
-        // Check for drag and drop
-        if let Some(payload) = drop_response.dnd_hover_payload::<DraggableEffect>() {
-            ui.painter().rect_filled(
-                drop_response.rect,
-                4.0,
-                egui::Color32::from_rgba_unmultiplied(100, 150, 255, 50),
-            );
-            if drop_response.hovered() {
-                // Accept the drop
-                if let Some(effect) = egui::DragAndDrop::payload::<DraggableEffect>(ui.ctx()) {
-                    if ui.input(|i| i.pointer.any_released()) {
-                        actions.push(PropertiesAction::AddClipEffect {
-                            layer_id,
-                            slot,
-                            effect_type: effect.effect_type.clone(),
-                        });
-                    }
-                }
-            }
-        }
-
-        // Add effect button
-        ui.add_space(8.0);
-        egui::ComboBox::from_label("Add Effect")
-            .selected_text("Select...")
-            .show_ui(ui, |ui| {
-                for category in effect_registry.categories() {
-                    ui.menu_button(category, |ui| {
-                        if let Some(effect_types) = effect_registry.effects_in_category(category) {
-                            for effect_type in effect_types {
-                                if let Some(def) = effect_registry.get(effect_type) {
-                                    if ui.button(def.display_name()).clicked() {
-                                        actions.push(PropertiesAction::AddClipEffect {
-                                            layer_id,
-                                            slot,
-                                            effect_type: effect_type.clone(),
-                                        });
-                                        ui.close_menu();
-                                    }
-                                }
-                            }
-                        }
-                    });
-                }
-            });
-    }
-
-    /// Render parameters for a clip effect
-    fn render_clip_effect_parameters(
-        &self,
-        ui: &mut egui::Ui,
-        layer_id: u32,
-        slot: usize,
-        effect: &crate::effects::EffectInstance,
-        actions: &mut Vec<PropertiesAction>,
-    ) {
-        for param in &effect.parameters {
-            ui.horizontal(|ui| {
-                ui.label(&param.meta.label);
-                match &param.value {
-                    ParameterValue::Float(val) => {
-                        let mut v = *val;
-                        let range = param.meta.min.unwrap_or(0.0)..=param.meta.max.unwrap_or(1.0);
-                        if ui.add(egui::Slider::new(&mut v, range)).changed() {
-                            actions.push(PropertiesAction::SetClipEffectParameter {
-                                layer_id,
-                                slot,
-                                effect_id: effect.id,
-                                param_name: param.meta.name.clone(),
-                                value: ParameterValue::Float(v),
-                            });
-                        }
-                    }
-                    ParameterValue::Int(val) => {
-                        let mut v = *val;
-                        let range = param.meta.min.unwrap_or(0.0) as i32..=param.meta.max.unwrap_or(100.0) as i32;
-                        if ui.add(egui::Slider::new(&mut v, range)).changed() {
-                            actions.push(PropertiesAction::SetClipEffectParameter {
-                                layer_id,
-                                slot,
-                                effect_id: effect.id,
-                                param_name: param.meta.name.clone(),
-                                value: ParameterValue::Int(v),
-                            });
-                        }
-                    }
-                    ParameterValue::Bool(val) => {
-                        let mut v = *val;
-                        if ui.checkbox(&mut v, "").changed() {
-                            actions.push(PropertiesAction::SetClipEffectParameter {
-                                layer_id,
-                                slot,
-                                effect_id: effect.id,
-                                param_name: param.meta.name.clone(),
-                                value: ParameterValue::Bool(v),
-                            });
-                        }
-                    }
-                    _ => {
-                        ui.label("(unsupported parameter type)");
-                    }
-                }
-            });
-        }
+        self.render_effect_stack_generic(ui, EffectContext::Clip { layer_id, slot }, &clip.effects, effect_registry, actions);
     }
 }
 

@@ -176,6 +176,14 @@ pub struct App {
     /// Pending OMT sender from background start (received when ready)
     pending_omt_sender: Option<std::sync::mpsc::Receiver<Result<crate::network::OmtSender, String>>>,
 
+    // NDI (Network Device Interface) networking
+    /// NDI sender for broadcasting the environment
+    ndi_sender: Option<crate::network::NdiSender>,
+    /// NDI capture for GPU texture readback
+    ndi_capture: Option<crate::network::NdiCapture>,
+    /// Whether NDI sender is enabled (broadcasts environment)
+    ndi_broadcast_enabled: bool,
+
     // Syphon/Spout texture sharing
     /// Texture sharer for Syphon (macOS) or Spout (Windows)
     #[cfg(target_os = "macos")]
@@ -484,6 +492,11 @@ impl App {
             omt_broadcast_enabled: false, // Disabled by default - enable via menu
             tokio_runtime: Self::create_tokio_runtime(),
             pending_omt_sender: None,
+
+            // NDI networking
+            ndi_sender: None,
+            ndi_capture: None,
+            ndi_broadcast_enabled: false,
 
             // Syphon/Spout texture sharing
             #[cfg(target_os = "macos")]
@@ -914,6 +927,11 @@ impl App {
             capture.resize(&self.device, desired_width, desired_height);
         }
 
+        // Resize NDI capture buffers if broadcasting
+        if let Some(capture) = &mut self.ndi_capture {
+            capture.resize(&self.device, desired_width, desired_height);
+        }
+
         self.update_present_params();
         self.update_checker_params();
         self.update_layer_params_for_environment();
@@ -1104,6 +1122,7 @@ impl App {
         // Get layer list for property panels
         let layers: Vec<_> = self.environment.layers().to_vec();
         let omt_broadcasting = self.is_omt_broadcasting();
+        let ndi_broadcasting = self.is_ndi_broadcasting();
 
         // Render properties panel (left panel or floating)
         let prop_actions = if let Some(panel) = self.dock_manager.get_panel(crate::ui::dock::panel_ids::PROPERTIES) {
@@ -1134,7 +1153,7 @@ impl App {
                                     });
                                 });
                                 ui.separator();
-                                actions = self.properties_panel.render(ui, &self.environment, &layers, &self.settings, omt_broadcasting, self.texture_share_enabled, self.effect_manager.registry());
+                                actions = self.properties_panel.render(ui, &self.environment, &layers, &self.settings, omt_broadcasting, ndi_broadcasting, self.texture_share_enabled, self.effect_manager.registry());
                             });
                         actions
                     }
@@ -1173,7 +1192,7 @@ impl App {
                                     });
                                 });
                                 ui.separator();
-                                actions = self.properties_panel.render(ui, &self.environment, &layers, &self.settings, omt_broadcasting, self.texture_share_enabled, self.effect_manager.registry());
+                                actions = self.properties_panel.render(ui, &self.environment, &layers, &self.settings, omt_broadcasting, ndi_broadcasting, self.texture_share_enabled, self.effect_manager.registry());
                             });
 
                         // Track window dragging for dock zone snapping
@@ -1912,6 +1931,13 @@ impl App {
             }
         }
 
+        // Capture environment texture for NDI output
+        if self.ndi_broadcast_enabled {
+            if let Some(capture) = &mut self.ndi_capture {
+                capture.capture_frame(&mut encoder, self.environment.texture());
+            }
+        }
+
         // Publish environment texture via Syphon (macOS)
         #[cfg(target_os = "macos")]
         if self.texture_share_enabled {
@@ -2002,6 +2028,13 @@ impl App {
         // Process OMT capture pipeline (non-blocking)
         if self.omt_broadcast_enabled {
             if let Some(capture) = &mut self.omt_capture {
+                capture.process(&self.device);
+            }
+        }
+
+        // Process NDI capture pipeline (non-blocking)
+        if self.ndi_broadcast_enabled {
+            if let Some(capture) = &mut self.ndi_capture {
                 capture.process(&self.device);
             }
         }
@@ -2138,9 +2171,80 @@ impl App {
             video_width: player.width(),
             video_height: player.height(),
             player: Some(player),
+            ndi_receiver: None,
             texture: Some(video_texture),
             bind_group: Some(bind_group),
             has_frame: false, // Will be set to true when first frame is uploaded
+            // Transition state (initialized empty)
+            transition_active: false,
+            transition_start: None,
+            transition_duration: std::time::Duration::ZERO,
+            transition_type: crate::compositor::ClipTransition::Cut,
+            old_bind_group: None,
+            old_video_width: 0,
+            old_video_height: 0,
+            old_params_buffer: None,
+            params_buffer: Some(params_buffer),
+            // Fade-out state (initialized empty)
+            fade_out_active: false,
+            fade_out_start: None,
+            fade_out_duration: std::time::Duration::ZERO,
+        };
+
+        if old_runtime_exists {
+            // Put in pending - old runtime continues to render until new one has a frame
+            self.pending_runtimes.insert(layer_id, runtime);
+        } else {
+            // No old runtime - insert directly
+            self.layer_runtimes.insert(layer_id, runtime);
+        }
+
+        Ok(())
+    }
+
+    /// Load an NDI source for an existing layer
+    fn load_layer_ndi(
+        &mut self,
+        layer_id: u32,
+        ndi_name: &str,
+    ) -> Result<(), String> {
+        let old_runtime_exists = self.layer_runtimes.contains_key(&layer_id);
+
+        // Create NDI receiver (url_address not currently used by NdiReceiver)
+        let receiver = crate::network::NdiReceiver::connect(ndi_name)
+            .map_err(|e| format!("Failed to connect to NDI source: {}", e))?;
+
+        log::info!(
+            "Layer {}: Connected to NDI source '{}'",
+            layer_id,
+            ndi_name
+        );
+
+        // Create a default-sized texture that will be resized on first frame
+        // NDI sources don't report their resolution until we receive a frame
+        let default_width = 1920;
+        let default_height = 1080;
+
+        let video_texture = VideoTexture::new(&self.device, default_width, default_height);
+
+        // Create per-layer params buffer
+        let params_buffer = self.video_renderer.create_params_buffer(&self.device);
+
+        // Create bind group
+        let bind_group = self
+            .video_renderer
+            .create_bind_group_with_buffer(&self.device, &video_texture, &params_buffer);
+
+        // Store runtime
+        let runtime = LayerRuntime {
+            layer_id,
+            video_width: default_width,
+            video_height: default_height,
+            player: None,
+            ndi_receiver: Some(receiver),
+            texture: Some(video_texture),
+            bind_group: Some(bind_group),
+            has_frame: false,
             // Transition state (initialized empty)
             transition_active: false,
             transition_start: None,
@@ -2498,6 +2602,41 @@ impl App {
                 log::warn!("📡 OMT playback not yet implemented: {} ({})", name, address);
                 return Err(format!("OMT playback not yet implemented. Source: {} ({})", name, address));
             }
+            crate::compositor::ClipSource::Ndi { ndi_name, .. } => {
+                // Check if this is a replay of the same NDI source
+                let is_same_source = if let Some(runtime) = self.layer_runtimes.get(&layer_id) {
+                    if let Some(receiver) = &runtime.ndi_receiver {
+                        receiver.source_name() == ndi_name
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+
+                if is_same_source {
+                    // Same NDI source - nothing to do (NDI streams continuously)
+                    log::info!("📺 NDI source already active on layer {}: {}", layer_id, ndi_name);
+                } else {
+                    // Different source - connect to new NDI source
+                    log::info!(
+                        "📺 Connecting to NDI source '{}' on layer {} with {:?} transition",
+                        ndi_name, layer_id, transition.name()
+                    );
+
+                    // Store the transition type for when the new source is ready
+                    self.pending_transition.insert(layer_id, transition);
+
+                    self.load_layer_ndi(layer_id, ndi_name)?;
+                }
+
+                // Update the active clip slot in the layer
+                if let Some(layer) = self.environment.get_layer_mut(layer_id) {
+                    layer.active_clip = Some(slot);
+                    // Use None for NDI sources (could add LayerSource::Ndi variant later)
+                    layer.source = crate::compositor::LayerSource::None;
+                }
+            }
         }
 
         Ok(())
@@ -2754,6 +2893,140 @@ impl App {
     /// Check if OMT broadcast is starting (pending)
     pub fn is_omt_starting(&self) -> bool {
         self.pending_omt_sender.is_some()
+    }
+
+    // =========================================================================
+    // NDI (Network Device Interface) Methods
+    // =========================================================================
+
+    /// Set an NDI source as a clip in a layer's clip slots
+    pub fn set_layer_ndi_clip(
+        &mut self,
+        layer_id: u32,
+        slot: usize,
+        ndi_name: String,
+        url_address: Option<String>,
+    ) -> bool {
+        if let Some(layer) = self.environment.get_layer_mut(layer_id) {
+            let cell = crate::compositor::ClipCell::from_ndi(&ndi_name, url_address);
+            if layer.set_clip(slot, cell) {
+                log::info!(
+                    "📺 Assigned NDI source '{}' to layer {} slot {}",
+                    ndi_name, layer_id, slot
+                );
+                // Extract display name for status
+                let display_name = if let Some(paren_start) = ndi_name.find(" (") {
+                    ndi_name[paren_start + 2..].trim_end_matches(')').to_string()
+                } else {
+                    ndi_name.clone()
+                };
+                self.menu_bar.set_status(format!("Assigned NDI source: {}", display_name));
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Start NDI discovery
+    pub fn start_ndi_discovery(&mut self) {
+        if let Some(discovery) = &mut self.omt_discovery {
+            match discovery.start_ndi_discovery() {
+                Ok(()) => {
+                    log::info!("📺 NDI: Discovery started");
+                    self.sources_panel.set_ndi_discovery_enabled(true);
+                    self.menu_bar.set_status("NDI discovery started");
+                }
+                Err(e) => {
+                    log::error!("📺 NDI: Failed to start discovery: {}", e);
+                    self.menu_bar.set_status(format!("NDI discovery failed: {}", e));
+                }
+            }
+        }
+    }
+
+    /// Stop NDI discovery
+    pub fn stop_ndi_discovery(&mut self) {
+        if let Some(discovery) = &mut self.omt_discovery {
+            discovery.stop_ndi_discovery();
+            log::info!("📺 NDI: Discovery stopped");
+            self.sources_panel.set_ndi_discovery_enabled(false);
+            self.sources_panel.set_ndi_sources(Vec::new());
+            self.menu_bar.set_status("NDI discovery stopped");
+        }
+    }
+
+    /// Refresh the list of discovered NDI sources
+    pub fn refresh_ndi_sources(&mut self) {
+        if let Some(discovery) = &mut self.omt_discovery {
+            discovery.refresh();
+        }
+        self.update_ndi_sources_in_ui();
+    }
+
+    /// Update the UI with the current NDI sources (called periodically)
+    pub fn update_ndi_sources_in_ui(&mut self) {
+        if let Some(discovery) = &self.omt_discovery {
+            if discovery.is_ndi_enabled() {
+                let sources: Vec<(String, String, Option<String>)> = discovery
+                    .get_sources_by_type(crate::network::SourceType::Ndi)
+                    .into_iter()
+                    .map(|s| {
+                        let url_address = s.properties.get("url_address").cloned();
+                        let ndi_name = s.id.strip_prefix("ndi:").unwrap_or(&s.id).to_string();
+                        (ndi_name, s.name, url_address)
+                    })
+                    .collect();
+                self.sources_panel.set_ndi_sources(sources);
+            }
+        }
+    }
+
+    /// Start NDI broadcast
+    pub fn start_ndi_broadcast(&mut self, name: &str) {
+        if self.ndi_capture.is_some() {
+            log::info!("NDI: Broadcast already active");
+            return;
+        }
+
+        // Create NDI sender
+        match crate::network::NdiSender::new(name) {
+            Ok(sender) => {
+                let w = self.environment.width();
+                let h = self.environment.height();
+                log::info!("📺 NDI: Creating capture pipeline for {}x{}", w, h);
+
+                let mut capture = crate::network::NdiCapture::new(&self.device, w, h);
+                capture.set_target_fps(self.settings.ndi_capture_fps);
+                capture.start_sender_thread(sender);
+                self.ndi_capture = Some(capture);
+                self.ndi_broadcast_enabled = true;
+                self.menu_bar.set_status(format!("NDI broadcast started ({}x{})", w, h));
+                log::info!("📺 NDI: Capture pipeline started, broadcasting {}x{}", w, h);
+            }
+            Err(e) => {
+                log::error!("NDI: Failed to create sender: {}", e);
+                self.ndi_broadcast_enabled = false;
+                self.settings.ndi_broadcast_enabled = false;
+                self.menu_bar.set_status(format!("NDI broadcast failed: {}", e));
+            }
+        }
+    }
+
+    /// Stop NDI broadcast
+    pub fn stop_ndi_broadcast(&mut self) {
+        if self.ndi_capture.is_some() {
+            // Drop capture - this stops the sender thread
+            self.ndi_capture = None;
+            self.ndi_sender = None;
+            self.ndi_broadcast_enabled = false;
+            log::info!("📺 NDI: Stopped broadcast");
+            self.menu_bar.set_status("NDI broadcast stopped");
+        }
+    }
+
+    /// Check if NDI broadcast is active
+    pub fn is_ndi_broadcasting(&self) -> bool {
+        self.ndi_capture.as_ref().map(|c| c.is_sender_running()).unwrap_or(false)
     }
 
     // =========================================
@@ -3123,6 +3396,10 @@ impl App {
                 // Assign an OMT source to a clip slot
                 self.set_layer_omt_clip(layer_id, slot, address, name);
             }
+            ClipGridAction::AssignNdiSource { layer_id, slot, ndi_name, url_address } => {
+                // Assign an NDI source to a clip slot
+                self.set_layer_ndi_clip(layer_id, slot, ndi_name, url_address);
+            }
             ClipGridAction::SelectClipForPreview { layer_id, slot } => {
                 // Select clip for preview without triggering it
                 // Load the clip into the preview player
@@ -3132,6 +3409,7 @@ impl App {
                         let source_info = match &clip.source {
                             crate::compositor::ClipSource::File { path } => path.display().to_string(),
                             crate::compositor::ClipSource::Omt { address, .. } => format!("OMT: {}", address),
+                            crate::compositor::ClipSource::Ndi { ndi_name, .. } => format!("NDI: {}", ndi_name),
                         };
                         self.preview_monitor_panel.set_preview_clip(crate::ui::PreviewClipInfo {
                             layer_id,
@@ -3151,6 +3429,10 @@ impl App {
                             crate::compositor::ClipSource::Omt { .. } => {
                                 log::info!("OMT preview not yet implemented");
                                 self.menu_bar.set_status("OMT preview not yet supported".to_string());
+                            }
+                            crate::compositor::ClipSource::Ndi { .. } => {
+                                log::info!("NDI preview not yet implemented");
+                                self.menu_bar.set_status("NDI preview not yet supported".to_string());
                             }
                         }
 
@@ -3235,6 +3517,21 @@ impl App {
             PropertiesAction::SetOmtCaptureFps { fps } => {
                 self.settings.omt_capture_fps = fps;
                 if let Some(ref mut capture) = self.omt_capture {
+                    capture.set_target_fps(fps);
+                }
+            }
+            PropertiesAction::SetNdiBroadcast { enabled } => {
+                self.settings.ndi_broadcast_enabled = enabled;
+                self.ndi_broadcast_enabled = enabled;
+                if enabled {
+                    self.start_ndi_broadcast("Immersive Server");
+                } else {
+                    self.stop_ndi_broadcast();
+                }
+            }
+            PropertiesAction::SetNdiCaptureFps { fps } => {
+                self.settings.ndi_capture_fps = fps;
+                if let Some(ref mut capture) = self.ndi_capture {
                     capture.set_target_fps(fps);
                 }
             }
@@ -3414,6 +3711,27 @@ impl App {
             PropertiesAction::ReorderEnvironmentEffect { effect_id, new_index } => {
                 self.environment.effects_mut().move_effect(effect_id, new_index);
             }
+            PropertiesAction::SetLayerEffectExpanded { layer_id, effect_id, expanded } => {
+                if let Some(layer) = self.environment.get_layer_mut(layer_id) {
+                    if let Some(effect) = layer.effects.get_mut(effect_id) {
+                        effect.expanded = expanded;
+                    }
+                }
+            }
+            PropertiesAction::SetClipEffectExpanded { layer_id, slot, effect_id, expanded } => {
+                if let Some(layer) = self.environment.get_layer_mut(layer_id) {
+                    if let Some(clip) = layer.get_clip_mut(slot) {
+                        if let Some(effect) = clip.effects.get_mut(effect_id) {
+                            effect.expanded = expanded;
+                        }
+                    }
+                }
+            }
+            PropertiesAction::SetEnvironmentEffectExpanded { effect_id, expanded } => {
+                if let Some(effect) = self.environment.effects_mut().get_mut(effect_id) {
+                    effect.expanded = expanded;
+                }
+            }
         }
     }
 
@@ -3424,6 +3742,15 @@ impl App {
         match action {
             SourcesAction::RefreshOmtSources => {
                 self.refresh_omt_sources();
+            }
+            SourcesAction::RefreshNdiSources => {
+                self.refresh_ndi_sources();
+            }
+            SourcesAction::StartNdiDiscovery => {
+                self.start_ndi_discovery();
+            }
+            SourcesAction::StopNdiDiscovery => {
+                self.stop_ndi_discovery();
             }
         }
     }
