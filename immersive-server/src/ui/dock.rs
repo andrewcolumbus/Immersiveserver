@@ -1245,6 +1245,61 @@ impl DockManager {
         false
     }
 
+    /// Request to undock a panel - queues a DockAction for main.rs to handle
+    ///
+    /// This method marks the panel as undocked and queues an action to create
+    /// the OS window. The actual window creation is handled by main.rs.
+    pub fn request_undock(&mut self, panel_id: &str) {
+        if let Some(panel) = self.get_panel(panel_id) {
+            if !panel.can_undock || panel.is_undocked() {
+                return;
+            }
+            let geometry = panel.undocked_geometry.clone();
+            let position = geometry.position;
+            let size = geometry.size;
+            let panel_id = panel_id.to_string();
+
+            // Mark as undocked
+            if self.undock_panel(&panel_id) {
+                // Queue action for main.rs
+                self.pending_actions.push(DockAction::UndockPanel {
+                    panel_id,
+                    position,
+                    size,
+                });
+            }
+        }
+    }
+
+    /// Request to re-dock a panel - queues a DockAction for main.rs to handle
+    ///
+    /// This method marks the panel as docked and queues an action to close
+    /// the OS window. The actual window destruction is handled by main.rs.
+    pub fn request_redock(&mut self, panel_id: &str) {
+        if let Some(panel) = self.get_panel(panel_id) {
+            if !panel.is_undocked() {
+                return;
+            }
+            let panel_id = panel_id.to_string();
+
+            // Mark as docked
+            if self.redock_panel(&panel_id) {
+                // Queue action for main.rs
+                self.pending_actions.push(DockAction::RedockPanel { panel_id });
+            }
+        }
+    }
+
+    /// Take all pending dock actions (drains the queue)
+    pub fn take_pending_actions(&mut self) -> Vec<DockAction> {
+        std::mem::take(&mut self.pending_actions)
+    }
+
+    /// Check if there are pending dock actions
+    pub fn has_pending_actions(&self) -> bool {
+        !self.pending_actions.is_empty()
+    }
+
     /// Dock a panel to a specific zone
     pub fn dock_panel_to(&mut self, panel_id: &str, zone: DockZone) {
         // If in a tab group, remove first

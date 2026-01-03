@@ -5167,4 +5167,20 @@ impl App {
     pub fn viewport_zoom(&self) -> f32 {
         self.viewport.zoom()
     }
+
+    /// Shutdown the application gracefully
+    /// This is called automatically via Drop, but can be called explicitly
+    pub fn shutdown(&mut self) {
+        // Signal API server to shut down gracefully
+        if let Some(tx) = self.api_shutdown_tx.take() {
+            log::info!("Signaling API server shutdown...");
+            let _ = tx.send(true);
+        }
+    }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
 }

@@ -19,7 +19,7 @@ pub mod thumbnail_cache;
 pub mod window_registry;
 
 pub use clip_grid_panel::{ClipGridAction, ClipGridPanel};
-pub use dock::{DockManager, DockZone, DockablePanel};
+pub use dock::{DockAction, DockManager, DockZone, DockablePanel};
 pub use effects_browser_panel::{DraggableEffect, EffectsBrowserAction, EffectsBrowserPanel, DRAG_EFFECT_PAYLOAD};
 pub use file_browser_panel::{FileBrowserAction, FileBrowserPanel};
 pub use layout_preset::{LayoutPreset, LayoutPresetManager};

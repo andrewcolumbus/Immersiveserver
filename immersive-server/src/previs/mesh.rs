@@ -81,6 +81,7 @@ impl PrevisMesh {
             position: [0.0, 0.0, 0.0],
             uv: [0.5, 0.5],
             normal: [0.0, 1.0, 0.0], // Pointing up
+            tex_index: 0,
         });
 
         // Edge vertices
@@ -97,6 +98,7 @@ impl PrevisMesh {
                 position: [x, 0.0, z],
                 uv: [u, v],
                 normal: [0.0, 1.0, 0.0],
+                tex_index: 0,
             });
         }
 
