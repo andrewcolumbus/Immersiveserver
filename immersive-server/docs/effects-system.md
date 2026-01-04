@@ -343,26 +343,124 @@ pub fn register_builtin_effects(registry: &mut EffectRegistry) {
 
 ## Automation System
 
+The automation system allows effect parameters to be modulated by LFO, Beat triggers, or audio-reactive FFT. Parameters are modulated in real-time during rendering.
+
+### Accessing Automation (Per-Parameter)
+
+Each automatable parameter shows a **gear icon** (⚙) next to its label:
+- **Gray gear**: No automation active
+- **Gold gear**: LFO modulation active
+- **Cyan gear**: Beat modulation active
+- **Magenta gear**: FFT modulation active
+
+Click the gear to open the automation popup:
+1. Select automation type: **None**, **LFO**, **Beat**, or **FFT**
+2. Configure the automation source parameters
+3. Click **×** to remove automation
+
+### Automatable vs Non-Automatable Parameters
+
+Not all parameters support automation. The `automatable` flag in `ParameterMeta` determines this:
+
+| Parameter Type | Automatable | Reason |
+|---------------|-------------|--------|
+| Float | ✅ Yes | Continuous numeric values can be interpolated |
+| Int | ✅ Yes | Can be interpolated (discretized to int) |
+| Bool | ✅ Yes | LFO can toggle on/off based on threshold |
+| Color | ❌ No | Use separate RGB float params if automation needed |
+| Enum | ❌ No | Discrete choices can't be meaningfully interpolated |
+| String | ❌ No | Text/file paths can't be interpolated |
+
+**Example - Image Rain effect:**
+```rust
+// Automatable parameters (show gear icon)
+Parameter::new(ParameterMeta::float("density", "Density", 0.5, 0.0, 1.0)),
+Parameter::new(ParameterMeta::float("gravity", "Gravity", 1.0, 0.1, 3.0)),
+
+// Non-automatable parameters (no gear icon)
+Parameter::new(ParameterMeta::enumeration("emoji", "Emoji", emoji_options, 0)),
+Parameter::new(ParameterMeta::string("custom_image", "Custom Image", "")),
+```
+
+To override the default automatable behavior:
+```rust
+// Make a normally-automatable float NOT automatable
+ParameterMeta::float("amount", "Amount", 1.0, 0.0, 1.0)
+    .with_automatable(false)
+```
+
 ### BPM Clock
+
+The global BPM clock synchronizes all beat-synced automation:
 
 ```rust
 let bpm_clock = BpmClock::new(120.0);
 bpm_clock.set_bpm(140.0);
-bpm_clock.tap();  // Tap tempo
-let phase = bpm_clock.beat_phase();  // 0.0 to 1.0
+bpm_clock.tap();  // Tap tempo (call repeatedly)
+let phase = bpm_clock.beat_phase();  // 0.0 to 1.0 within beat
+let bar_phase = bpm_clock.bar_phase();  // 0.0 to 1.0 within bar
 ```
 
-### LFO Shapes
+**BPM Settings** (managed by EffectManager):
+- Default BPM: 120
+- Range: 20-300 BPM
+- Beats per bar: 4 (configurable 1-16)
+- Tap tempo: Average of last 8 taps
 
-- **Sine** - Smooth oscillation
-- **Triangle** - Linear up/down
-- **Square** - On/off toggle
-- **Sawtooth** - Linear ramp, instant reset
-- **Random** - Random value each cycle
+### LFO (Low Frequency Oscillator)
+
+Continuously modulates parameter value with a waveform.
+
+**LFO Settings:**
+| Setting | Range | Description |
+|---------|-------|-------------|
+| Shape | Sine/Triangle/Square/Sawtooth/SawRev/Random | Waveform shape |
+| Frequency | 0.01-20 Hz | Oscillation speed (when not synced) |
+| Sync to BPM | On/Off | Lock frequency to tempo |
+| Beats | 0.25-16 | Beats per cycle (when synced) |
+| Amplitude | 0.0-1.0 | Modulation depth |
+| Phase | 0.0-1.0 | Phase offset |
+
+**LFO Shapes:**
+- **Sine** - Smooth oscillation, natural movement
+- **Triangle** - Linear up/down, sharp peaks
+- **Square** - On/off toggle, hard switch
+- **Sawtooth** - Linear ramp up, instant reset
+- **Saw Reverse** - Linear ramp down, instant reset
+- **Random** - Random value each cycle, stepped
 
 ### Beat Envelope (ADSR)
 
-Trigger effects on beat with Attack, Decay, Sustain, Release envelope.
+Triggers a one-shot envelope on each beat/bar.
+
+**Beat Settings:**
+| Setting | Range | Description |
+|---------|-------|-------------|
+| Trigger | Beat/Bar/2 Bars/4 Bars | When to trigger |
+| Attack | 0-500 ms | Rise time |
+| Decay | 0-500 ms | Fall time to sustain |
+| Sustain | 0.0-1.0 | Hold level |
+| Release | 0-1000 ms | Fall time to zero |
+
+### FFT (Audio-Reactive)
+
+Modulates parameter based on audio frequency analysis.
+
+**FFT Settings:**
+| Setting | Range | Description |
+|---------|-------|-------------|
+| Band | Sub/Low/Mid/High/Presence | Frequency range to track |
+| Gain | 0.0-2.0 | Sensitivity multiplier |
+| Smoothing | 0.0-1.0 | Temporal smoothing (0=instant, 1=very slow) |
+| Attack | 0-100 ms | Rise response time |
+| Release | 0-500 ms | Fall response time |
+
+**Frequency Bands:**
+- **Sub** (20-60 Hz) - Deep bass, kick drums
+- **Low** (60-250 Hz) - Bass, low toms
+- **Mid** (250-2000 Hz) - Vocals, snare body
+- **High** (2000-6000 Hz) - Hi-hats, presence
+- **Presence** (6000-20000 Hz) - Air, brilliance
 
 ---
 

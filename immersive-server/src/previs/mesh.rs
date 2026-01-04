@@ -119,12 +119,14 @@ impl PrevisMesh {
     /// - Front/back wall width determines the room's X dimension
     /// - Left/right wall width determines the room's Z dimension
     /// - Each wall has independent height
+    /// - Optional floor at Y=0 using a separate texture (tex_index=1)
     /// Environment texture is divided into quadrants for each wall.
     pub fn walls_individual(
         front: &WallSettings,
         back: &WallSettings,
         left: &WallSettings,
         right: &WallSettings,
+        floor_enabled: bool,
     ) -> Self {
         let mut vertices = Vec::new();
         let mut indices = Vec::new();
@@ -135,7 +137,7 @@ impl PrevisMesh {
         let room_half_width = (front.width.max(back.width)) / 2.0;  // X extent
         let room_half_depth = (left.width.max(right.width)) / 2.0;  // Z extent
 
-        // Helper to add a wall quad
+        // Helper to add a wall quad (tex_index = 0 for walls)
         let mut add_wall = |corners: [[f32; 3]; 4],
                            normal: [f32; 3],
                            uv_start: [f32; 2],
@@ -147,24 +149,28 @@ impl PrevisMesh {
                 position: corners[0],
                 uv: [uv_start[0], uv_end[1]], // Bottom of this quadrant
                 normal,
+                tex_index: 0,
             });
             // Bottom-right
             vertices.push(PrevisVertex {
                 position: corners[1],
                 uv: [uv_end[0], uv_end[1]],
                 normal,
+                tex_index: 0,
             });
             // Top-right
             vertices.push(PrevisVertex {
                 position: corners[2],
                 uv: [uv_end[0], uv_start[1]], // Top of this quadrant
                 normal,
+                tex_index: 0,
             });
             // Top-left
             vertices.push(PrevisVertex {
                 position: corners[3],
                 uv: [uv_start[0], uv_start[1]],
                 normal,
+                tex_index: 0,
             });
 
             // Two triangles (CCW winding for inward-facing surfaces)
@@ -244,6 +250,41 @@ impl PrevisMesh {
             );
         }
 
+        // Floor at Y=0 (uses tex_index = 1 for separate layer texture)
+        if floor_enabled {
+            let base_idx = vertices.len() as u32;
+
+            // Floor quad corners (viewed from above, normal pointing up)
+            vertices.push(PrevisVertex {
+                position: [-room_half_width, 0.0, -room_half_depth], // back-left
+                uv: [0.0, 0.0],
+                normal: [0.0, 1.0, 0.0],
+                tex_index: 1, // Floor uses separate texture
+            });
+            vertices.push(PrevisVertex {
+                position: [room_half_width, 0.0, -room_half_depth], // back-right
+                uv: [1.0, 0.0],
+                normal: [0.0, 1.0, 0.0],
+                tex_index: 1,
+            });
+            vertices.push(PrevisVertex {
+                position: [room_half_width, 0.0, room_half_depth], // front-right
+                uv: [1.0, 1.0],
+                normal: [0.0, 1.0, 0.0],
+                tex_index: 1,
+            });
+            vertices.push(PrevisVertex {
+                position: [-room_half_width, 0.0, room_half_depth], // front-left
+                uv: [0.0, 1.0],
+                normal: [0.0, 1.0, 0.0],
+                tex_index: 1,
+            });
+
+            // Two triangles for floor (CCW winding viewed from above)
+            indices.extend_from_slice(&[base_idx, base_idx + 2, base_idx + 1]);
+            indices.extend_from_slice(&[base_idx, base_idx + 3, base_idx + 2]);
+        }
+
         Self { vertices, indices }
     }
 
@@ -283,6 +324,7 @@ impl PrevisMesh {
                     position: [x, y, z],
                     uv: [u, v_coord],
                     normal: [nx, ny, nz],
+                    tex_index: 0,
                 });
             }
         }
@@ -329,9 +371,17 @@ mod tests {
     #[test]
     fn test_walls_mesh() {
         let wall = WallSettings::default();
-        let mesh = PrevisMesh::walls_individual(&wall, &wall, &wall, &wall);
+        let mesh = PrevisMesh::walls_individual(&wall, &wall, &wall, &wall, false);
         assert_eq!(mesh.vertices.len(), 16); // 4 walls * 4 vertices
         assert_eq!(mesh.indices.len(), 24); // 4 walls * 2 triangles * 3
+    }
+
+    #[test]
+    fn test_walls_with_floor() {
+        let wall = WallSettings::default();
+        let mesh = PrevisMesh::walls_individual(&wall, &wall, &wall, &wall, true);
+        assert_eq!(mesh.vertices.len(), 20); // 4 walls * 4 vertices + floor 4 vertices
+        assert_eq!(mesh.indices.len(), 30); // 4 walls * 6 + floor * 6
     }
 
     #[test]
@@ -341,7 +391,7 @@ mod tests {
         disabled_wall.enabled = false;
 
         // Only 2 walls enabled
-        let mesh = PrevisMesh::walls_individual(&enabled_wall, &disabled_wall, &enabled_wall, &disabled_wall);
+        let mesh = PrevisMesh::walls_individual(&enabled_wall, &disabled_wall, &enabled_wall, &disabled_wall, false);
         assert_eq!(mesh.vertices.len(), 8); // 2 walls * 4 vertices
         assert_eq!(mesh.indices.len(), 12); // 2 walls * 2 triangles * 3
     }

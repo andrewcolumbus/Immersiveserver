@@ -28,6 +28,9 @@ pub enum PrevisAction {
     SetWallEnabled(WallId, bool),
     SetWallWidth(WallId, f32),
     SetWallHeight(WallId, f32),
+    // Floor parameters (for walls mode)
+    SetFloorEnabled(bool),
+    SetFloorLayerIndex(usize),
     // Dome parameters
     SetDomeRadius(f32),
     SetDomeSegmentsH(u32),
@@ -331,6 +334,33 @@ impl PrevisPanel {
             settings.wall_right.width,
             settings.wall_right.height,
         );
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(4.0);
+
+        // Floor settings
+        ui.label(egui::RichText::new("Floor").strong());
+        ui.add_space(4.0);
+
+        let mut floor_enabled = settings.floor_enabled;
+        if ui.checkbox(&mut floor_enabled, "Enable Floor").changed() {
+            actions.push(PrevisAction::SetFloorEnabled(floor_enabled));
+        }
+
+        ui.add_enabled_ui(floor_enabled, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Layer:");
+                let mut layer_idx = settings.floor_layer_index;
+                if ui
+                    .add(egui::DragValue::new(&mut layer_idx).range(0..=15).speed(0.1))
+                    .changed()
+                {
+                    actions.push(PrevisAction::SetFloorLayerIndex(layer_idx));
+                }
+                ui.label(egui::RichText::new("(0 = first layer)").small().weak());
+            });
+        });
     }
 
     fn render_dome_params(

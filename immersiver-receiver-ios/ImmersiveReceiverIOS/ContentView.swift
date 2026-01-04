@@ -106,3 +106,4 @@ struct ConnectionIndicator: View {
         .environmentObject(AppState())
 }
 
+

@@ -8,6 +8,7 @@ pub mod effects_browser_panel;
 pub mod file_browser_panel;
 pub mod layout_preset;
 pub mod menu_bar;
+pub mod menu_definition;
 pub mod native_menu;
 pub mod performance_panel;
 pub mod preferences_window;
@@ -28,9 +29,12 @@ pub use native_menu::{activate_macos_app, focus_window_on_click, is_native_menu_
 pub use performance_panel::PerformancePanel;
 pub use preferences_window::PreferencesWindow;
 pub use previs_panel::{PrevisAction, PrevisPanel, WallId};
-pub use preview_monitor_panel::{PreviewClipInfo, PreviewMonitorAction, PreviewMonitorPanel};
-pub use properties_panel::{PropertiesPanel, PropertiesTab};
+pub use preview_monitor_panel::{PreviewClipInfo, PreviewLayerInfo, PreviewMode, PreviewMonitorAction, PreviewMonitorPanel};
+pub use properties_panel::{PropertiesPanel, PropertiesAction, PropertiesTab};
 pub use sources_panel::{DraggableSource, SourcesAction, SourcesPanel};
 pub use thumbnail_cache::ThumbnailCache;
 pub use window_registry::{WindowEntry, WindowRegistry, WindowType};
+
+// Re-export scrubber widget from external egui-widgets crate
+pub use egui_widgets::{format_time, video_scrubber, ScrubberAction, ScrubberState};
 

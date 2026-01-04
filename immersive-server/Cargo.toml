@@ -12,6 +12,7 @@ winit = "0.30"
 egui = "0.31"
 egui-wgpu = "0.31"
 egui-winit = "0.31"
+egui-widgets = { path = "../external_libraries/egui-widgets" }
 
 # Video decoding
 ffmpeg-next = "7.1"

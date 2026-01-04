@@ -3,11 +3,22 @@
 //! A tabbed panel for editing properties of the environment, layers, and clips.
 //! Includes transform controls, tiling (multiplexing), effects, and other settings.
 
+use std::collections::HashMap;
+
 use crate::audio::AudioBand;
-use crate::compositor::{BlendMode, ClipTransition, Environment, Layer};
+use crate::compositor::{BlendMode, ClipTransition, Environment, Layer, LoopMode};
 use crate::effects::{AutomationSource, EffectRegistry, EffectStack, FftSource, LfoSource, LfoShape, BeatSource, BeatTrigger, ParameterValue};
+use crate::layer_runtime::LayerVideoInfo;
 use crate::settings::{EnvironmentSettings, ThumbnailMode};
 use crate::ui::effects_browser_panel::DraggableEffect;
+use egui_widgets::{video_scrubber, ScrubberAction, ScrubberState};
+
+/// Payload for dragging effects within the stack for reordering
+#[derive(Clone)]
+struct DraggedEffectReorder {
+    effect_id: u32,
+    source_index: usize,
+}
 
 /// Which tab is currently active in the properties panel
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -143,10 +154,24 @@ pub enum PropertiesAction {
     // Clip transport actions (for active/playing clips)
     /// Toggle clip playback (pause/resume)
     ToggleClipPlayback { layer_id: u32 },
+    /// Start scrubbing (pauses and stores play state)
+    StartScrub { layer_id: u32 },
+    /// End scrubbing (seeks to final position and restores previous play state)
+    EndScrub { layer_id: u32, time_secs: f64 },
     /// Restart clip from beginning
     RestartClip { layer_id: u32 },
+    /// Seek clip to specific time
+    SeekClip { layer_id: u32, time_secs: f64 },
     /// Preview this clip in the preview monitor
     PreviewClip { layer_id: u32, slot: usize },
+    /// Set clip loop mode
+    SetClipLoopMode { layer_id: u32, slot: usize, mode: LoopMode },
+
+    // Performance mode actions
+    /// Floor sync enabled changed
+    SetFloorSyncEnabled { enabled: bool },
+    /// Floor layer index changed
+    SetFloorLayerIndex { index: usize },
 }
 
 /// Context for rendering effect stacks (determines which PropertiesAction variants to emit)
@@ -170,6 +195,8 @@ pub struct PropertiesPanel {
     pub selected_clip_slot: Option<usize>,
     /// Whether the panel is open
     pub open: bool,
+    /// Scrubber states for each layer (for timeline scrubber)
+    scrubber_states: HashMap<u32, ScrubberState>,
 }
 
 impl Default for PropertiesPanel {
@@ -186,6 +213,7 @@ impl PropertiesPanel {
             selected_layer_id: None,
             selected_clip_slot: None,
             open: true,
+            scrubber_states: HashMap::new(),
         }
     }
 
@@ -227,6 +255,8 @@ impl PropertiesPanel {
         bpm_clock: &crate::effects::BpmClock,
         effect_time: f32,
         audio_manager: Option<&crate::audio::AudioManager>,
+        // Video info for each layer (for transport controls)
+        layer_video_info: &HashMap<u32, LayerVideoInfo>,
     ) -> Vec<PropertiesAction> {
         let mut actions = Vec::new();
 
@@ -266,7 +296,7 @@ impl PropertiesPanel {
                         self.render_layer_tab(ui, layers, effect_registry, &mut actions, bpm_clock, effect_time, audio_manager);
                     }
                     PropertiesTab::Clip => {
-                        self.render_clip_tab(ui, layers, effect_registry, &mut actions, bpm_clock, effect_time, audio_manager);
+                        self.render_clip_tab(ui, layers, effect_registry, &mut actions, bpm_clock, effect_time, audio_manager, layer_video_info);
                     }
                 }
             });
@@ -696,6 +726,7 @@ impl PropertiesPanel {
     /// Render an effect stack for any context (layer, clip, or environment)
     ///
     /// Clean design with collapsible effect sections and aligned parameter rows.
+    /// Supports drag-and-drop reordering within the stack.
     fn render_effect_stack_generic(
         &mut self,
         ui: &mut egui::Ui,
@@ -708,11 +739,13 @@ impl PropertiesPanel {
         effect_time: f32,
         audio_manager: Option<&crate::audio::AudioManager>,
     ) {
-        // Check if a DraggableEffect is specifically being dragged
-        let is_dragging_effect = egui::DragAndDrop::payload::<DraggableEffect>(ui.ctx()).is_some();
+        // Check what type of drag is happening
+        let is_dragging_new_effect = egui::DragAndDrop::payload::<DraggableEffect>(ui.ctx()).is_some();
+        let dragged_reorder = egui::DragAndDrop::payload::<DraggedEffectReorder>(ui.ctx());
+        let is_dragging_reorder = dragged_reorder.is_some();
 
-        // Visual feedback for drop zone only when dragging an effect
-        let frame = if is_dragging_effect {
+        // Visual feedback for drop zone only when dragging a new effect from browser
+        let frame = if is_dragging_new_effect {
             egui::Frame::new()
                 .stroke(egui::Stroke::new(2.0, egui::Color32::from_rgb(100, 149, 237)))
                 .inner_margin(4.0)
@@ -721,7 +754,10 @@ impl PropertiesPanel {
             egui::Frame::NONE
         };
 
-        // Wrap effects list in a drop zone
+        // Collect reorder actions to emit after the loop (to avoid borrow issues)
+        let mut reorder_action: Option<(u32, usize)> = None;
+
+        // Wrap effects list in a drop zone for adding new effects
         let drop_response = frame.show(ui, |ui| {
             ui.dnd_drop_zone::<DraggableEffect, ()>(egui::Frame::NONE, |ui| {
                 if effects.is_empty() {
@@ -734,62 +770,129 @@ impl PropertiesPanel {
                 } else {
                     let effect_count = effects.effects.len();
 
-                    // Render each effect as a collapsible section
+                    // Get source index if we're dragging for reorder
+                    let source_idx = dragged_reorder.as_ref().map(|p| p.source_index);
+
+                    // Render each effect as a collapsible section with drag-and-drop
                     for (index, effect) in effects.effects.iter().enumerate() {
+                        // Drop zone BEFORE this effect (for reordering)
+                        if is_dragging_reorder {
+                            // Check if this is a valid drop target
+                            let is_valid_drop = source_idx.map(|src| index != src && index != src + 1).unwrap_or(false);
+
+                            if is_valid_drop {
+                                // Use dnd_drop_zone for proper drop detection
+                                let drop_frame = egui::Frame::NONE;
+                                let inner_response = ui.dnd_drop_zone::<DraggedEffectReorder, ()>(drop_frame, |ui| {
+                                    let (rect, response) = ui.allocate_exact_size(
+                                        egui::vec2(ui.available_width(), 8.0),
+                                        egui::Sense::hover(),
+                                    );
+
+                                    // Draw indicator line when hovered
+                                    if response.hovered() {
+                                        let painter = ui.painter();
+                                        let line_y = rect.center().y;
+                                        painter.line_segment(
+                                            [egui::pos2(rect.left(), line_y), egui::pos2(rect.right(), line_y)],
+                                            egui::Stroke::new(3.0, egui::Color32::from_rgb(100, 149, 237)),
+                                        );
+                                    }
+                                });
+
+                                // Handle drop
+                                if let Some(dropped) = inner_response.1 {
+                                    let target_index = if index > dropped.source_index { index - 1 } else { index };
+                                    reorder_action = Some((dropped.effect_id, target_index));
+                                }
+                            }
+                        }
+
                         ui.push_id(effect.id, |ui| {
                             // Header background color - darker for section headers
-                            let header_bg = if effect.bypassed {
+                            let is_being_dragged = source_idx == Some(index);
+                            let header_bg = if is_being_dragged {
+                                egui::Color32::from_rgb(60, 80, 100) // Highlight when being dragged
+                            } else if effect.bypassed {
                                 egui::Color32::from_gray(35)
                             } else {
                                 egui::Color32::from_rgb(45, 65, 55) // Subtle green tint when active
                             };
 
-                            // Effect header with collapsible state
-                            let header_response = egui::Frame::new()
-                                .fill(header_bg)
-                                .inner_margin(egui::Margin::symmetric(6, 4))
-                                .corner_radius(2.0)
-                                .show(ui, |ui| {
-                                    ui.horizontal(|ui| {
-                                        // Disclosure triangle
-                                        let arrow = if effect.expanded { "▼" } else { "▶" };
-                                        let arrow_response = ui.add(
-                                            egui::Label::new(egui::RichText::new(arrow).size(10.0).color(egui::Color32::GRAY))
-                                                .sense(egui::Sense::click())
-                                        );
+                            // Track button clicks using Cell for interior mutability
+                            let delete_clicked = std::cell::Cell::new(false);
 
-                                        // Effect name
-                                        let name_color = if effect.bypassed {
-                                            egui::Color32::from_gray(100)
-                                        } else {
-                                            egui::Color32::from_gray(200)
-                                        };
-                                        let name_text = egui::RichText::new(&effect.name).color(name_color);
-                                        ui.label(name_text);
+                            // Wrap effect header in drag source for reordering
+                            let effect_id = effect.id;
+                            let drag_id = egui::Id::new(("effect_drag", effect_id));
 
-                                        // Status indicators on the right
-                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                            // Bypass indicator
-                                            if effect.bypassed {
-                                                ui.label(egui::RichText::new("B").size(10.0).color(egui::Color32::from_gray(80)));
-                                            }
-                                            // Solo indicator
-                                            if effect.soloed {
-                                                ui.label(egui::RichText::new("S").size(10.0).color(egui::Color32::YELLOW));
-                                            }
-                                        });
+                            let drag_response = ui.dnd_drag_source(drag_id, DraggedEffectReorder { effect_id, source_index: index }, |ui| {
+                                // Effect header with collapsible state
+                                let header_response = egui::Frame::new()
+                                    .fill(header_bg)
+                                    .inner_margin(egui::Margin::symmetric(6, 4))
+                                    .corner_radius(2.0)
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            // Drag handle indicator
+                                            ui.add(egui::Label::new(
+                                                egui::RichText::new("⠿").size(12.0).color(egui::Color32::from_gray(120))
+                                            ).sense(egui::Sense::drag()));
 
-                                        arrow_response
-                                    })
-                                });
+                                            // Disclosure triangle
+                                            let arrow = if effect.expanded { "▼" } else { "▶" };
+                                            let arrow_response = ui.add(
+                                                egui::Label::new(egui::RichText::new(arrow).size(10.0).color(egui::Color32::GRAY))
+                                                    .sense(egui::Sense::click())
+                                            );
 
-                            // Handle click on arrow or header to toggle expanded state
-                            if header_response.inner.inner.clicked() || header_response.response.clicked() {
-                                self.push_expanded_action(actions, context, effect.id, !effect.expanded);
+                                            // Effect name
+                                            let name_color = if effect.bypassed {
+                                                egui::Color32::from_gray(100)
+                                            } else {
+                                                egui::Color32::from_gray(200)
+                                            };
+                                            let name_text = egui::RichText::new(&effect.name).color(name_color);
+                                            ui.label(name_text);
+
+                                            // Controls on the right
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                // Delete button - track click to handle outside drag source
+                                                let delete_btn = ui.small_button("×").on_hover_text("Remove effect");
+                                                if delete_btn.clicked() {
+                                                    delete_clicked.set(true);
+                                                }
+                                                // Bypass indicator
+                                                if effect.bypassed {
+                                                    ui.label(egui::RichText::new("B").size(10.0).color(egui::Color32::from_gray(80)));
+                                                }
+                                                // Solo indicator
+                                                if effect.soloed {
+                                                    ui.label(egui::RichText::new("S").size(10.0).color(egui::Color32::YELLOW));
+                                                }
+                                            });
+
+                                            arrow_response
+                                        })
+                                    });
+
+                                header_response
+                            });
+
+                            // Handle delete button click (outside drag source closure)
+                            if delete_clicked.get() {
+                                self.push_remove_action(actions, context, effect.id);
+                            }
+
+                            // Handle click on arrow or header to toggle expanded state (only if not dragging)
+                            if !is_dragging_reorder && !is_dragging_new_effect && !delete_clicked.get() {
+                                if drag_response.response.clicked() || drag_response.inner.inner.inner.clicked() {
+                                    self.push_expanded_action(actions, context, effect.id, !effect.expanded);
+                                }
                             }
 
                             // Right-click context menu for effect controls
-                            header_response.response.context_menu(|ui| {
+                            drag_response.response.context_menu(|ui| {
                                 // Bypass toggle
                                 let bypass_label = if effect.bypassed { "Enable" } else { "Bypass" };
                                 if ui.button(bypass_label).clicked() {
@@ -839,11 +942,46 @@ impl PropertiesPanel {
                             ui.add_space(2.0);
                         });
                     }
+
+                    // Drop zone AFTER last effect (for reordering to the end)
+                    if is_dragging_reorder {
+                        let is_valid_drop = source_idx.map(|src| src != effect_count - 1).unwrap_or(false);
+
+                        if is_valid_drop {
+                            let drop_frame = egui::Frame::NONE;
+                            let inner_response = ui.dnd_drop_zone::<DraggedEffectReorder, ()>(drop_frame, |ui| {
+                                let (rect, response) = ui.allocate_exact_size(
+                                    egui::vec2(ui.available_width(), 8.0),
+                                    egui::Sense::hover(),
+                                );
+
+                                // Draw indicator line when hovered
+                                if response.hovered() {
+                                    let painter = ui.painter();
+                                    let line_y = rect.center().y;
+                                    painter.line_segment(
+                                        [egui::pos2(rect.left(), line_y), egui::pos2(rect.right(), line_y)],
+                                        egui::Stroke::new(3.0, egui::Color32::from_rgb(100, 149, 237)),
+                                    );
+                                }
+                            });
+
+                            // Handle drop
+                            if let Some(dropped) = inner_response.1 {
+                                reorder_action = Some((dropped.effect_id, effect_count - 1));
+                            }
+                        }
+                    }
                 }
             })
         });
 
-        // Handle dropped effect
+        // Emit reorder action if a drop occurred
+        if let Some((effect_id, new_index)) = reorder_action {
+            self.push_reorder_action(actions, context, effect_id, new_index);
+        }
+
+        // Handle dropped new effect from browser
         if let Some(dragged_effect) = drop_response.inner.1 {
             self.push_add_action(actions, context, dragged_effect.effect_type.clone());
         }
@@ -882,64 +1020,69 @@ impl PropertiesPanel {
         effect_id: u32,
         param: &crate::effects::Parameter,
         actions: &mut Vec<PropertiesAction>,
-        // Automation evaluation context (reserved for future real-time modulation visualization)
-        _bpm_clock: &crate::effects::BpmClock,
-        _effect_time: f32,
-        _audio_manager: Option<&crate::audio::AudioManager>,
+        bpm_clock: &crate::effects::BpmClock,
+        effect_time: f32,
+        audio_manager: Option<&crate::audio::AudioManager>,
     ) {
         const GEAR_WIDTH: f32 = 20.0;
         const LABEL_WIDTH: f32 = 76.0; // Reduced from 80 to accommodate gear
 
         ui.horizontal(|ui| {
-            // Gear icon for modulation
-            let gear_color = match &param.automation {
-                Some(AutomationSource::Lfo(_)) => egui::Color32::from_rgb(255, 200, 50), // Gold for LFO
-                Some(AutomationSource::Beat(_)) => egui::Color32::from_rgb(50, 200, 255), // Cyan for Beat
-                Some(AutomationSource::Fft(_)) => egui::Color32::from_rgb(255, 80, 200), // Magenta for FFT
-                None => egui::Color32::from_gray(100), // Gray when inactive
-            };
+            // Only show gear icon for automatable parameters
+            if param.meta.automatable {
+                // Gear icon for modulation
+                let gear_color = match &param.automation {
+                    Some(AutomationSource::Lfo(_)) => egui::Color32::from_rgb(255, 200, 50), // Gold for LFO
+                    Some(AutomationSource::Beat(_)) => egui::Color32::from_rgb(50, 200, 255), // Cyan for Beat
+                    Some(AutomationSource::Fft(_)) => egui::Color32::from_rgb(255, 80, 200), // Magenta for FFT
+                    None => egui::Color32::from_gray(100), // Gray when inactive
+                };
 
-            // Create a unique popup ID for this parameter
-            let popup_id = ui.make_persistent_id(format!("mod_popup_{}_{}", effect_id, &param.meta.name));
+                // Create a unique popup ID for this parameter
+                let popup_id = ui.make_persistent_id(format!("mod_popup_{}_{}", effect_id, &param.meta.name));
 
-            // Gear button with popup
-            let gear_response = ui.allocate_ui_with_layout(
-                egui::vec2(GEAR_WIDTH, ui.spacing().interact_size.y),
-                egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
-                |ui| {
-                    let response = ui.add(
-                        egui::Button::new(
-                            egui::RichText::new("\u{2699}") // Unicode gear: ⚙
-                                .size(12.0)
-                                .color(gear_color)
-                        )
-                        .frame(false)
-                        .min_size(egui::vec2(16.0, 16.0))
-                    );
+                // Gear button with popup
+                let gear_response = ui.allocate_ui_with_layout(
+                    egui::vec2(GEAR_WIDTH, ui.spacing().interact_size.y),
+                    egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+                    |ui| {
+                        let response = ui.add(
+                            egui::Button::new(
+                                egui::RichText::new("\u{2699}") // Unicode gear: ⚙
+                                    .size(12.0)
+                                    .color(gear_color)
+                            )
+                            .frame(false)
+                            .min_size(egui::vec2(16.0, 16.0))
+                        );
 
-                    // Hover tooltip
-                    let tooltip = match &param.automation {
-                        Some(AutomationSource::Lfo(_)) => "LFO modulation active (click to edit)",
-                        Some(AutomationSource::Beat(_)) => "Beat modulation active (click to edit)",
-                        Some(AutomationSource::Fft(_)) => "FFT modulation active (click to edit)",
-                        None => "Click to add modulation",
-                    };
-                    response.clone().on_hover_text(tooltip);
+                        // Hover tooltip
+                        let tooltip = match &param.automation {
+                            Some(AutomationSource::Lfo(_)) => "LFO modulation active (click to edit)",
+                            Some(AutomationSource::Beat(_)) => "Beat modulation active (click to edit)",
+                            Some(AutomationSource::Fft(_)) => "FFT modulation active (click to edit)",
+                            None => "Click to add modulation",
+                        };
+                        response.clone().on_hover_text(tooltip);
 
-                    // Left-click to open modulation popup
-                    if response.clicked() {
-                        ui.memory_mut(|mem| mem.toggle_popup(popup_id));
-                    }
+                        // Left-click to open modulation popup
+                        if response.clicked() {
+                            ui.memory_mut(|mem| mem.toggle_popup(popup_id));
+                        }
 
-                    response
-                },
-            ).inner;
+                        response
+                    },
+                ).inner;
 
-            // Render popup below the gear icon
-            egui::popup_below_widget(ui, popup_id, &gear_response, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
-                ui.set_min_width(180.0);
-                self.render_modulation_menu(ui, context, effect_id, param, actions);
-            });
+                // Render popup below the gear icon
+                egui::popup_below_widget(ui, popup_id, &gear_response, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+                    ui.set_min_width(180.0);
+                    self.render_modulation_menu(ui, context, effect_id, param, actions);
+                });
+            } else {
+                // Add spacing to align with automatable params
+                ui.add_space(GEAR_WIDTH);
+            }
 
             // Fixed-width right-aligned label
             ui.allocate_ui_with_layout(
@@ -984,8 +1127,26 @@ impl PropertiesPanel {
                             egui::Stroke::new(2.0, egui::Color32::from_gray(60))
                         );
 
+                        // Calculate display value (base value + modulation)
+                        let display_val = if let Some(automation) = &param.automation {
+                            let mod_value = match automation {
+                                AutomationSource::Lfo(lfo) => lfo.evaluate(bpm_clock, effect_time),
+                                AutomationSource::Beat(_) => 0.0,
+                                AutomationSource::Fft(fft) => {
+                                    if let Some(am) = audio_manager {
+                                        am.get_band_value(fft.band) * fft.gain
+                                    } else {
+                                        0.0
+                                    }
+                                }
+                            };
+                            (val + mod_value * (max - min)).clamp(min, max)
+                        } else {
+                            val
+                        };
+
                         // Draw filled portion (left of handle)
-                        let norm = (val - min) / (max - min);
+                        let norm = (display_val - min) / (max - min);
                         let handle_x = track_left + norm * (track_right - track_left);
                         painter.line_segment(
                             [egui::pos2(track_left, track_y), egui::pos2(handle_x, track_y)],
@@ -1023,12 +1184,6 @@ impl PropertiesPanel {
                         }
                     });
 
-                    // × button to remove modulation (always visible when automation active)
-                    if param.automation.is_some() {
-                        if ui.small_button("×").on_hover_text("Remove modulation").clicked() {
-                            self.push_automation_action(actions, context, effect_id, param.meta.name.clone(), None);
-                        }
-                    }
                 }
                 ParameterValue::Int(value) => {
                     let mut val = *value;
@@ -1455,12 +1610,6 @@ impl PropertiesPanel {
                         }
                     });
 
-                    ui.separator();
-
-                    // Remove button
-                    if ui.small_button("×").on_hover_text("Remove modulation").clicked() {
-                        self.push_automation_action(actions, context, effect_id, param.meta.name.clone(), None);
-                    }
                 });
 
                 if changed {
@@ -1562,12 +1711,6 @@ impl PropertiesPanel {
                         }
                     });
 
-                    ui.separator();
-
-                    // Remove button
-                    if ui.small_button("×").on_hover_text("Remove modulation").clicked() {
-                        self.push_automation_action(actions, context, effect_id, param.meta.name.clone(), None);
-                    }
                 });
 
                 if changed {
@@ -1580,6 +1723,7 @@ impl PropertiesPanel {
                 let default_fft = FftSource::default();
                 let mut changed = false;
 
+                // Row 1: FFT label, Band, Gain, Smoothing
                 ui.horizontal(|ui| {
                     ui.add_space(indent);
                     ui.label(egui::RichText::new("FFT").small().color(egui::Color32::from_rgb(255, 80, 200)));
@@ -1646,7 +1790,11 @@ impl PropertiesPanel {
                         }
                     });
 
-                    ui.separator();
+                });
+
+                // Row 2: Attack and Release (envelope controls)
+                ui.horizontal(|ui| {
+                    ui.add_space(indent + 40.0);
 
                     // Attack
                     ui.label(egui::RichText::new("Atk:").small());
@@ -1677,13 +1825,6 @@ impl PropertiesPanel {
                             ui.close_menu();
                         }
                     });
-
-                    ui.separator();
-
-                    // Remove button
-                    if ui.small_button("×").on_hover_text("Remove modulation").clicked() {
-                        self.push_automation_action(actions, context, effect_id, param.meta.name.clone(), None);
-                    }
                 });
 
                 if changed {
@@ -1704,6 +1845,8 @@ impl PropertiesPanel {
         bpm_clock: &crate::effects::BpmClock,
         effect_time: f32,
         audio_manager: Option<&crate::audio::AudioManager>,
+        // Video info for transport controls
+        layer_video_info: &HashMap<u32, LayerVideoInfo>,
     ) {
         // Get selected layer
         let Some(layer_id) = self.selected_layer_id else {
@@ -1789,10 +1932,19 @@ impl PropertiesPanel {
                     actions.push(PropertiesAction::RestartClip { layer_id });
                 }
 
-                // Play/Pause button
+                // Play/Pause button - reactive based on current state
+                let is_paused = layer_video_info
+                    .get(&layer_id)
+                    .map(|info| info.is_paused)
+                    .unwrap_or(false);
+                let (icon, tooltip) = if is_paused {
+                    ("▶", "Resume playback")
+                } else {
+                    ("⏸", "Pause playback")
+                };
                 if ui
-                    .button("⏸")
-                    .on_hover_text("Pause/Resume playback")
+                    .button(icon)
+                    .on_hover_text(tooltip)
                     .clicked()
                 {
                     actions.push(PropertiesAction::ToggleClipPlayback { layer_id });
@@ -1800,13 +1952,74 @@ impl PropertiesPanel {
             });
         });
 
-        if !is_playing {
+        // Timeline scrubber (only when playing and has video info)
+        if let Some(info) = layer_video_info.get(&layer_id) {
+            ui.add_space(8.0);
+
+            // Get or create scrubber state for this layer
+            let scrubber_state = self.scrubber_states.entry(layer_id).or_insert_with(ScrubberState::new);
+
+            let (scrub_actions, _display_pos) = video_scrubber(
+                ui,
+                scrubber_state,
+                info.position,
+                info.duration,
+            );
+
+            // Convert scrubber actions to properties actions
+            for action in scrub_actions {
+                match action {
+                    ScrubberAction::StartScrub => {
+                        actions.push(PropertiesAction::StartScrub { layer_id });
+                    }
+                    ScrubberAction::Seek { time_secs } => {
+                        actions.push(PropertiesAction::SeekClip { layer_id, time_secs });
+                    }
+                    ScrubberAction::EndScrub { time_secs } => {
+                        actions.push(PropertiesAction::EndScrub { layer_id, time_secs });
+                    }
+                }
+            }
+
+            ui.add_space(4.0);
+
+            // Video info line
+            ui.label(
+                egui::RichText::new(format!(
+                    "{}x{} @ {:.1}fps",
+                    info.width, info.height, info.frame_rate
+                ))
+                .small()
+                .weak(),
+            );
+        } else if !is_playing {
             ui.label(
                 egui::RichText::new("Playback controls available when clip is playing")
                     .small()
                     .weak(),
             );
         }
+
+        // Loop mode dropdown
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.label("Loop Mode:");
+            let mut current_mode = clip.loop_mode;
+            egui::ComboBox::from_id_salt(format!("loop_mode_{}", slot))
+                .selected_text(match current_mode {
+                    LoopMode::Loop => "Loop",
+                    LoopMode::PlayOnce => "Play Once",
+                })
+                .width(100.0)
+                .show_ui(ui, |ui| {
+                    if ui.selectable_value(&mut current_mode, LoopMode::Loop, "Loop").changed() {
+                        actions.push(PropertiesAction::SetClipLoopMode { layer_id, slot, mode: LoopMode::Loop });
+                    }
+                    if ui.selectable_value(&mut current_mode, LoopMode::PlayOnce, "Play Once").changed() {
+                        actions.push(PropertiesAction::SetClipLoopMode { layer_id, slot, mode: LoopMode::PlayOnce });
+                    }
+                });
+        });
 
         // ========== CLIP TRANSFORM ==========
         ui.add_space(16.0);
@@ -1952,4 +2165,5 @@ impl PropertiesPanel {
         self.render_effect_stack_generic(ui, EffectContext::Clip { layer_id, slot }, &clip.effects, effect_registry, actions, bpm_clock, effect_time, audio_manager);
     }
 }
+
 

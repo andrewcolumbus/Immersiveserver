@@ -369,39 +369,46 @@ impl VideoDecoder {
     /// Decode HAP frames by extracting raw DXT data directly from packets
     /// This bypasses FFmpeg's decoder which would convert DXT to RGBA
     fn decode_hap_frame(&mut self) -> Result<Option<DecodedFrame>, VideoDecoderError> {
-        loop {
-            match self.input.packets().next() {
-                Some((stream, packet)) => {
-                    if stream.index() == self.video_stream_index {
-                        let packet_data = packet.data().unwrap_or(&[]);
-                        
-                        if let Some((dxt_data, is_bc3)) = parse_hap_packet(packet_data) {
-                            let pts = packet.pts().unwrap_or(0) as f64 * self.time_base;
-                            
-                            let frame = DecodedFrame::new_gpu_native(
-                                dxt_data,
-                                self.width,
-                                self.height,
-                                pts,
-                                self.frame_index,
-                                is_bc3,
-                            );
-                            self.frame_index += 1;
-                            
-                            return Ok(Some(frame));
-                        } else {
-                            // HAP parsing failed - this shouldn't happen for valid HAP files
-                            tracing::warn!("HAP packet parsing failed for frame {}", self.frame_index);
-                            continue;
-                        }
-                    }
-                }
-                None => {
-                    self.eof = true;
-                    return Ok(None);
+        // Read packets until we find a video packet or hit EOF
+        for (stream, packet) in self.input.packets() {
+            if stream.index() == self.video_stream_index {
+                let packet_data = packet.data().unwrap_or(&[]);
+
+                if let Some((dxt_data, is_bc3)) = parse_hap_packet(packet_data) {
+                    // Get raw PTS from packet
+                    let raw_pts = packet.pts().unwrap_or(0);
+
+                    // Get stream time_base for proper PTS conversion
+                    let stream_time_base = stream.time_base();
+                    let stream_tb_f64 = stream_time_base.numerator() as f64 / stream_time_base.denominator() as f64;
+
+                    // Convert PTS to seconds using stream time_base
+                    let pts_secs = raw_pts as f64 * stream_tb_f64;
+                    let pts_frame_index = (pts_secs * self.frame_rate).round() as u64;
+
+                    let frame = DecodedFrame::new_gpu_native(
+                        dxt_data,
+                        self.width,
+                        self.height,
+                        pts_secs,
+                        pts_frame_index, // Use PTS-derived index for accurate position
+                        is_bc3,
+                    );
+                    self.frame_index = pts_frame_index + 1; // Keep internal counter in sync
+
+                    return Ok(Some(frame));
+                } else {
+                    // HAP parsing failed - this shouldn't happen for valid HAP files
+                    tracing::warn!("HAP packet parsing failed for frame {}", self.frame_index);
+                    continue;
                 }
             }
+            // Non-video packet, continue to next
         }
+
+        // Iterator exhausted - EOF
+        self.eof = true;
+        Ok(None)
     }
     
     /// Standard decode path using FFmpeg decoder (for non-HAP codecs)
@@ -469,14 +476,17 @@ impl VideoDecoder {
                         output
                     };
 
+                    // Use PTS for accurate position tracking
+                    let pts_frame_index = (pts * self.frame_rate).round() as u64;
+
                     let frame = DecodedFrame::new(
                         rgba_data,
                         self.width,
                         self.height,
                         pts,
-                        self.frame_index,
+                        pts_frame_index,
                     );
-                    self.frame_index += 1;
+                    self.frame_index = pts_frame_index + 1;
 
                     return Ok(Some(frame));
                 }
@@ -529,7 +539,6 @@ impl VideoDecoder {
 
     /// Reset the decoder to the beginning of the file
     pub fn reset(&mut self) -> Result<(), VideoDecoderError> {
-        // Seek to beginning
         self.input.seek(0, ..)?;
         self.decoder.flush();
         self.frame_index = 0;
@@ -545,17 +554,15 @@ impl VideoDecoder {
     /// NOTE: For HAP videos, this returns DXT compressed data (is_gpu_native=true).
     /// Use `seek_and_decode_frame_rgba` if you need raw RGBA pixels.
     pub fn seek_and_decode_frame(&mut self, timestamp_secs: f64) -> Result<DecodedFrame, VideoDecoderError> {
-        // Convert seconds to stream timestamp units
-        // timestamp = seconds / time_base
-        let timestamp = (timestamp_secs / self.time_base) as i64;
+        // FFmpeg's input.seek() uses AV_TIME_BASE (microseconds)
+        let timestamp_us = (timestamp_secs * 1_000_000.0) as i64;
 
-        // Seek to the timestamp (seeks to nearest keyframe before)
-        self.input.seek(timestamp, ..timestamp)?;
+        // Seek to nearest keyframe
+        self.input.seek(timestamp_us, ..timestamp_us)?;
         self.decoder.flush();
         self.eof = false;
 
-        // Decode frames until we get one at or after our target
-        // (seek goes to keyframe, may need to decode a few frames)
+        // Just decode the next available frame after seek
         self.decode_next_frame()?
             .ok_or(VideoDecoderError::DecodeFailed("No frame available after seek".to_string()))
     }
@@ -565,8 +572,9 @@ impl VideoDecoder {
     /// This forces the standard FFmpeg decode path even for HAP videos,
     /// ensuring the result is always raw RGBA pixels suitable for thumbnails.
     pub fn seek_and_decode_frame_rgba(&mut self, timestamp_secs: f64) -> Result<DecodedFrame, VideoDecoderError> {
-        let timestamp = (timestamp_secs / self.time_base) as i64;
-        self.input.seek(timestamp, ..timestamp)?;
+        // FFmpeg's input.seek() uses AV_TIME_BASE (microseconds)
+        let timestamp_us = (timestamp_secs * 1_000_000.0) as i64;
+        self.input.seek(timestamp_us, ..timestamp_us)?;
         self.decoder.flush();
         self.eof = false;
 

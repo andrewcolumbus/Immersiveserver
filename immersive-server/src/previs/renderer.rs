@@ -40,6 +40,8 @@ fn hash_settings(settings: &PrevisSettings) -> u64 {
     settings.wall_right.enabled.hash(&mut hasher);
     settings.wall_right.width.to_bits().hash(&mut hasher);
     settings.wall_right.height.to_bits().hash(&mut hasher);
+    // Floor settings
+    settings.floor_enabled.hash(&mut hasher);
     settings.dome_radius.to_bits().hash(&mut hasher);
     settings.dome_segments_horizontal.hash(&mut hasher);
     settings.dome_segments_vertical.hash(&mut hasher);
@@ -88,7 +90,7 @@ impl PrevisRenderer {
             source: wgpu::ShaderSource::Wgsl(shader_source.into()),
         });
 
-        // Bind group layout: [0] camera uniforms, [1] environment texture, [2] sampler
+        // Bind group layout: [0] camera uniforms, [1] environment texture, [2] sampler, [3] floor texture
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Previs Bind Group Layout"),
             entries: &[
@@ -116,6 +118,16 @@ impl PrevisRenderer {
                     binding: 2,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
                     count: None,
                 },
             ],
@@ -222,6 +234,7 @@ impl PrevisRenderer {
                     &settings.wall_back,
                     &settings.wall_left,
                     &settings.wall_right,
+                    settings.floor_enabled,
                 ),
                 SurfaceType::Dome => PrevisMesh::dome(
                     settings.dome_radius,
@@ -319,12 +332,16 @@ impl PrevisRenderer {
     }
 
     /// Render 3D scene to internal texture
+    ///
+    /// `floor_texture_view` is used when floor mode is enabled (walls mode only).
+    /// If None, the environment texture is used for the floor as well.
     pub fn render(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         env_texture_view: &wgpu::TextureView,
+        floor_texture_view: Option<&wgpu::TextureView>,
         settings: &PrevisSettings,
     ) {
         // Update mesh if needed
@@ -339,6 +356,9 @@ impl PrevisRenderer {
             _padding: 0.0,
         };
         queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniforms));
+
+        // Use floor texture if provided, otherwise fallback to environment texture
+        let floor_view = floor_texture_view.unwrap_or(env_texture_view);
 
         // Create bind group
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -356,6 +376,10 @@ impl PrevisRenderer {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(floor_view),
                 },
             ],
         });

@@ -250,10 +250,19 @@ pub struct ParameterMeta {
     pub max: Option<f32>,
     /// Step increment (for numeric types)
     pub step: Option<f32>,
+    /// Whether this parameter can be automated with LFO/Beat/FFT
+    /// Numeric parameters (Float, Int, Bool) are automatable by default.
+    /// Non-interpolatable types (Enum, String, Color) are not automatable by default.
+    #[serde(default = "default_automatable")]
+    pub automatable: bool,
+}
+
+fn default_automatable() -> bool {
+    true
 }
 
 impl ParameterMeta {
-    /// Create a new float parameter metadata
+    /// Create a new float parameter metadata (automatable by default)
     pub fn float(name: impl Into<String>, label: impl Into<String>, default: f32, min: f32, max: f32) -> Self {
         Self {
             name: name.into(),
@@ -262,10 +271,11 @@ impl ParameterMeta {
             min: Some(min),
             max: Some(max),
             step: None,
+            automatable: true,
         }
     }
 
-    /// Create a new float parameter with step increment
+    /// Create a new float parameter with step increment (automatable by default)
     pub fn float_with_step(name: impl Into<String>, label: impl Into<String>, default: f32, min: f32, max: f32, step: f32) -> Self {
         Self {
             name: name.into(),
@@ -274,10 +284,11 @@ impl ParameterMeta {
             min: Some(min),
             max: Some(max),
             step: Some(step),
+            automatable: true,
         }
     }
 
-    /// Create a new boolean parameter metadata
+    /// Create a new boolean parameter metadata (automatable by default)
     pub fn bool(name: impl Into<String>, label: impl Into<String>, default: bool) -> Self {
         Self {
             name: name.into(),
@@ -286,10 +297,11 @@ impl ParameterMeta {
             min: None,
             max: None,
             step: None,
+            automatable: true,
         }
     }
 
-    /// Create a new color parameter metadata
+    /// Create a new color parameter metadata (NOT automatable - use individual RGB params if needed)
     pub fn color(name: impl Into<String>, label: impl Into<String>, default: [f32; 4]) -> Self {
         Self {
             name: name.into(),
@@ -298,10 +310,11 @@ impl ParameterMeta {
             min: None,
             max: None,
             step: None,
+            automatable: false,
         }
     }
 
-    /// Create a new enum parameter metadata
+    /// Create a new enum parameter metadata (NOT automatable - discrete choices)
     pub fn enumeration(name: impl Into<String>, label: impl Into<String>, options: Vec<String>, default_index: usize) -> Self {
         Self {
             name: name.into(),
@@ -310,10 +323,11 @@ impl ParameterMeta {
             min: None,
             max: None,
             step: None,
+            automatable: false,
         }
     }
 
-    /// Create a new string parameter metadata (for file paths, text, etc.)
+    /// Create a new string parameter metadata (NOT automatable - text/paths)
     pub fn string(name: impl Into<String>, label: impl Into<String>, default: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -322,7 +336,14 @@ impl ParameterMeta {
             min: None,
             max: None,
             step: None,
+            automatable: false,
         }
+    }
+
+    /// Create a variant with automation explicitly enabled/disabled
+    pub fn with_automatable(mut self, automatable: bool) -> Self {
+        self.automatable = automatable;
+        self
     }
 }
 
@@ -540,7 +561,6 @@ pub enum AutomationSource {
     Beat(BeatSource),
     /// FFT audio reactivity
     Fft(FftSource),
-    // Future: Midi { channel: u8, cc: u8 }
     // Future: Osc { address: String }
 }
 

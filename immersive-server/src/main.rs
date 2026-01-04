@@ -9,7 +9,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use immersive_server::settings::{AppPreferences, EnvironmentSettings};
-use immersive_server::ui::{activate_macos_app, focus_window_on_click, is_native_menu_supported, NativeMenu, NativeMenuEvent, WindowRegistry};
+use immersive_server::ui::{activate_macos_app, focus_window_on_click, is_native_menu_supported, DockAction, NativeMenu, NativeMenuEvent, WindowRegistry};
 use immersive_server::App;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -253,7 +253,7 @@ impl ImmersiveApp {
     fn save_settings(app: &mut App, path: &PathBuf) -> bool {
         // Sync layers from environment to settings before saving
         app.sync_layers_to_settings();
-        
+
         match app.settings.save_to_file(path) {
             Ok(_) => {
                 tracing::info!("Saved settings to: {}", path.display());
@@ -266,6 +266,206 @@ impl ImmersiveApp {
         }
     }
 
+    /// Handle dock actions (create/destroy panel windows)
+    fn handle_dock_actions(
+        event_loop: &ActiveEventLoop,
+        app: &mut App,
+        window_registry: &mut WindowRegistry,
+        gpu: &Arc<immersive_server::GpuContext>,
+    ) {
+        let actions = app.dock_manager.take_pending_actions();
+        for action in actions {
+            match action {
+                DockAction::UndockPanel { panel_id, position, size } => {
+                    tracing::info!("Creating window for undocked panel: {}", panel_id);
+
+                    // Get panel title for window
+                    let title = app.dock_manager
+                        .get_panel(&panel_id)
+                        .map(|p| p.title.clone())
+                        .unwrap_or_else(|| panel_id.clone());
+
+                    // Create the window
+                    let window_attrs = WindowAttributes::default()
+                        .with_title(title)
+                        .with_inner_size(LogicalSize::new(size.0 as f64, size.1 as f64))
+                        .with_position(winit::dpi::LogicalPosition::new(position.0 as f64, position.1 as f64));
+
+                    match event_loop.create_window(window_attrs) {
+                        Ok(window) => {
+                            let window = Arc::new(window);
+                            // Register in window registry
+                            // Note: For UI-only panels, we don't need GPU rendering
+                            // but we still need egui state for the panel content
+                            window_registry.register_panel_window(
+                                window.clone(),
+                                panel_id.clone(),
+                                gpu,
+                            );
+                            tracing::info!("Panel window created: {}", panel_id);
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to create panel window: {}", e);
+                            // Revert the undock
+                            app.dock_manager.redock_panel(&panel_id);
+                        }
+                    }
+                }
+                DockAction::RedockPanel { panel_id } => {
+                    tracing::info!("Closing window for re-docked panel: {}", panel_id);
+                    // The window will be closed when it receives CloseRequested
+                    // or we can close it programmatically here
+                    if let Some(window_id) = window_registry.get_panel_window_id(&panel_id) {
+                        window_registry.mark_closed(window_id);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Render content into an undocked panel window
+    fn render_panel_window(
+        window_id: winit::window::WindowId,
+        window_registry: &mut WindowRegistry,
+        app: &mut App,
+    ) {
+        // First, extract what we need from the entry before borrowing gpu_context mutably
+        let Some(entry) = window_registry.get(window_id) else {
+            return;
+        };
+
+        let Some(panel_id) = entry.panel_id().map(|s| s.to_string()) else {
+            return;
+        };
+
+        if entry.gpu_context.is_none() {
+            return;
+        }
+
+        let scale_factor = entry.window.scale_factor() as f32;
+        let size = entry.window.inner_size();
+
+        // Now get mutable access
+        let entry = window_registry.get_mut(window_id).unwrap();
+        let gpu_context = entry.gpu_context.as_mut().unwrap();
+
+        let gpu = app.gpu_context();
+
+        // Get surface texture
+        let surface_texture = match gpu_context.surface.get_current_texture() {
+            Ok(tex) => tex,
+            Err(e) => {
+                tracing::warn!("Failed to get panel window surface: {:?}", e);
+                return;
+            }
+        };
+
+        let view = surface_texture.texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // Begin egui pass for this window using the persistent context
+        let mut raw_input = entry.egui_state.take_egui_input(&entry.window);
+
+        // Explicitly set the screen rect to ensure egui knows the window size
+        // This is needed because the initial window creation might not have triggered resize events
+        let logical_width = size.width as f32 / scale_factor;
+        let logical_height = size.height as f32 / scale_factor;
+        raw_input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(logical_width, logical_height),
+        ));
+
+        // Use the persistent egui context for this panel window
+        let egui_ctx = &entry.egui_ctx;
+        egui_ctx.set_pixels_per_point(scale_factor);
+
+        egui_ctx.begin_pass(raw_input);
+
+        // Render panel content using App's public method
+        // Use a frame with no margins that fills the entire window
+        let mut should_redock = false;
+        let panel_frame = egui::Frame::NONE
+            .fill(egui::Color32::from_gray(30))
+            .inner_margin(egui::Margin::same(8));
+        egui::CentralPanel::default()
+            .frame(panel_frame)
+            .show(egui_ctx, |ui| {
+                should_redock = app.render_undocked_panel(&panel_id, ui);
+            });
+
+        let full_output = egui_ctx.end_pass();
+
+        // Handle platform output
+        entry.egui_state.handle_platform_output(&entry.window, full_output.platform_output);
+
+        // Tessellate and render
+        let screen_descriptor = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [size.width, size.height],
+            pixels_per_point: scale_factor,
+        };
+
+        let clipped_primitives = egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
+
+        // Upload textures
+        for (id, delta) in &full_output.textures_delta.set {
+            gpu_context.egui_renderer.update_texture(&gpu.device, &gpu.queue, *id, delta);
+        }
+
+        // Create encoder and render
+        let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Panel Window Encoder"),
+        });
+
+        gpu_context.egui_renderer.update_buffers(
+            &gpu.device,
+            &gpu.queue,
+            &mut encoder,
+            &clipped_primitives,
+            &screen_descriptor,
+        );
+
+        // Render pass in its own scope so it's dropped before encoder.finish()
+        {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Panel Window Render Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.1,
+                            g: 0.1,
+                            b: 0.1,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+
+            // SAFETY: The render_pass is used only within this block and dropped
+            // before the encoder is finished.
+            let render_pass_static: &mut wgpu::RenderPass<'static> =
+                unsafe { std::mem::transmute(&mut render_pass) };
+
+            gpu_context.egui_renderer.render(render_pass_static, &clipped_primitives, &screen_descriptor);
+        }
+
+        gpu.queue.submit(std::iter::once(encoder.finish()));
+        surface_texture.present();
+
+        // Free textures
+        for id in &full_output.textures_delta.free {
+            gpu_context.egui_renderer.free_texture(id);
+        }
+
+        // Handle redock request after rendering
+        if should_redock {
+            app.dock_manager.request_redock(&panel_id);
+        }
+    }
 }
 
 impl ApplicationHandler for ImmersiveApp {
@@ -393,13 +593,43 @@ impl ApplicationHandler for ImmersiveApp {
         // For now, only handle events for the main window
         // Panel window event handling will be added in Phase E
         if !is_main_window {
-            // Future: Route to panel window handler
-            // For now, handle basic panel window events
-            if let WindowEvent::CloseRequested = event {
-                // Panel window closed - mark for cleanup
-                // In Phase E, this will trigger re-docking
-                window_registry.mark_closed(window_id);
-                tracing::info!("Panel window closed");
+            // Handle panel window events
+            match event {
+                WindowEvent::CloseRequested => {
+                    // Panel window closed - trigger re-docking
+                    if let Some(entry) = window_registry.get(window_id) {
+                        if let Some(panel_id) = entry.panel_id() {
+                            tracing::info!("Panel window closed, re-docking: {}", panel_id);
+                            app.dock_manager.redock_panel(panel_id);
+                        }
+                    }
+                    window_registry.mark_closed(window_id);
+                }
+                WindowEvent::Resized(new_size) => {
+                    // Update panel window GPU context
+                    let gpu = app.gpu_context();
+                    if let Some(entry) = window_registry.get_mut(window_id) {
+                        entry.resize(&gpu, new_size);
+                        // Also forward to egui_state so it knows the new window size
+                        let _ = entry.egui_state.on_window_event(&entry.window, &event);
+                        // Update panel geometry
+                        if let Some(panel_id) = entry.panel_id().map(|s| s.to_string()) {
+                            if let Some(panel) = app.dock_manager.get_panel_mut(&panel_id) {
+                                panel.undocked_geometry.set_size(new_size.width as f32, new_size.height as f32);
+                            }
+                        }
+                    }
+                }
+                WindowEvent::RedrawRequested => {
+                    // Render the undocked panel
+                    Self::render_panel_window(window_id, window_registry, app);
+                }
+                _ => {
+                    // Forward other events to egui for the panel window
+                    if let Some(entry) = window_registry.get_mut(window_id) {
+                        let _ = entry.egui_state.on_window_event(&entry.window, &event);
+                    }
+                }
             }
             return;
         }
@@ -554,6 +784,9 @@ impl ApplicationHandler for ImmersiveApp {
                             NativeMenuEvent::ShowFpsToggled(show) => {
                                 app.settings.show_fps = show;
                             }
+                            NativeMenuEvent::ShowBpmToggled(show) => {
+                                app.settings.show_bpm = show;
+                            }
                             NativeMenuEvent::OpenPreferences => {
                                 app.preferences_window.open = true;
                             }
@@ -697,6 +930,10 @@ impl ApplicationHandler for ImmersiveApp {
                     menu.update_panel_states(&panel_states);
                     menu.update_show_fps(app.settings.show_fps);
                 }
+
+                // Handle dock actions (create/destroy panel windows)
+                let gpu = app.gpu_context();
+                Self::handle_dock_actions(event_loop, app, window_registry, &gpu);
             }
 
             _ => {}
@@ -753,6 +990,12 @@ impl ApplicationHandler for ImmersiveApp {
 
         // Time to render
         window.request_redraw();
+
+        // Also request redraws for all panel windows
+        for (_, entry) in window_registry.iter() {
+            entry.window.request_redraw();
+        }
+
         self.next_redraw_at += frame_duration;
 
         // Reset if more than 2 frames behind

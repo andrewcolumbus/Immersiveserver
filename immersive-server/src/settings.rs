@@ -57,6 +57,10 @@ pub struct EnvironmentSettings {
     #[serde(rename = "showFps")]
     pub show_fps: bool,
 
+    /// Whether to show BPM display in menu bar
+    #[serde(rename = "showBpm", default = "default_show_bpm")]
+    pub show_bpm: bool,
+
     /// Environment (composition canvas) width.
     ///
     /// If missing in older `.immersive` files, this will default to `window_width`.
@@ -124,6 +128,20 @@ pub struct EnvironmentSettings {
     /// 3D previsualization settings
     #[serde(rename = "previsSettings", default)]
     pub previs_settings: PrevisSettings,
+
+    // Performance mode settings
+    /// Whether floor sync is enabled (triggering clips also triggers floor layer)
+    #[serde(rename = "floorSyncEnabled", default)]
+    pub floor_sync_enabled: bool,
+
+    /// Which layer index to use as the floor layer (0 = first layer)
+    #[serde(rename = "floorLayerIndex", default)]
+    pub floor_layer_index: usize,
+}
+
+/// Default show BPM setting
+fn default_show_bpm() -> bool {
+    true
 }
 
 /// Default OMT capture FPS
@@ -156,6 +174,7 @@ impl Default for EnvironmentSettings {
         Self {
             target_fps: 60,
             show_fps: true,
+            show_bpm: true,
             environment_width: 1920,
             environment_height: 1080,
             window_width: 1920,
@@ -172,6 +191,8 @@ impl Default for EnvironmentSettings {
             thumbnail_mode: ThumbnailMode::default(),
             effects: EffectStack::new(),
             previs_settings: PrevisSettings::default(),
+            floor_sync_enabled: false,
+            floor_layer_index: 0,
         }
     }
 }

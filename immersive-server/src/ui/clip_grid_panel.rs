@@ -108,6 +108,14 @@ pub enum ClipGridAction {
         layer_id: u32,
         slot: usize,
     },
+    /// Select a layer for preview (show live layer output with effects)
+    SelectLayerForPreview {
+        layer_id: u32,
+    },
+    /// Launch all clips in a column (like Resolume)
+    LaunchColumn {
+        column_index: usize,
+    },
 }
 
 /// State for the clip grid panel
@@ -290,11 +298,26 @@ impl ClipGridPanel {
 
             for slot in 0..max_clips {
                 let label = format!("{}", slot + 1);
-                let response = ui.allocate_ui(egui::vec2(CELL_SIZE, 20.0), |ui| {
-                    ui.centered_and_justified(|ui| {
-                        ui.label(egui::RichText::new(label).size(11.0).color(egui::Color32::GRAY))
-                    }).inner
-                }).inner;
+                let (rect, response) = ui.allocate_exact_size(egui::vec2(CELL_SIZE, 20.0), egui::Sense::click());
+
+                // Draw the column number
+                let text_color = if response.hovered() {
+                    egui::Color32::WHITE
+                } else {
+                    egui::Color32::GRAY
+                };
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    label,
+                    egui::FontId::proportional(11.0),
+                    text_color,
+                );
+
+                // Left-click to launch column
+                if response.clicked() {
+                    actions.push(ClipGridAction::LaunchColumn { column_index: slot });
+                }
 
                 // Right-click context menu on column header
                 response.context_menu(|ui| {
@@ -380,9 +403,10 @@ impl ClipGridPanel {
                         .color(name_color);
                     let response = ui.selectable_label(false, label);
                     
-                    // Handle left-click to select layer (show in properties panel)
+                    // Handle left-click to select layer (show in properties panel and preview monitor)
                     if response.clicked() {
                         actions.push(ClipGridAction::SelectLayer { layer_id });
+                        actions.push(ClipGridAction::SelectLayerForPreview { layer_id });
                     }
                     
                     // Right-click context menu directly on the label
@@ -438,7 +462,7 @@ impl ClipGridPanel {
             });
 
             // Show tooltip on layer name area
-            label_response.response.on_hover_text("Click to select • Right-click for options");
+            label_response.response.on_hover_text("Click to select/preview • Right-click for options");
 
             // Opacity slider (vertical fader)
             let mut opacity = layer.opacity;

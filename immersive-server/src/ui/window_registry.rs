@@ -44,6 +44,8 @@ pub struct WindowEntry {
     /// GPU context for this window (surface, egui renderer)
     /// Only present for windows that need rendering
     pub gpu_context: Option<WindowGpuContext>,
+    /// egui context for this window (persistent across frames)
+    pub egui_ctx: egui::Context,
     /// egui state for this window
     pub egui_state: egui_winit::State,
     /// Whether this window needs a redraw
@@ -56,7 +58,7 @@ impl WindowEntry {
     /// Create a new window entry for the main window (without GPU context yet)
     pub fn new_main(window: Arc<Window>, egui_ctx: egui::Context) -> Self {
         let egui_state = egui_winit::State::new(
-            egui_ctx,
+            egui_ctx.clone(),
             egui::ViewportId::ROOT,
             &window,
             Some(window.scale_factor() as f32),
@@ -68,6 +70,7 @@ impl WindowEntry {
             window,
             window_type: WindowType::Main,
             gpu_context: None, // Main window GPU context is managed by App
+            egui_ctx,
             egui_state,
             needs_redraw: true,
             closed: false,
@@ -79,12 +82,15 @@ impl WindowEntry {
         window: Arc<Window>,
         panel_id: String,
         gpu: &GpuContext,
-        egui_ctx: egui::Context,
     ) -> Self {
         let gpu_context = WindowGpuContext::new(gpu, window.clone());
 
+        // Create a new egui context for this panel window
+        let egui_ctx = egui::Context::default();
+        egui_ctx.set_pixels_per_point(window.scale_factor() as f32);
+
         let egui_state = egui_winit::State::new(
-            egui_ctx,
+            egui_ctx.clone(),
             egui::ViewportId::from_hash_of(&panel_id),
             &window,
             Some(window.scale_factor() as f32),
@@ -96,6 +102,7 @@ impl WindowEntry {
             window,
             window_type: WindowType::Panel { panel_id },
             gpu_context: Some(gpu_context),
+            egui_ctx,
             egui_state,
             needs_redraw: true,
             closed: false,
@@ -180,11 +187,10 @@ impl WindowRegistry {
         window: Arc<Window>,
         panel_id: String,
         gpu: &GpuContext,
-        egui_ctx: egui::Context,
     ) {
         let id = window.id();
         self.panel_to_window.insert(panel_id.clone(), id);
-        self.windows.insert(id, WindowEntry::new_panel(window, panel_id, gpu, egui_ctx));
+        self.windows.insert(id, WindowEntry::new_panel(window, panel_id, gpu));
         self.next_viewport_id += 1;
     }
 

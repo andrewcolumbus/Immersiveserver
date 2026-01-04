@@ -11,6 +11,19 @@ use crate::compositor::ClipTransition;
 use crate::network::NdiReceiver;
 use crate::video::{VideoPlayer, VideoTexture};
 
+/// Video information for a layer's playing clip
+#[derive(Debug, Clone)]
+pub struct LayerVideoInfo {
+    pub width: u32,
+    pub height: u32,
+    pub frame_rate: f64,
+    pub duration: f64,
+    /// Current playback position in seconds
+    pub position: f64,
+    /// Whether playback is currently paused
+    pub is_paused: bool,
+}
+
 /// Runtime state for a layer, including GPU resources and video playback.
 ///
 /// This struct is stored separately from the Layer data model to keep
@@ -129,6 +142,34 @@ impl LayerRuntime {
         if let Some(player) = &self.player {
             player.restart();
         }
+    }
+
+    /// Seek video to specific time in seconds
+    pub fn seek(&self, time_secs: f64) {
+        if let Some(player) = &self.player {
+            player.seek(time_secs);
+        }
+    }
+
+    /// Get video info (dimensions, fps, duration, position)
+    pub fn video_info(&self) -> Option<LayerVideoInfo> {
+        self.player.as_ref().map(|p| {
+            let frame_index = p.frame_index();
+            let frame_rate = p.frame_rate();
+            let position = if frame_rate > 0.0 {
+                frame_index as f64 / frame_rate
+            } else {
+                0.0
+            };
+            LayerVideoInfo {
+                width: p.width(),
+                height: p.height(),
+                frame_rate,
+                duration: p.duration(),
+                position,
+                is_paused: p.is_paused(),
+            }
+        })
     }
 
     /// Take the latest decoded frame (if any) and upload to texture

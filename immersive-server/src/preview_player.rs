@@ -177,6 +177,13 @@ impl PreviewPlayer {
         }
     }
 
+    /// Seek to a specific time in seconds
+    pub fn seek(&self, time_secs: f64) {
+        if let Some(player) = &self.player {
+            player.seek(time_secs);
+        }
+    }
+
     /// Check if paused
     pub fn is_paused(&self) -> bool {
         self.player.as_ref().map(|p| p.is_paused()).unwrap_or(true)

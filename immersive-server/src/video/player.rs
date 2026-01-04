@@ -5,7 +5,7 @@
 //! display refresh rate.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -24,8 +24,14 @@ struct SharedState {
     paused: AtomicBool,
     /// Signal to restart from beginning
     restart_requested: AtomicBool,
+    /// Signal to seek to a specific time
+    seek_requested: AtomicBool,
+    /// Target seek time in seconds (stored as bits for atomic ops)
+    seek_target_bits: AtomicU64,
     /// Current frame index for tracking
     frame_index: AtomicU64,
+    /// Loop mode: 0=Loop, 1=PlayOnce
+    loop_mode: AtomicU8,
 }
 
 impl SharedState {
@@ -36,7 +42,10 @@ impl SharedState {
             running: AtomicBool::new(true),
             paused: AtomicBool::new(false),
             restart_requested: AtomicBool::new(false),
+            seek_requested: AtomicBool::new(false),
+            seek_target_bits: AtomicU64::new(0),
             frame_index: AtomicU64::new(0),
+            loop_mode: AtomicU8::new(0), // Default: Loop
         }
     }
 }
@@ -148,6 +157,27 @@ impl VideoPlayer {
                 tracing::debug!("VideoPlayer: restarted");
             }
 
+            // Check for seek request
+            if state.seek_requested.swap(false, Ordering::AcqRel) {
+                let target_bits = state.seek_target_bits.load(Ordering::Acquire);
+                let target_secs = f64::from_bits(target_bits);
+
+                match decoder.seek_and_decode_frame(target_secs) {
+                    Ok(frame) => {
+                        let frame_idx = frame.frame_index;
+                        if let Ok(mut current) = state.current_frame.lock() {
+                            *current = Some(frame);
+                            state.new_frame_available.store(true, Ordering::Release);
+                            state.frame_index.store(frame_idx, Ordering::Release);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to seek: {}", e);
+                    }
+                }
+                next_frame_time = Instant::now();
+            }
+
             // Check if paused
             if state.paused.load(Ordering::Acquire) {
                 thread::sleep(Duration::from_millis(10));
@@ -180,13 +210,19 @@ impl VideoPlayer {
                     }
                 }
                 Ok(None) => {
-                    // End of video - loop
-                    if let Err(e) = decoder.reset() {
-                        tracing::warn!("Failed to reset decoder for loop: {}", e);
+                    // End of video - check loop mode
+                    let mode = state.loop_mode.load(Ordering::Acquire);
+                    if mode == 0 {
+                        // Loop: restart from beginning
+                        if let Err(e) = decoder.reset() {
+                            tracing::warn!("Failed to reset decoder for loop: {}", e);
+                        }
+                        next_frame_time = Instant::now();
+                        state.frame_index.store(0, Ordering::Release);
+                    } else {
+                        // PlayOnce: stay paused on last frame
+                        state.paused.store(true, Ordering::Release);
                     }
-                    next_frame_time = Instant::now();
-                    state.frame_index.store(0, Ordering::Release);
-                    tracing::debug!("VideoPlayer: looping");
                 }
                 Err(e) => {
                     tracing::error!("Decode error: {}", e);
@@ -251,7 +287,15 @@ impl VideoPlayer {
     pub fn restart(&self) {
         self.state.restart_requested.store(true, Ordering::Release);
     }
-    
+
+    /// Seek to a specific time in seconds
+    pub fn seek(&self, time_secs: f64) {
+        // Store target time as bits (atomic f64 workaround)
+        let bits = time_secs.to_bits();
+        self.state.seek_target_bits.store(bits, Ordering::Release);
+        self.state.seek_requested.store(true, Ordering::Release);
+    }
+
     /// Get current frame index
     pub fn frame_index(&self) -> u64 {
         self.state.frame_index.load(Ordering::Acquire)
@@ -300,6 +344,17 @@ impl VideoPlayer {
     /// Check if this is specifically a HAP codec (not DXV)
     pub fn is_hap(&self) -> bool {
         self.info.is_hap
+    }
+
+    /// Set the loop mode (0=Loop, 1=PlayOnce)
+    pub fn set_loop_mode(&self, mode: u8) {
+        self.state.loop_mode.store(mode, Ordering::Release);
+        tracing::debug!("VideoPlayer: set loop mode to {}", mode);
+    }
+
+    /// Get the current loop mode (0=Loop, 1=PlayOnce)
+    pub fn loop_mode(&self) -> u8 {
+        self.state.loop_mode.load(Ordering::Acquire)
     }
 }
 

@@ -112,11 +112,11 @@ pub struct PrevisSettings {
     #[serde(rename = "domeSegmentsV", default = "default_dome_segments_v")]
     pub dome_segments_vertical: u32,
 
-    // Floor settings (for walls mode)
-    /// Whether floor is enabled
+    // Floor settings (for walls mode - 3D visualization only)
+    /// Whether floor is enabled in 3D preview
     #[serde(rename = "floorEnabled", default)]
     pub floor_enabled: bool,
-    /// Which layer index to display on the floor (0 = first layer)
+    /// Which layer index to display on the floor in 3D preview (0 = first layer)
     #[serde(rename = "floorLayerIndex", default)]
     pub floor_layer_index: usize,
 

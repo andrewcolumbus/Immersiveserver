@@ -145,6 +145,8 @@ pub struct App {
     previs_renderer: Option<crate::previs::PrevisRenderer>,
     /// Preview player for clip preview playback
     preview_player: crate::preview_player::PreviewPlayer,
+    /// Layer ID for layer preview mode (None = clip preview, Some = layer preview)
+    preview_layer_id: Option<u32>,
     /// Thumbnail cache for video previews in clip grid
     pub thumbnail_cache: crate::ui::ThumbnailCache,
     /// HAP Converter window
@@ -169,6 +171,11 @@ pub struct App {
     pending_runtimes: HashMap<u32, LayerRuntime>,
     /// Pending transitions for layers (stored when clip is triggered, applied when ready)
     pending_transition: HashMap<u32, crate::compositor::ClipTransition>,
+    /// Scrub state: tracks which layers were playing before scrubbing started
+    /// Key is layer ID, value is true if layer was playing (not paused) before scrub
+    scrub_was_playing: HashMap<u32, bool>,
+    /// Scrub state for preview player: was video playing before scrub started?
+    scrub_was_playing_preview: bool,
     /// Last layer ID that had a texture uploaded (for round-robin rate limiting)
     last_upload_layer: u32,
 
@@ -531,6 +538,7 @@ impl App {
             previs_panel: crate::ui::PrevisPanel::new(),
             previs_renderer: Some(previs_renderer),
             preview_player: crate::preview_player::PreviewPlayer::new(bc_texture_supported),
+            preview_layer_id: None,
             thumbnail_cache: crate::ui::ThumbnailCache::new(),
             converter_window: crate::converter::ConverterWindow::new(),
             preferences_window: crate::ui::PreferencesWindow::new(),
@@ -545,6 +553,8 @@ impl App {
             layer_runtimes: HashMap::new(),
             pending_runtimes: HashMap::new(),
             pending_transition: HashMap::new(),
+            scrub_was_playing: HashMap::new(),
+            scrub_was_playing_preview: false,
             last_upload_layer: 0,
             shader_watcher,
 
@@ -673,22 +683,10 @@ impl App {
                 }
             }
             panel_ids::PREVIEW_MONITOR => {
-                let has_frame = self.preview_player.has_frame();
-                let is_playing = !self.preview_player.is_paused();
-                let video_info = self.preview_player.video_info();
-                let actions = self.preview_monitor_panel.render_contents(
-                    ui,
-                    has_frame,
-                    is_playing,
-                    video_info,
-                    |_ui, _rect| {
-                        // Preview texture rendering in undocked window not yet supported
-                        // Would need to share the texture between windows
-                    },
-                );
-                for action in actions {
-                    self.handle_preview_action(action);
-                }
+                // Preview Monitor cannot be undocked (requires GPU texture access from main window)
+                ui.centered_and_justified(|ui| {
+                    ui.label("Preview Monitor cannot be undocked");
+                });
             }
             panel_ids::PREVIS => {
                 if let Some(renderer) = &mut self.previs_renderer {
@@ -1244,6 +1242,246 @@ impl App {
         // Sync thumbnail mode from settings (clears cache if changed)
         self.thumbnail_cache.set_mode(self.settings.thumbnail_mode);
 
+        // Create command encoder early so we can process preview effects before egui
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Render Encoder"),
+            });
+
+        // ========== PREVIEW EFFECT PROCESSING ==========
+        // Process effects for the preview clip BEFORE building egui UI
+        // This ensures the egui texture ID points to the effect output when the UI is built
+        if self.preview_player.has_frame() {
+            if let Some(preview_clip_info) = self.preview_monitor_panel.current_clip() {
+                // Get the clip's effects from the environment
+                if let Some(layer) = self.environment.get_layer(preview_clip_info.layer_id) {
+                    if let Some(clip) = layer.get_clip(preview_clip_info.slot) {
+                        let active_effect_count = clip.effects.active_effects().count();
+
+                        if active_effect_count > 0 {
+                            let (width, height) = self.preview_player.dimensions();
+
+                            // 1. Ensure preview runtime exists
+                            self.effect_manager.ensure_preview_runtime(
+                                &self.device,
+                                width,
+                                height,
+                                self.config.format,
+                            );
+
+                            // 2. Sync preview effects with the clip's effect stack
+                            self.effect_manager.sync_preview_effects(
+                                &clip.effects,
+                                &self.device,
+                                &self.queue,
+                                self.config.format,
+                            );
+
+                            // 3. Copy video texture to preview effect input
+                            if let Some(video_view) = self.preview_player.texture_view() {
+                                if let Some(preview_runtime) = self.effect_manager.get_preview_runtime_mut() {
+                                    preview_runtime.copy_input_texture(
+                                        &mut encoder,
+                                        &self.device,
+                                        video_view,
+                                    );
+                                }
+                            }
+
+                            // 4. Process preview effects
+                            let effect_params = self.effect_manager.build_params();
+                            let bpm_clock = self.effect_manager.bpm_clock().clone();
+                            if let Some(preview_runtime) = self.effect_manager.get_preview_runtime_mut() {
+                                if let (Some(input_view), Some(output_view)) = (
+                                    preview_runtime.input_view().map(|v| v as *const _),
+                                    preview_runtime.output_view(active_effect_count).map(|v| v as *const _),
+                                ) {
+                                    unsafe {
+                                        preview_runtime.process_with_automation(
+                                            &mut encoder,
+                                            &self.queue,
+                                            &self.device,
+                                            &*input_view,
+                                            &*output_view,
+                                            &clip.effects,
+                                            &effect_params,
+                                            &bpm_clock,
+                                            Some(&self.audio_manager),
+                                        );
+                                    }
+                                }
+                            }
+
+                            // 5. Update egui texture to use effect output
+                            if let Some(preview_runtime) = self.effect_manager.get_preview_runtime() {
+                                if let Some(output_view) = preview_runtime.output_view(active_effect_count) {
+                                    // Free old texture if exists
+                                    if let Some(old_id) = self.preview_player.egui_texture_id.take() {
+                                        self.egui_renderer.free_texture(&old_id);
+                                    }
+                                    // Register effect output
+                                    let texture_id = self.egui_renderer.register_native_texture(
+                                        &self.device,
+                                        output_view,
+                                        wgpu::FilterMode::Linear,
+                                    );
+                                    self.preview_player.egui_texture_id = Some(texture_id);
+                                }
+                            }
+                        } else {
+                            // No active effects - ensure we're showing the raw video texture
+                            // Re-register the video texture if effects were just disabled
+                            // Use a raw pointer to work around borrow checker since we know the lifetime is safe
+                            let video_view_ptr = self.preview_player.texture_view()
+                                .map(|v| v as *const wgpu::TextureView);
+                            if let Some(video_view_ptr) = video_view_ptr {
+                                if let Some(old_id) = self.preview_player.egui_texture_id.take() {
+                                    self.egui_renderer.free_texture(&old_id);
+                                }
+                                let texture_id = unsafe {
+                                    self.egui_renderer.register_native_texture(
+                                        &self.device,
+                                        &*video_view_ptr,
+                                        wgpu::FilterMode::Linear,
+                                    )
+                                };
+                                self.preview_player.egui_texture_id = Some(texture_id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ========== LAYER PREVIEW TEXTURE REGISTRATION ==========
+        // For layer preview mode, register the layer's texture (with effects) for egui display
+        if let Some(layer_id) = self.preview_layer_id {
+            if let Some(layer_runtime) = self.layer_runtimes.get(&layer_id) {
+                if layer_runtime.has_frame {
+                    // Get the layer's video texture
+                    if let Some(texture) = &layer_runtime.texture {
+                        // Get layer and its effects for preview processing
+                        let layer_effects_info = self.environment.get_layer(layer_id).map(|layer| {
+                            let clip_effects = layer.active_clip
+                                .and_then(|slot| layer.get_clip(slot))
+                                .map(|c| c.effects.clone());
+                            let layer_effects = layer.effects.clone();
+                            (clip_effects, layer_effects)
+                        });
+
+                        // Process effects if any are active
+                        let mut use_raw_texture = true;
+                        if let Some((clip_effects, layer_effects)) = layer_effects_info {
+                            let clip_effect_count = clip_effects.as_ref()
+                                .map(|e| e.active_effects().count())
+                                .unwrap_or(0);
+                            let layer_effect_count = layer_effects.active_effects().count();
+                            let total_effects = clip_effect_count + layer_effect_count;
+
+                            if total_effects > 0 {
+                                let (width, height) = (texture.width(), texture.height());
+
+                                // Ensure preview runtime exists
+                                self.effect_manager.ensure_preview_runtime(
+                                    &self.device,
+                                    width,
+                                    height,
+                                    self.config.format,
+                                );
+
+                                // Create a combined effect stack for preview
+                                // We'll process clip effects first, then layer effects
+                                let mut combined_effects = crate::effects::EffectStack::new();
+                                if let Some(ref clip_fx) = clip_effects {
+                                    for effect in &clip_fx.effects {
+                                        combined_effects.effects.push(effect.clone());
+                                    }
+                                }
+                                for effect in &layer_effects.effects {
+                                    combined_effects.effects.push(effect.clone());
+                                }
+
+                                // Sync preview effects with combined stack
+                                self.effect_manager.sync_preview_effects(
+                                    &combined_effects,
+                                    &self.device,
+                                    &self.queue,
+                                    self.config.format,
+                                );
+
+                                // Copy layer texture to preview effect input
+                                if let Some(preview_runtime) = self.effect_manager.get_preview_runtime_mut() {
+                                    preview_runtime.copy_input_texture(
+                                        &mut encoder,
+                                        &self.device,
+                                        texture.view(),
+                                    );
+                                }
+
+                                // Process effects
+                                let effect_params = self.effect_manager.build_params();
+                                let bpm_clock = self.effect_manager.bpm_clock().clone();
+                                let combined_effect_count = combined_effects.active_effects().count();
+                                if let Some(preview_runtime) = self.effect_manager.get_preview_runtime_mut() {
+                                    if let (Some(input_view), Some(output_view)) = (
+                                        preview_runtime.input_view().map(|v| v as *const _),
+                                        preview_runtime.output_view(combined_effect_count).map(|v| v as *const _),
+                                    ) {
+                                        unsafe {
+                                            preview_runtime.process_with_automation(
+                                                &mut encoder,
+                                                &self.queue,
+                                                &self.device,
+                                                &*input_view,
+                                                &*output_view,
+                                                &combined_effects,
+                                                &effect_params,
+                                                &bpm_clock,
+                                                Some(&self.audio_manager),
+                                            );
+                                        }
+                                    }
+                                }
+
+                                // Register effect output with egui
+                                if let Some(preview_runtime) = self.effect_manager.get_preview_runtime() {
+                                    if let Some(output_view) = preview_runtime.output_view(combined_effect_count) {
+                                        if let Some(old_id) = self.preview_player.egui_texture_id.take() {
+                                            self.egui_renderer.free_texture(&old_id);
+                                        }
+                                        let texture_id = self.egui_renderer.register_native_texture(
+                                            &self.device,
+                                            output_view,
+                                            wgpu::FilterMode::Linear,
+                                        );
+                                        self.preview_player.egui_texture_id = Some(texture_id);
+                                        use_raw_texture = false;
+                                    }
+                                }
+                            }
+                        }
+
+                        // No effects - register raw layer texture
+                        if use_raw_texture {
+                            let texture_view_ptr = texture.view() as *const wgpu::TextureView;
+                            if let Some(old_id) = self.preview_player.egui_texture_id.take() {
+                                self.egui_renderer.free_texture(&old_id);
+                            }
+                            let texture_id = unsafe {
+                                self.egui_renderer.register_native_texture(
+                                    &self.device,
+                                    &*texture_view_ptr,
+                                    wgpu::FilterMode::Linear,
+                                )
+                            };
+                            self.preview_player.egui_texture_id = Some(texture_id);
+                        }
+                    }
+                }
+            }
+        }
+
         // Begin egui frame
         let raw_input = self.egui_state.take_egui_input(&self.window);
         self.egui_ctx.begin_pass(raw_input);
@@ -1445,6 +1683,7 @@ impl App {
                         let mut actions = Vec::new();
                         egui::SidePanel::left("properties_panel")
                             .default_width(dock_width)
+                            .max_width(450.0)
                             .resizable(true)
                             .show(&self.egui_ctx, |ui| {
                                 // Panel header with float/undock buttons
@@ -1832,9 +2071,25 @@ impl App {
                 let size = floating_size.unwrap_or((320.0, 280.0));
                 let mut open = true;
 
-                let has_frame = self.preview_player.has_frame();
+                // Determine has_frame based on mode (clip vs layer preview)
+                let has_frame = if let Some(layer_id) = self.preview_layer_id {
+                    // Layer preview mode - check if layer runtime has a frame
+                    self.layer_runtimes.get(&layer_id)
+                        .map(|r| r.has_frame)
+                        .unwrap_or(false)
+                } else {
+                    // Clip preview mode
+                    self.preview_player.has_frame()
+                };
                 let is_playing = !self.preview_player.is_paused();
                 let video_info = self.preview_player.video_info();
+
+                // Get layer dimensions for layer preview mode
+                let layer_dimensions = self.preview_layer_id.and_then(|layer_id| {
+                    self.layer_runtimes.get(&layer_id)
+                        .and_then(|r| r.texture.as_ref())
+                        .map(|t| (t.width(), t.height()))
+                });
 
                 let window_response = egui::Window::new("Preview Monitor")
                     .id(egui::Id::new("preview_monitor_window"))
@@ -1844,31 +2099,24 @@ impl App {
                     .collapsible(true)
                     .open(&mut open)
                     .show(&self.egui_ctx, |ui| {
-                        // Undock button in header
-                        ui.horizontal(|ui| {
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.small_button("⧉").on_hover_text("Undock to separate window").clicked() {
-                                    self.dock_manager.request_undock(crate::ui::dock::panel_ids::PREVIEW_MONITOR);
-                                }
-                            });
-                        });
-                        ui.separator();
+                        // Preview Monitor cannot be undocked (requires GPU texture access)
                         actions = self.preview_monitor_panel.render_contents(
                             ui,
                             has_frame,
                             is_playing,
                             video_info,
+                            layer_dimensions,
                             |ui, rect| {
                                 // Render the preview texture into the given rect
                                 if let Some(texture_id) = self.preview_player.egui_texture_id {
-                                    // Display the actual video texture
+                                    // Display the actual video/layer texture
                                     ui.painter().image(
                                         texture_id,
                                         rect,
                                         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                                         egui::Color32::WHITE,
                                     );
-                                } else if self.preview_player.is_loaded() {
+                                } else if self.preview_player.is_loaded() || self.preview_layer_id.is_some() {
                                     // Texture not yet registered, show loading state
                                     ui.painter().rect_filled(
                                         rect,
@@ -1994,13 +2242,6 @@ impl App {
         let paint_jobs = self
             .egui_ctx
             .tessellate(full_output.shapes, full_output.pixels_per_point);
-
-        // Create command encoder
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Render Encoder"),
-            });
 
         // Render to Environment texture (fixed-resolution canvas)
         // 1. Always render checkerboard background first
@@ -2359,91 +2600,6 @@ impl App {
                     env_effects,
                     Some(&self.audio_manager),
                 );
-            }
-        }
-
-        // ========== PREVIEW EFFECT PROCESSING ==========
-        // Process effects for the preview clip if the clip has effects
-        if self.preview_player.has_frame() {
-            if let Some(preview_clip_info) = self.preview_monitor_panel.current_clip() {
-                // Get the clip's effects from the environment
-                if let Some(layer) = self.environment.get_layer(preview_clip_info.layer_id) {
-                    if let Some(clip) = layer.get_clip(preview_clip_info.slot) {
-                        let active_effect_count = clip.effects.active_effects().count();
-
-                        if active_effect_count > 0 {
-                            let (width, height) = self.preview_player.dimensions();
-
-                            // 1. Ensure preview runtime exists
-                            self.effect_manager.ensure_preview_runtime(
-                                &self.device,
-                                width,
-                                height,
-                                self.config.format,
-                            );
-
-                            // 2. Sync preview effects with the clip's effect stack
-                            self.effect_manager.sync_preview_effects(
-                                &clip.effects,
-                                &self.device,
-                                &self.queue,
-                                self.config.format,
-                            );
-
-                            // 3. Copy video texture to preview effect input
-                            if let Some(video_view) = self.preview_player.texture_view() {
-                                if let Some(preview_runtime) = self.effect_manager.get_preview_runtime_mut() {
-                                    preview_runtime.copy_input_texture(
-                                        &mut encoder,
-                                        &self.device,
-                                        video_view,
-                                    );
-                                }
-                            }
-
-                            // 4. Process preview effects
-                            let effect_params = self.effect_manager.build_params();
-                            let bpm_clock = self.effect_manager.bpm_clock().clone();
-                            if let Some(preview_runtime) = self.effect_manager.get_preview_runtime_mut() {
-                                if let (Some(input_view), Some(output_view)) = (
-                                    preview_runtime.input_view().map(|v| v as *const _),
-                                    preview_runtime.output_view(active_effect_count).map(|v| v as *const _),
-                                ) {
-                                    unsafe {
-                                        preview_runtime.process_with_automation(
-                                            &mut encoder,
-                                            &self.queue,
-                                            &self.device,
-                                            &*input_view,
-                                            &*output_view,
-                                            &clip.effects,
-                                            &effect_params,
-                                            &bpm_clock,
-                                            Some(&self.audio_manager),
-                                        );
-                                    }
-                                }
-                            }
-
-                            // 5. Update egui texture to use effect output
-                            if let Some(preview_runtime) = self.effect_manager.get_preview_runtime() {
-                                if let Some(output_view) = preview_runtime.output_view(active_effect_count) {
-                                    // Free old texture if exists
-                                    if let Some(old_id) = self.preview_player.egui_texture_id.take() {
-                                        self.egui_renderer.free_texture(&old_id);
-                                    }
-                                    // Register effect output
-                                    let texture_id = self.egui_renderer.register_native_texture(
-                                        &self.device,
-                                        output_view,
-                                        wgpu::FilterMode::Linear,
-                                    );
-                                    self.preview_player.egui_texture_id = Some(texture_id);
-                                }
-                            }
-                        }
-                    }
-                }
             }
         }
 
@@ -3392,6 +3548,12 @@ impl App {
         // Handle different source types
         match &clip_source {
             crate::compositor::ClipSource::File { path } => {
+                // Get the loop mode for this clip
+                let loop_mode = self.environment.get_layer(layer_id)
+                    .and_then(|l| l.get_clip(slot))
+                    .map(|c| c.loop_mode)
+                    .unwrap_or_default();
+
                 // Check if this is a replay of the same clip (same path)
                 let is_same_clip = if let Some(runtime) = self.layer_runtimes.get(&layer_id) {
                     if let Some(player) = &runtime.player {
@@ -3407,6 +3569,12 @@ impl App {
                     // Same clip - just restart playback (no flash!)
                     tracing::info!("🔄 Restarting clip {} on layer {}", slot, layer_id);
                     self.restart_layer_video(layer_id);
+                    // Update loop mode on existing player
+                    if let Some(runtime) = self.layer_runtimes.get(&layer_id) {
+                        if let Some(player) = &runtime.player {
+                            player.set_loop_mode(loop_mode.as_u8());
+                        }
+                    }
                 } else {
                     // Different clip - need to load it
                     tracing::info!("🎬 Loading clip {} on layer {} with {:?} transition: {:?}",
@@ -3416,6 +3584,13 @@ impl App {
                     self.pending_transition.insert(layer_id, transition);
 
                     self.load_layer_video(layer_id, path)?;
+
+                    // Set loop mode on the new player (in pending or current runtime)
+                    if let Some(runtime) = self.pending_runtimes.get(&layer_id).or(self.layer_runtimes.get(&layer_id)) {
+                        if let Some(player) = &runtime.player {
+                            player.set_loop_mode(loop_mode.as_u8());
+                        }
+                    }
                 }
 
                 // Update the active clip slot in the layer
@@ -4906,6 +5081,9 @@ impl App {
             }
             ClipGridAction::SelectClipForPreview { layer_id, slot } => {
                 // Select clip for preview without triggering it
+                // Clear layer preview mode (switching to clip mode)
+                self.preview_layer_id = None;
+
                 // Load the clip into the preview player
                 if let Some(layer) = self.environment.layers().iter().find(|l| l.id == layer_id) {
                     if let Some(clip) = layer.get_clip(slot) {
@@ -4964,6 +5142,34 @@ impl App {
                             p.open = true;
                         }
                     }
+                }
+            }
+            ClipGridAction::SelectLayerForPreview { layer_id } => {
+                // Select layer for preview (show live layer output with effects)
+                if let Some(layer) = self.environment.layers().iter().find(|l| l.id == layer_id) {
+                    // Set the layer info in the preview panel
+                    self.preview_monitor_panel.set_preview_layer(crate::ui::PreviewLayerInfo {
+                        layer_id,
+                        name: layer.name.clone(),
+                    });
+
+                    // Store the layer ID for preview rendering
+                    self.preview_layer_id = Some(layer_id);
+
+                    // Stop any clip preview playback (we're now in layer mode)
+                    self.preview_player.clear();
+
+                    // Free old preview texture from egui
+                    if let Some(old_texture_id) = self.preview_player.egui_texture_id.take() {
+                        self.egui_renderer.free_texture(&old_texture_id);
+                    }
+
+                    // Open preview monitor panel
+                    if let Some(p) = self.dock_manager.get_panel_mut(crate::ui::dock::panel_ids::PREVIEW_MONITOR) {
+                        p.open = true;
+                    }
+
+                    tracing::info!("Layer preview selected: {} (id={})", layer.name, layer_id);
                 }
             }
             ClipGridAction::LaunchColumn { column_index } => {
@@ -5349,11 +5555,59 @@ impl App {
                     slot,
                 });
             }
+            PropertiesAction::SetClipLoopMode { layer_id, slot, mode } => {
+                // Check if this clip is currently playing first (before borrowing mutably)
+                let is_active_clip = self.environment.get_layer(layer_id)
+                    .map(|l| l.active_clip == Some(slot))
+                    .unwrap_or(false);
+
+                // Update clip data
+                if let Some(layer) = self.environment.get_layer_mut(layer_id) {
+                    if let Some(Some(clip)) = layer.clips.get_mut(slot) {
+                        clip.loop_mode = mode;
+                    }
+                }
+
+                // Update active player if this clip is currently playing
+                if is_active_clip {
+                    if let Some(runtime) = self.layer_runtimes.get(&layer_id) {
+                        if let Some(player) = &runtime.player {
+                            player.set_loop_mode(mode.as_u8());
+                        }
+                    }
+                }
+            }
             PropertiesAction::SetFloorSyncEnabled { enabled } => {
                 self.settings.floor_sync_enabled = enabled;
             }
             PropertiesAction::SetFloorLayerIndex { index } => {
                 self.settings.floor_layer_index = index;
+            }
+            PropertiesAction::StartScrub { layer_id } => {
+                // Store whether the video was playing before scrubbing
+                if let Some(runtime) = self.layer_runtimes.get(&layer_id) {
+                    let was_playing = !runtime.is_paused();
+                    self.scrub_was_playing.insert(layer_id, was_playing);
+                    // Pause during scrub
+                    if let Some(player) = &runtime.player {
+                        player.pause();
+                    }
+                }
+            }
+            PropertiesAction::EndScrub { layer_id, time_secs } => {
+                // Final seek to the scrub position, then restore previous play state
+                if let Some(runtime) = self.layer_runtimes.get(&layer_id) {
+                    runtime.seek(time_secs);
+                }
+                if let Some(was_playing) = self.scrub_was_playing.remove(&layer_id) {
+                    if was_playing {
+                        if let Some(runtime) = self.layer_runtimes.get(&layer_id) {
+                            if let Some(player) = &runtime.player {
+                                player.resume();
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -5391,6 +5645,20 @@ impl App {
             }
             PreviewMonitorAction::SeekTo { time_secs } => {
                 self.preview_player.seek(time_secs);
+            }
+            PreviewMonitorAction::StartScrub => {
+                // Store whether video was playing before scrubbing
+                self.scrub_was_playing_preview = !self.preview_player.is_paused();
+                // Pause during scrub
+                self.preview_player.pause();
+            }
+            PreviewMonitorAction::EndScrub { time_secs } => {
+                // Final seek to scrub position
+                self.preview_player.seek(time_secs);
+                // Restore previous play state
+                if self.scrub_was_playing_preview {
+                    self.preview_player.resume();
+                }
             }
             PreviewMonitorAction::TriggerToLayer { layer_id, slot } => {
                 // Trigger the previewed clip to its layer (go live)

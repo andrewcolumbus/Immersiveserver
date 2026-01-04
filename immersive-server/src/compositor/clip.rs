@@ -16,6 +16,34 @@ pub const DEFAULT_CLIP_SLOTS: usize = 8;
 /// Default transition duration in milliseconds
 pub const DEFAULT_TRANSITION_DURATION_MS: u32 = 500;
 
+/// How the clip should behave at end of playback
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum LoopMode {
+    /// Loop continuously (default)
+    #[default]
+    Loop,
+    /// Play once and stop on last frame
+    PlayOnce,
+}
+
+impl LoopMode {
+    /// Convert to u8 for atomic storage
+    pub fn as_u8(self) -> u8 {
+        match self {
+            LoopMode::Loop => 0,
+            LoopMode::PlayOnce => 1,
+        }
+    }
+
+    /// Convert from u8
+    pub fn from_u8(value: u8) -> Self {
+        match value {
+            1 => LoopMode::PlayOnce,
+            _ => LoopMode::Loop,
+        }
+    }
+}
+
 /// The source type for a clip
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClipSource {
@@ -293,6 +321,10 @@ pub struct ClipCell {
     /// Transform for this clip (applied before layer transform)
     #[serde(default)]
     pub transform: Transform2D,
+
+    /// How this clip loops (default: Loop continuously)
+    #[serde(default)]
+    pub loop_mode: LoopMode,
 }
 
 /// Helper struct for deserializing ClipCell with backwards compatibility
@@ -308,6 +340,8 @@ struct ClipCellRaw {
     effects: EffectStack,
     #[serde(default)]
     transform: Transform2D,
+    #[serde(default)]
+    loop_mode: LoopMode,
 }
 
 impl<'de> Deserialize<'de> for ClipCell {
@@ -345,6 +379,7 @@ impl<'de> Deserialize<'de> for ClipCell {
             label: raw.label,
             effects: raw.effects,
             transform: raw.transform,
+            loop_mode: raw.loop_mode,
         })
     }
 }
@@ -370,6 +405,7 @@ impl ClipCell {
             label: None,
             effects: EffectStack::new(),
             transform: Transform2D::default(),
+            loop_mode: LoopMode::default(),
         }
     }
 
@@ -382,6 +418,7 @@ impl ClipCell {
             label: Some(label.into()),
             effects: EffectStack::new(),
             transform: Transform2D::default(),
+            loop_mode: LoopMode::default(),
         }
     }
 
@@ -397,6 +434,7 @@ impl ClipCell {
             label: Some(name_str),
             effects: EffectStack::new(),
             transform: Transform2D::default(),
+            loop_mode: LoopMode::default(),
         }
     }
 
@@ -420,6 +458,7 @@ impl ClipCell {
             label: Some(display_name),
             effects: EffectStack::new(),
             transform: Transform2D::default(),
+            loop_mode: LoopMode::default(),
         }
     }
 
