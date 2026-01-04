@@ -8,6 +8,8 @@ Cargo.lock
 *.xcodeproj/
 *.xcworkspace/
 DerivedData/
+Pods/
+Podfile.lock
 
 # IDE
 .idea/
@@ -23,6 +25,8 @@ Thumbs.db
 # Debug files
 *.dSYM/
 *.pdb
+*.profraw
+*.profdata
 
 # Build artifacts
 *.o
@@ -30,6 +34,15 @@ Thumbs.db
 *.dylib
 *.so
 *.dll
+
+# macOS/iOS app bundles and frameworks
+Electron.framework/
+*.ipa
+
+# Node.js / Electron
+node_modules/
+package-lock.json
+yarn.lock
 
 # External libraries (large binary dependencies)
 external_libraries/
@@ -44,10 +57,17 @@ assets/ffmpeg/
 
 # Archives
 *.zip
+*.tar.gz
+*.tgz
+
+# Environment and secrets
+.env
+.env.*
+*.pem
+*.key
 
 # Cursor project files
 .cursor/
 
 # egui toy for testing
-
 custom_egui/
