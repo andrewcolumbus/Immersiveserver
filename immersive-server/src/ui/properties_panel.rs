@@ -834,17 +834,11 @@ impl PropertiesPanel {
                                     .corner_radius(2.0)
                                     .show(ui, |ui| {
                                         ui.horizontal(|ui| {
-                                            // Drag handle indicator
-                                            ui.add(egui::Label::new(
-                                                egui::RichText::new("⠿").size(12.0).color(egui::Color32::from_gray(120))
-                                            ).sense(egui::Sense::drag()));
-
-                                            // Disclosure triangle
-                                            let arrow = if effect.expanded { "▼" } else { "▶" };
-                                            let arrow_response = ui.add(
-                                                egui::Label::new(egui::RichText::new(arrow).size(10.0).color(egui::Color32::GRAY))
-                                                    .sense(egui::Sense::click())
-                                            );
+                                            // Delete button on the left
+                                            let delete_btn = ui.small_button("×").on_hover_text("Remove effect");
+                                            if delete_btn.clicked() {
+                                                delete_clicked.set(true);
+                                            }
 
                                             // Effect name
                                             let name_color = if effect.bypassed {
@@ -855,13 +849,8 @@ impl PropertiesPanel {
                                             let name_text = egui::RichText::new(&effect.name).color(name_color);
                                             ui.label(name_text);
 
-                                            // Controls on the right
+                                            // Indicators on the right
                                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                // Delete button - track click to handle outside drag source
-                                                let delete_btn = ui.small_button("×").on_hover_text("Remove effect");
-                                                if delete_btn.clicked() {
-                                                    delete_clicked.set(true);
-                                                }
                                                 // Bypass indicator
                                                 if effect.bypassed {
                                                     ui.label(egui::RichText::new("B").size(10.0).color(egui::Color32::from_gray(80)));
@@ -871,8 +860,6 @@ impl PropertiesPanel {
                                                     ui.label(egui::RichText::new("S").size(10.0).color(egui::Color32::YELLOW));
                                                 }
                                             });
-
-                                            arrow_response
                                         })
                                     });
 
@@ -884,9 +871,9 @@ impl PropertiesPanel {
                                 self.push_remove_action(actions, context, effect.id);
                             }
 
-                            // Handle click on arrow or header to toggle expanded state (only if not dragging)
+                            // Handle click on header to toggle expanded state (only if not dragging)
                             if !is_dragging_reorder && !is_dragging_new_effect && !delete_clicked.get() {
-                                if drag_response.response.clicked() || drag_response.inner.inner.inner.clicked() {
+                                if drag_response.response.clicked() {
                                     self.push_expanded_action(actions, context, effect.id, !effect.expanded);
                                 }
                             }
