@@ -3,7 +3,7 @@
 //! A modal window for configuring multi-screen outputs with slice-based input selection.
 //! Accessible via View → Advanced Output.
 
-use crate::output::{EdgeBlendConfig, MaskShape, OutputDevice, OutputManager, Point2D as MaskPoint2D, Screen, ScreenId, Slice, SliceId, SliceInput, SliceMask, WarpMesh};
+use crate::output::{DisplayInfo, EdgeBlendConfig, MaskShape, OutputDevice, OutputManager, Point2D as MaskPoint2D, Screen, ScreenId, Slice, SliceId, SliceInput, SliceMask, WarpMesh};
 use crate::output::slice::Point2D;
 
 /// Actions returned from the Advanced Output window
@@ -51,6 +51,10 @@ pub struct AdvancedOutputWindow {
     dragging_warp_point: Option<(usize, usize)>,
     /// Currently dragged mask vertex index
     dragging_mask_vertex: Option<usize>,
+    /// Temporary device name for streaming outputs
+    temp_device_name: String,
+    /// Temporary OMT port
+    temp_omt_port: String,
 }
 
 impl Default for AdvancedOutputWindow {
@@ -73,6 +77,8 @@ impl AdvancedOutputWindow {
             preview_texture_id: None,
             dragging_warp_point: None,
             dragging_mask_vertex: None,
+            temp_device_name: String::new(),
+            temp_omt_port: "5960".to_string(),
         }
     }
 
@@ -94,6 +100,7 @@ impl AdvancedOutputWindow {
         ctx: &egui::Context,
         output_manager: Option<&OutputManager>,
         layer_count: usize,
+        available_displays: &[DisplayInfo],
     ) -> Vec<AdvancedOutputAction> {
         let mut actions = Vec::new();
 
@@ -111,7 +118,7 @@ impl AdvancedOutputWindow {
             .resizable(true)
             .collapsible(true)
             .show(ctx, |ui| {
-                self.render_contents(ui, output_manager, layer_count, &mut actions);
+                self.render_contents(ui, output_manager, layer_count, available_displays, &mut actions);
             });
         self.open = open;
 
@@ -124,6 +131,7 @@ impl AdvancedOutputWindow {
         ui: &mut egui::Ui,
         output_manager: Option<&OutputManager>,
         layer_count: usize,
+        available_displays: &[DisplayInfo],
         actions: &mut Vec<AdvancedOutputAction>,
     ) {
         // Get screens from output manager
@@ -758,7 +766,7 @@ impl AdvancedOutputWindow {
                                     }
                                 } else {
                                     // Show screen properties
-                                    self.render_screen_properties(ui, screen, actions);
+                                    self.render_screen_properties(ui, screen, available_displays, actions);
                                 }
                             }
                         } else {
@@ -778,6 +786,7 @@ impl AdvancedOutputWindow {
         &mut self,
         ui: &mut egui::Ui,
         screen: &Screen,
+        available_displays: &[DisplayInfo],
         actions: &mut Vec<AdvancedOutputAction>,
     ) {
         let mut changed = false;
@@ -828,22 +837,281 @@ impl AdvancedOutputWindow {
         });
 
         ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(4.0);
 
-        // Output device
-        ui.horizontal(|ui| {
-            ui.label("Output:");
-            let device_text = match screen.device {
-                OutputDevice::Virtual => "Virtual (Preview)",
-                OutputDevice::Display { .. } => "Display",
-                OutputDevice::Ndi { .. } => "NDI",
-                OutputDevice::Omt { .. } => "OMT",
+        // Output Device section
+        ui.label(egui::RichText::new("Output Device").strong());
+        ui.add_space(4.0);
+
+        // Device type selector
+        let current_device_type = screen.device.type_name();
+        egui::ComboBox::from_id_salt("device_type")
+            .selected_text(current_device_type)
+            .show_ui(ui, |ui| {
+                // Virtual
+                if ui.selectable_label(matches!(screen_copy.device, OutputDevice::Virtual), "Virtual").clicked() {
+                    screen_copy.device = OutputDevice::Virtual;
+                    changed = true;
+                }
+
+                // Display (only show if displays are available)
+                if !available_displays.is_empty() {
+                    if ui.selectable_label(matches!(screen_copy.device, OutputDevice::Display { .. }), "Display").clicked() {
+                        // Default to first display
+                        screen_copy.device = OutputDevice::Display {
+                            display_id: available_displays[0].id,
+                        };
+                        changed = true;
+                    }
+                }
+
+                // NDI
+                if ui.selectable_label(matches!(screen_copy.device, OutputDevice::Ndi { .. }), "NDI").clicked() {
+                    let name = if self.temp_device_name.is_empty() {
+                        format!("{} NDI", screen.name)
+                    } else {
+                        self.temp_device_name.clone()
+                    };
+                    screen_copy.device = OutputDevice::Ndi { name };
+                    self.temp_device_name = if let OutputDevice::Ndi { name } = &screen_copy.device {
+                        name.clone()
+                    } else {
+                        String::new()
+                    };
+                    changed = true;
+                }
+
+                // OMT
+                if ui.selectable_label(matches!(screen_copy.device, OutputDevice::Omt { .. }), "OMT").clicked() {
+                    let name = if self.temp_device_name.is_empty() {
+                        format!("{} OMT", screen.name)
+                    } else {
+                        self.temp_device_name.clone()
+                    };
+                    let port = self.temp_omt_port.parse().unwrap_or(5960);
+                    screen_copy.device = OutputDevice::Omt { name, port };
+                    self.temp_device_name = if let OutputDevice::Omt { name, .. } = &screen_copy.device {
+                        name.clone()
+                    } else {
+                        String::new()
+                    };
+                    changed = true;
+                }
+
+                // Syphon (macOS only)
                 #[cfg(target_os = "macos")]
-                OutputDevice::Syphon { .. } => "Syphon",
+                if ui.selectable_label(matches!(screen_copy.device, OutputDevice::Syphon { .. }), "Syphon").clicked() {
+                    let name = if self.temp_device_name.is_empty() {
+                        format!("{} Syphon", screen.name)
+                    } else {
+                        self.temp_device_name.clone()
+                    };
+                    screen_copy.device = OutputDevice::Syphon { name };
+                    self.temp_device_name = if let OutputDevice::Syphon { name } = &screen_copy.device {
+                        name.clone()
+                    } else {
+                        String::new()
+                    };
+                    changed = true;
+                }
+
+                // Spout (Windows only)
                 #[cfg(target_os = "windows")]
-                OutputDevice::Spout { .. } => "Spout",
-            };
-            ui.label(egui::RichText::new(device_text).weak());
+                if ui.selectable_label(matches!(screen_copy.device, OutputDevice::Spout { .. }), "Spout").clicked() {
+                    let name = if self.temp_device_name.is_empty() {
+                        format!("{} Spout", screen.name)
+                    } else {
+                        self.temp_device_name.clone()
+                    };
+                    screen_copy.device = OutputDevice::Spout { name };
+                    self.temp_device_name = if let OutputDevice::Spout { name } = &screen_copy.device {
+                        name.clone()
+                    } else {
+                        String::new()
+                    };
+                    changed = true;
+                }
+            });
+
+        ui.add_space(4.0);
+
+        // Device-specific configuration
+        // Extract info before rendering to avoid borrow issues in closures
+        let (is_virtual, current_display_id, current_name, current_port) = match &screen_copy.device {
+            OutputDevice::Virtual => (true, None, None, None),
+            OutputDevice::Display { display_id } => (false, Some(*display_id), None, None),
+            OutputDevice::Ndi { name } => (false, None, Some(name.clone()), None),
+            OutputDevice::Omt { name, port } => (false, None, Some(name.clone()), Some(*port)),
+            #[cfg(target_os = "macos")]
+            OutputDevice::Syphon { name } => (false, None, Some(name.clone()), None),
+            #[cfg(target_os = "windows")]
+            OutputDevice::Spout { name } => (false, None, Some(name.clone()), None),
+        };
+
+        if is_virtual {
+            ui.label(egui::RichText::new("Preview only (no output)").weak().italics());
+        } else if let Some(display_id) = current_display_id {
+            // Display selector dropdown
+            let current_display = available_displays.iter().find(|d| d.id == display_id);
+            let is_disconnected = current_display.is_none();
+            let display_label = current_display
+                .map(|d| d.label())
+                .unwrap_or_else(|| format!("Display {} (disconnected)", display_id));
+
+            ui.horizontal(|ui| {
+                ui.label("Monitor:");
+                egui::ComboBox::from_id_salt("display_selector")
+                    .selected_text(&display_label)
+                    .show_ui(ui, |ui| {
+                        for display in available_displays {
+                            if ui.selectable_label(display.id == display_id, display.label()).clicked() {
+                                screen_copy.device = OutputDevice::Display { display_id: display.id };
+                                changed = true;
+                            }
+                        }
+                    });
+            });
+
+            // Show warning if display is disconnected
+            if is_disconnected {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("⚠").color(egui::Color32::YELLOW));
+                    ui.label(
+                        egui::RichText::new("Display disconnected - output paused")
+                            .color(egui::Color32::YELLOW)
+                            .italics()
+                    );
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Switch to Virtual").clicked() {
+                        screen_copy.device = OutputDevice::Virtual;
+                        changed = true;
+                    }
+                });
+            }
+        } else if matches!(screen_copy.device, OutputDevice::Ndi { .. }) {
+            // NDI name editor
+            if let Some(ref name) = current_name {
+                if self.temp_device_name.is_empty() || !self.temp_device_name.eq(name) {
+                    self.temp_device_name = name.clone();
+                }
+            }
+            ui.horizontal(|ui| {
+                ui.label("Name:");
+                if ui.text_edit_singleline(&mut self.temp_device_name).changed() {
+                    screen_copy.device = OutputDevice::Ndi {
+                        name: self.temp_device_name.clone(),
+                    };
+                    changed = true;
+                }
+            });
+        } else if matches!(screen_copy.device, OutputDevice::Omt { .. }) {
+            // OMT name and port editor
+            if let Some(ref name) = current_name {
+                if self.temp_device_name.is_empty() || !self.temp_device_name.eq(name) {
+                    self.temp_device_name = name.clone();
+                }
+            }
+            if let Some(port) = current_port {
+                if self.temp_omt_port.is_empty() {
+                    self.temp_omt_port = port.to_string();
+                }
+            }
+            ui.horizontal(|ui| {
+                ui.label("Name:");
+                if ui.text_edit_singleline(&mut self.temp_device_name).changed() {
+                    screen_copy.device = OutputDevice::Omt {
+                        name: self.temp_device_name.clone(),
+                        port: self.temp_omt_port.parse().unwrap_or(5960),
+                    };
+                    changed = true;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Port:");
+                if ui.add(egui::TextEdit::singleline(&mut self.temp_omt_port).desired_width(60.0)).changed() {
+                    if let Ok(p) = self.temp_omt_port.parse::<u16>() {
+                        screen_copy.device = OutputDevice::Omt {
+                            name: self.temp_device_name.clone(),
+                            port: p,
+                        };
+                        changed = true;
+                    }
+                }
+            });
+        }
+        #[cfg(target_os = "macos")]
+        if matches!(screen_copy.device, OutputDevice::Syphon { .. }) {
+            // Syphon name editor
+            if let Some(ref name) = current_name {
+                if self.temp_device_name.is_empty() || !self.temp_device_name.eq(name) {
+                    self.temp_device_name = name.clone();
+                }
+            }
+            ui.horizontal(|ui| {
+                ui.label("Name:");
+                if ui.text_edit_singleline(&mut self.temp_device_name).changed() {
+                    screen_copy.device = OutputDevice::Syphon {
+                        name: self.temp_device_name.clone(),
+                    };
+                    changed = true;
+                }
+            });
+        }
+        #[cfg(target_os = "windows")]
+        if matches!(screen_copy.device, OutputDevice::Spout { .. }) {
+            // Spout name editor
+            if let Some(ref name) = current_name {
+                if self.temp_device_name.is_empty() || !self.temp_device_name.eq(name) {
+                    self.temp_device_name = name.clone();
+                }
+            }
+            ui.horizontal(|ui| {
+                ui.label("Name:");
+                if ui.text_edit_singleline(&mut self.temp_device_name).changed() {
+                    screen_copy.device = OutputDevice::Spout {
+                        name: self.temp_device_name.clone(),
+                    };
+                    changed = true;
+                }
+            });
+        }
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(4.0);
+
+        // Timing section (for projector sync)
+        ui.label(egui::RichText::new("Timing").strong());
+        ui.add_space(4.0);
+
+        // Frame delay slider
+        ui.horizontal(|ui| {
+            ui.label("Delay:");
+
+            // Convert to i32 for slider, then back to u32
+            let mut delay_val = screen_copy.delay_ms as i32;
+            let slider = egui::Slider::new(&mut delay_val, 0..=500)
+                .suffix(" ms")
+                .clamping(egui::SliderClamping::Always);
+
+            if ui.add(slider).changed() {
+                screen_copy.delay_ms = delay_val.max(0) as u32;
+                changed = true;
+            }
+
+            // Show frame count at 60fps as reference
+            let frames_at_60 = (screen_copy.delay_ms as f32 * 60.0 / 1000.0).round() as u32;
+            if frames_at_60 > 0 {
+                ui.label(format!("({} frames @ 60fps)", frames_at_60))
+                    .on_hover_text("Number of frames of delay at 60 FPS");
+            }
         });
+
+        if screen_copy.delay_ms > 0 {
+            ui.label(egui::RichText::new("Delay active - output will lag behind preview").weak().italics());
+        }
 
         ui.add_space(8.0);
         ui.separator();

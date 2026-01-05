@@ -109,6 +109,37 @@ impl WindowEntry {
         }
     }
 
+    /// Create a new window entry for a monitor output window (fullscreen on a display)
+    ///
+    /// Monitor windows are used for outputting to physical displays/projectors.
+    /// They have a GPU context but minimal egui (for potential debug overlays).
+    pub fn new_monitor(window: Arc<Window>, output_id: u32, gpu: &GpuContext) -> Self {
+        let gpu_context = WindowGpuContext::new(gpu, window.clone());
+
+        // Create egui context (minimal, for potential overlays)
+        let egui_ctx = egui::Context::default();
+        egui_ctx.set_pixels_per_point(window.scale_factor() as f32);
+
+        let egui_state = egui_winit::State::new(
+            egui_ctx.clone(),
+            egui::ViewportId::from_hash_of(&format!("monitor_{}", output_id)),
+            &window,
+            Some(window.scale_factor() as f32),
+            None,
+            None,
+        );
+
+        Self {
+            window,
+            window_type: WindowType::Monitor { output_id },
+            gpu_context: Some(gpu_context),
+            egui_ctx,
+            egui_state,
+            needs_redraw: true,
+            closed: false,
+        }
+    }
+
     /// Get the panel ID if this is a panel window
     pub fn panel_id(&self) -> Option<&str> {
         match &self.window_type {
@@ -117,9 +148,22 @@ impl WindowEntry {
         }
     }
 
+    /// Get the output ID if this is a monitor window
+    pub fn output_id(&self) -> Option<u32> {
+        match &self.window_type {
+            WindowType::Monitor { output_id } => Some(*output_id),
+            _ => None,
+        }
+    }
+
     /// Check if this is the main window
     pub fn is_main(&self) -> bool {
         matches!(self.window_type, WindowType::Main)
+    }
+
+    /// Check if this is a monitor window
+    pub fn is_monitor(&self) -> bool {
+        matches!(self.window_type, WindowType::Monitor { .. })
     }
 
     /// Mark the window as needing a redraw
@@ -151,6 +195,8 @@ pub struct WindowRegistry {
     windows: HashMap<WindowId, WindowEntry>,
     /// Map from panel ID to window ID (for quick lookup)
     panel_to_window: HashMap<String, WindowId>,
+    /// Map from output/screen ID to window ID (for monitor windows)
+    monitor_to_window: HashMap<u32, WindowId>,
     /// The main window's ID
     main_window_id: Option<WindowId>,
     /// Next viewport ID for egui (incremented for each new panel window)
@@ -169,6 +215,7 @@ impl WindowRegistry {
         Self {
             windows: HashMap::new(),
             panel_to_window: HashMap::new(),
+            monitor_to_window: HashMap::new(),
             main_window_id: None,
             next_viewport_id: 1,
         }
@@ -194,12 +241,29 @@ impl WindowRegistry {
         self.next_viewport_id += 1;
     }
 
+    /// Register a monitor output window
+    pub fn register_monitor_window(
+        &mut self,
+        window: Arc<Window>,
+        output_id: u32,
+        gpu: &GpuContext,
+    ) {
+        let id = window.id();
+        self.monitor_to_window.insert(output_id, id);
+        self.windows
+            .insert(id, WindowEntry::new_monitor(window, output_id, gpu));
+    }
+
     /// Unregister a window by its ID
     pub fn unregister_window(&mut self, window_id: WindowId) -> Option<WindowEntry> {
         if let Some(entry) = self.windows.remove(&window_id) {
             // Remove from panel_to_window if it's a panel
             if let WindowType::Panel { ref panel_id } = entry.window_type {
                 self.panel_to_window.remove(panel_id);
+            }
+            // Remove from monitor_to_window if it's a monitor
+            if let WindowType::Monitor { output_id } = entry.window_type {
+                self.monitor_to_window.remove(&output_id);
             }
             // Clear main window ID if this was the main window
             if self.main_window_id == Some(window_id) {
@@ -262,6 +326,32 @@ impl WindowRegistry {
         self.panel_to_window.get(panel_id).copied()
     }
 
+    /// Get the window for a specific monitor output
+    pub fn get_monitor_window(&self, output_id: u32) -> Option<&WindowEntry> {
+        self.monitor_to_window
+            .get(&output_id)
+            .and_then(|id| self.windows.get(id))
+    }
+
+    /// Get the window for a specific monitor output mutably
+    pub fn get_monitor_window_mut(&mut self, output_id: u32) -> Option<&mut WindowEntry> {
+        if let Some(&id) = self.monitor_to_window.get(&output_id) {
+            self.windows.get_mut(&id)
+        } else {
+            None
+        }
+    }
+
+    /// Get the window ID for a monitor output
+    pub fn get_monitor_window_id(&self, output_id: u32) -> Option<WindowId> {
+        self.monitor_to_window.get(&output_id).copied()
+    }
+
+    /// Check if a monitor window exists for the given output ID
+    pub fn has_monitor_window(&self, output_id: u32) -> bool {
+        self.monitor_to_window.contains_key(&output_id)
+    }
+
     /// Iterate over all windows
     pub fn iter(&self) -> impl Iterator<Item = (&WindowId, &WindowEntry)> {
         self.windows.iter()
@@ -279,6 +369,13 @@ impl WindowRegistry {
             .filter(|(_, entry)| matches!(entry.window_type, WindowType::Panel { .. }))
     }
 
+    /// Iterate over all monitor windows
+    pub fn monitor_windows(&self) -> impl Iterator<Item = (&WindowId, &WindowEntry)> {
+        self.windows
+            .iter()
+            .filter(|(_, entry)| matches!(entry.window_type, WindowType::Monitor { .. }))
+    }
+
     /// Get the number of registered windows
     pub fn window_count(&self) -> usize {
         self.windows.len()
@@ -287,6 +384,11 @@ impl WindowRegistry {
     /// Get the number of panel windows
     pub fn panel_window_count(&self) -> usize {
         self.panel_to_window.len()
+    }
+
+    /// Get the number of monitor windows
+    pub fn monitor_window_count(&self) -> usize {
+        self.monitor_to_window.len()
     }
 
     /// Request redraw for all windows

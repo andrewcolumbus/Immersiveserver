@@ -6,7 +6,9 @@
 
 use std::collections::HashMap;
 
-use super::{MaskShape, Screen, ScreenId, Slice, SliceId, SliceInput, SliceMask, WarpMesh};
+use winit::window::WindowId;
+
+use super::{MaskShape, OutputDevice, Screen, ScreenId, Slice, SliceId, SliceInput, SliceMask, WarpMesh};
 
 /// Screen-level color correction parameters (matches shader uniform)
 #[repr(C)]
@@ -760,6 +762,197 @@ fn point_to_segment_distance(px: f32, py: f32, x1: f32, y1: f32, x2: f32, y2: f3
     ((px - proj_x).powi(2) + (py - proj_y).powi(2)).sqrt()
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// FRAME DELAY BUFFER — Ring buffer for projector sync timing
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Ring buffer for frame delay (projector sync)
+///
+/// Stores a configurable number of frames to introduce latency for projector timing sync.
+/// When delay_frames is 0, no buffering occurs (passthrough mode).
+pub struct FrameDelayBuffer {
+    /// Ring buffer of frame textures
+    frames: Vec<wgpu::Texture>,
+    /// Ring buffer of texture views
+    views: Vec<wgpu::TextureView>,
+    /// Current write index in the ring buffer
+    write_index: usize,
+    /// Number of frames of delay (0 = passthrough)
+    delay_frames: usize,
+    /// Texture width
+    width: u32,
+    /// Texture height
+    height: u32,
+    /// Texture format
+    format: wgpu::TextureFormat,
+}
+
+impl FrameDelayBuffer {
+    /// Create a new frame delay buffer
+    ///
+    /// Initially empty - call `set_delay_frames` to allocate textures.
+    pub fn new(width: u32, height: u32, format: wgpu::TextureFormat) -> Self {
+        Self {
+            frames: Vec::new(),
+            views: Vec::new(),
+            write_index: 0,
+            delay_frames: 0,
+            width,
+            height,
+            format,
+        }
+    }
+
+    /// Get the current delay in frames
+    pub fn delay_frames(&self) -> usize {
+        self.delay_frames
+    }
+
+    /// Check if delay is active (non-zero)
+    pub fn is_active(&self) -> bool {
+        self.delay_frames > 0 && !self.frames.is_empty()
+    }
+
+    /// Set the delay in frames, allocating/deallocating textures as needed
+    ///
+    /// When delay changes, textures are reallocated and initialized to black.
+    pub fn set_delay_frames(&mut self, device: &wgpu::Device, delay_frames: usize) {
+        if delay_frames == self.delay_frames {
+            return;
+        }
+
+        self.delay_frames = delay_frames;
+        self.write_index = 0;
+
+        // Deallocate if no delay
+        if delay_frames == 0 {
+            self.frames.clear();
+            self.views.clear();
+            return;
+        }
+
+        // Allocate ring buffer textures
+        // We need delay_frames + 1 slots: one being written, delay_frames being read
+        let buffer_size = delay_frames + 1;
+        self.frames.clear();
+        self.views.clear();
+
+        for i in 0..buffer_size {
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(&format!("Frame Delay Buffer Slot {}", i)),
+                size: wgpu::Extent3d {
+                    width: self.width.max(1),
+                    height: self.height.max(1),
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: self.format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_DST
+                    | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            self.frames.push(texture);
+            self.views.push(view);
+        }
+
+        tracing::debug!(
+            "Frame delay buffer: {} frames ({} buffer slots) @ {}x{}",
+            delay_frames,
+            buffer_size,
+            self.width,
+            self.height
+        );
+    }
+
+    /// Resize the buffer textures
+    pub fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
+        if width == self.width && height == self.height {
+            return;
+        }
+
+        self.width = width;
+        self.height = height;
+
+        // Re-allocate if active
+        if self.delay_frames > 0 {
+            let delay = self.delay_frames;
+            self.delay_frames = 0; // Force reallocation
+            self.set_delay_frames(device, delay);
+        }
+    }
+
+    /// Push current frame and get delayed frame
+    ///
+    /// Copies `input_view` to the write slot and returns the view of the delayed frame.
+    /// Returns None if delay is not active (caller should use input directly).
+    pub fn push_and_get<'a>(
+        &'a mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        input_texture: &wgpu::Texture,
+    ) -> Option<&'a wgpu::TextureView> {
+        if !self.is_active() {
+            return None;
+        }
+
+        let buffer_size = self.frames.len();
+
+        // Copy input to current write slot
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: input_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.frames[self.write_index],
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: self.width,
+                height: self.height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        // Calculate read index (delay_frames behind write)
+        let read_index = (self.write_index + buffer_size - self.delay_frames) % buffer_size;
+
+        // Advance write index
+        self.write_index = (self.write_index + 1) % buffer_size;
+
+        Some(&self.views[read_index])
+    }
+
+    /// Get the delayed frame view without pushing a new frame
+    ///
+    /// Useful for reading the current delayed state without modifying the buffer.
+    pub fn current_delayed_view(&self) -> Option<&wgpu::TextureView> {
+        if !self.is_active() {
+            return None;
+        }
+
+        let buffer_size = self.frames.len();
+        // Read index is delay_frames behind the current write position
+        // But since we haven't written yet, we use write_index - 1 as the "last written"
+        let last_written = (self.write_index + buffer_size - 1) % buffer_size;
+        let read_index = (last_written + buffer_size - self.delay_frames + 1) % buffer_size;
+
+        Some(&self.views[read_index])
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SCREEN RUNTIME — GPU resources for a screen
+// ═══════════════════════════════════════════════════════════════════════════════
+
 /// Runtime GPU resources for a screen
 pub struct ScreenRuntime {
     /// The screen ID this runtime belongs to
@@ -779,6 +972,9 @@ pub struct ScreenRuntime {
 
     /// Bind group for color correction (samples from output_texture)
     pub color_bind_group: Option<wgpu::BindGroup>,
+
+    /// Frame delay buffer for projector sync timing
+    pub delay_buffer: FrameDelayBuffer,
 
     /// Slice runtimes for this screen
     pub slices: HashMap<SliceId, SliceRuntime>,
@@ -839,6 +1035,9 @@ impl ScreenRuntime {
 
         let color_temp_view = color_temp_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
+        // Create delay buffer (initially empty - will be allocated when delay_ms > 0)
+        let delay_buffer = FrameDelayBuffer::new(width, height, format);
+
         Self {
             screen_id,
             output_texture,
@@ -846,6 +1045,7 @@ impl ScreenRuntime {
             color_temp_texture,
             color_temp_view,
             color_bind_group: None,
+            delay_buffer,
             slices: HashMap::new(),
             width,
             height,
@@ -901,6 +1101,9 @@ impl ScreenRuntime {
         // Invalidate color bind group (will be recreated when needed)
         self.color_bind_group = None;
 
+        // Resize delay buffer if active
+        self.delay_buffer.resize(device, width, height);
+
         self.width = width;
         self.height = height;
     }
@@ -927,6 +1130,46 @@ impl ScreenRuntime {
     pub fn output_texture(&self) -> &wgpu::Texture {
         &self.output_texture
     }
+
+    /// Update delay settings based on delay_ms and target_fps
+    ///
+    /// Calculates the number of frames needed for the given delay.
+    pub fn update_delay(&mut self, device: &wgpu::Device, delay_ms: u32, target_fps: f32) {
+        let delay_frames = if delay_ms == 0 || target_fps <= 0.0 {
+            0
+        } else {
+            // delay_frames = delay_ms / (1000 / fps) = delay_ms * fps / 1000
+            ((delay_ms as f32 * target_fps) / 1000.0).round() as usize
+        };
+
+        self.delay_buffer.set_delay_frames(device, delay_frames);
+    }
+
+    /// Get the delayed output view for presentation
+    ///
+    /// If delay is active, pushes the current frame and returns the delayed frame.
+    /// If delay is not active, returns the direct output view.
+    pub fn get_delayed_output<'a>(
+        &'a mut self,
+        encoder: &mut wgpu::CommandEncoder,
+    ) -> &'a wgpu::TextureView {
+        // Try to get delayed frame; if delay not active, return direct output
+        if let Some(delayed_view) = self.delay_buffer.push_and_get(encoder, &self.output_texture) {
+            delayed_view
+        } else {
+            &self.output_view
+        }
+    }
+
+    /// Check if delay is currently active
+    pub fn delay_active(&self) -> bool {
+        self.delay_buffer.is_active()
+    }
+
+    /// Get the current delay in frames
+    pub fn delay_frames(&self) -> usize {
+        self.delay_buffer.delay_frames()
+    }
 }
 
 /// Manages all screen and slice runtimes
@@ -936,6 +1179,9 @@ pub struct OutputManager {
 
     /// Screen runtimes (GPU resources)
     runtimes: HashMap<ScreenId, ScreenRuntime>,
+
+    /// Window IDs for screens with Display output devices
+    screen_windows: HashMap<ScreenId, WindowId>,
 
     /// Next screen ID
     next_screen_id: u32,
@@ -987,6 +1233,15 @@ pub struct OutputManager {
 
     /// Dummy mask bind group for slices without masking
     dummy_mask_bind_group: Option<wgpu::BindGroup>,
+
+    // =========================================
+    // Blit Pipeline (for presenting to surfaces)
+    // =========================================
+    /// Render pipeline for blitting textures to surfaces
+    blit_pipeline: Option<wgpu::RenderPipeline>,
+
+    /// Bind group layout for blit (texture + sampler only)
+    blit_bind_group_layout: Option<wgpu::BindGroupLayout>,
 }
 
 impl OutputManager {
@@ -995,6 +1250,7 @@ impl OutputManager {
         Self {
             screens: HashMap::new(),
             runtimes: HashMap::new(),
+            screen_windows: HashMap::new(),
             next_screen_id: 1,
             next_slice_id: 1,
             format,
@@ -1012,6 +1268,8 @@ impl OutputManager {
             dummy_mask_texture: None,
             dummy_mask_texture_view: None,
             dummy_mask_bind_group: None,
+            blit_pipeline: None,
+            blit_bind_group_layout: None,
         }
     }
 
@@ -1365,6 +1623,80 @@ impl OutputManager {
         self.slice_render_pipeline = Some(slice_render_pipeline);
         self.screen_composite_pipeline = Some(screen_composite_pipeline);
 
+        // Create blit pipeline for presenting to surfaces
+        let blit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Blit Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/output/blit.wgsl").into()),
+        });
+
+        let blit_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Blit Bind Group Layout"),
+                entries: &[
+                    // Source texture
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    // Sampler
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+
+        let blit_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Blit Pipeline Layout"),
+            bind_group_layouts: &[&blit_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let blit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Blit Pipeline"),
+            layout: Some(&blit_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &blit_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &blit_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: self.format,
+                    blend: None, // No blending - direct copy
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        self.blit_bind_group_layout = Some(blit_bind_group_layout);
+        self.blit_pipeline = Some(blit_pipeline);
+
         tracing::info!("Output render pipelines created");
     }
 
@@ -1438,6 +1770,171 @@ impl OutputManager {
         self.screens.len()
     }
 
+    // =========================================
+    // Window Management (for Display output devices)
+    // =========================================
+
+    /// Get screens that need windows created for their Display output devices
+    ///
+    /// Returns (screen_id, display_id) pairs for screens that:
+    /// - Are enabled
+    /// - Have OutputDevice::Display
+    /// - Don't already have a window assigned
+    pub fn pending_display_windows(&self) -> Vec<(ScreenId, u32)> {
+        self.screens
+            .values()
+            .filter(|screen| screen.enabled)
+            .filter_map(|screen| match &screen.device {
+                OutputDevice::Display { display_id } => {
+                    if !self.screen_windows.contains_key(&screen.id) {
+                        Some((screen.id, *display_id))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Associate a window with a screen
+    ///
+    /// Call this after creating a window for a screen's Display output.
+    pub fn set_window_for_screen(&mut self, screen_id: ScreenId, window_id: WindowId) {
+        self.screen_windows.insert(screen_id, window_id);
+    }
+
+    /// Remove window association for a screen
+    ///
+    /// Call this when a display window is closed.
+    pub fn remove_window_for_screen(&mut self, screen_id: ScreenId) -> Option<WindowId> {
+        self.screen_windows.remove(&screen_id)
+    }
+
+    /// Get the window ID for a screen (if any)
+    pub fn get_window_for_screen(&self, screen_id: ScreenId) -> Option<WindowId> {
+        self.screen_windows.get(&screen_id).copied()
+    }
+
+    /// Find the screen ID for a given window ID
+    pub fn get_screen_for_window(&self, window_id: WindowId) -> Option<ScreenId> {
+        self.screen_windows
+            .iter()
+            .find(|(_, &wid)| wid == window_id)
+            .map(|(&sid, _)| sid)
+    }
+
+    /// Check if a screen has an associated window
+    pub fn screen_has_window(&self, screen_id: ScreenId) -> bool {
+        self.screen_windows.contains_key(&screen_id)
+    }
+
+    /// Get all screens with windows
+    pub fn screens_with_windows(&self) -> impl Iterator<Item = (ScreenId, WindowId)> + '_ {
+        self.screen_windows.iter().map(|(&s, &w)| (s, w))
+    }
+
+    /// Get screens that have windows but should no longer (device changed or disabled)
+    ///
+    /// Returns screen IDs that should have their windows closed.
+    pub fn stale_display_windows(&self) -> Vec<ScreenId> {
+        self.screen_windows
+            .keys()
+            .filter(|screen_id| {
+                self.screens.get(screen_id).map_or(true, |screen| {
+                    !screen.enabled || !matches!(screen.device, OutputDevice::Display { .. })
+                })
+            })
+            .copied()
+            .collect()
+    }
+
+    // =========================================
+    // Surface Presentation (for monitor windows)
+    // =========================================
+
+    /// Present a screen's output texture to a surface
+    ///
+    /// This blits the screen's rendered output to the provided surface view.
+    /// Used for displaying screen content on monitor windows.
+    /// If the screen has delay configured, the delayed frame is presented.
+    pub fn present_to_surface(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        screen_id: ScreenId,
+        surface_view: &wgpu::TextureView,
+        surface_format: wgpu::TextureFormat,
+    ) -> bool {
+        // Get the blit pipeline and resources (borrow these first)
+        let Some(blit_pipeline) = &self.blit_pipeline else {
+            return false;
+        };
+        let Some(blit_bind_group_layout) = &self.blit_bind_group_layout else {
+            return false;
+        };
+        let Some(sampler) = &self.sampler else {
+            return false;
+        };
+
+        // Clone references we need to keep across the mutable borrow
+        let blit_pipeline = blit_pipeline.clone();
+        let blit_bind_group_layout = blit_bind_group_layout.clone();
+        let sampler = sampler.clone();
+
+        // Get the screen runtime mutably to access delay buffer
+        let Some(runtime) = self.runtimes.get_mut(&screen_id) else {
+            return false;
+        };
+
+        // Get the output view (delayed if delay buffer is active)
+        let source_view = runtime.get_delayed_output(encoder);
+
+        // Create bind group for this blit operation
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Blit Bind Group"),
+            layout: &blit_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(source_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
+        });
+
+        // Check if we need to handle format mismatch
+        // For now, we assume formats match. In the future, we could add format conversion.
+        let _ = surface_format;
+
+        // Create render pass to blit to surface
+        {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Blit to Surface"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: surface_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+
+            render_pass.set_pipeline(&blit_pipeline);
+            render_pass.set_bind_group(0, &bind_group, &[]);
+            render_pass.draw(0..3, 0..1);
+        }
+
+        true
+    }
+
     /// Add a slice to a screen
     pub fn add_slice(
         &mut self,
@@ -1478,24 +1975,35 @@ impl OutputManager {
     }
 
     /// Sync screen data to runtime (after screen properties change)
-    pub fn sync_runtime(&mut self, device: &wgpu::Device, screen_id: ScreenId) {
+    ///
+    /// `target_fps` is used to calculate the number of delay frames from delay_ms.
+    pub fn sync_runtime(&mut self, device: &wgpu::Device, screen_id: ScreenId, target_fps: f32) {
         let Some(screen) = self.screens.get(&screen_id) else {
             return;
         };
 
+        // Get screen settings we need
+        let width = screen.width;
+        let height = screen.height;
+        let delay_ms = screen.delay_ms;
+        let slices: Vec<_> = screen.slices.clone();
+
         // Get or create runtime
         let runtime = self.runtimes.entry(screen_id).or_insert_with(|| {
-            ScreenRuntime::new(device, screen_id, screen.width, screen.height, self.format)
+            ScreenRuntime::new(device, screen_id, width, height, self.format)
         });
 
         // Resize if needed
-        runtime.resize(device, screen.width, screen.height);
+        runtime.resize(device, width, height);
+
+        // Update delay settings
+        runtime.update_delay(device, delay_ms, target_fps);
 
         // Sync slices
-        let slice_ids: Vec<_> = screen.slices.iter().map(|s| s.id).collect();
+        let slice_ids: Vec<_> = slices.iter().map(|s| s.id).collect();
 
         // Ensure all slices have runtimes
-        for slice in &screen.slices {
+        for slice in &slices {
             runtime.ensure_slice(device, slice);
         }
 
@@ -1865,5 +2373,28 @@ mod tests {
         let params = SliceParams::from_slice(&slice);
         assert_eq!(params.flip[0], 1.0);
         assert_eq!(params.opacity, 0.5);
+    }
+
+    #[test]
+    fn test_frame_delay_buffer_new() {
+        let buffer = FrameDelayBuffer::new(1920, 1080, wgpu::TextureFormat::Rgba8Unorm);
+        assert!(!buffer.is_active());
+        assert_eq!(buffer.delay_frames(), 0);
+    }
+
+    #[test]
+    fn test_frame_delay_calculation() {
+        // Test delay frame calculation
+        // At 60fps: 100ms delay = 6 frames
+        let frames_100ms_60fps = ((100.0_f32 * 60.0) / 1000.0).round() as usize;
+        assert_eq!(frames_100ms_60fps, 6);
+
+        // At 30fps: 100ms delay = 3 frames
+        let frames_100ms_30fps = ((100.0_f32 * 30.0) / 1000.0).round() as usize;
+        assert_eq!(frames_100ms_30fps, 3);
+
+        // Zero delay = 0 frames
+        let frames_0ms = ((0.0_f32 * 60.0) / 1000.0).round() as usize;
+        assert_eq!(frames_0ms, 0);
     }
 }

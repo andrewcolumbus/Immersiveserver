@@ -6,8 +6,10 @@
 //! - Output transformations (perspective warp, mesh deformation)
 //! - Edge blending for seamless projector overlap
 //! - Per-output masking and color correction
+//! - Display enumeration and multi-monitor output
 
 mod color;
+pub mod display;
 mod edge_blend;
 mod mask;
 pub mod runtime;
@@ -16,6 +18,7 @@ pub mod slice;
 mod warp;
 
 pub use color::{OutputColorCorrection, SliceColorCorrection};
+pub use display::{DisplayEvent, DisplayInfo, DisplayManager, DisplayStatus};
 pub use edge_blend::{EdgeBlendConfig, EdgeBlendRegion};
 pub use mask::{BezierSegment, MaskShape, Point2D, SliceMask};
 pub use runtime::{OutputManager, ScreenRuntime, SliceParams, SliceRuntime};

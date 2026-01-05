@@ -32,8 +32,10 @@ struct SliceParams {
     perspective_bl: vec2<f32>,  // Bottom-left
     // Perspective enabled flag (1.0 = enabled, 0.0 = disabled)
     perspective_enabled: f32,
-    // Padding for perspective
-    _pad0: vec3<f32>,
+    // Padding for perspective (3x f32 instead of vec3 to avoid 16-byte alignment)
+    _pad0a: f32,
+    _pad0b: f32,
+    _pad0c: f32,
     // Mesh warp parameters
     mesh_columns: u32,
     mesh_rows: u32,

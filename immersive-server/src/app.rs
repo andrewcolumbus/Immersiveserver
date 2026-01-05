@@ -155,6 +155,8 @@ pub struct App {
     pub preferences_window: crate::ui::PreferencesWindow,
     /// Advanced Output window for multi-screen configuration
     pub advanced_output_window: crate::ui::AdvancedOutputWindow,
+    /// Available displays for output selection (updated from DisplayManager)
+    available_displays: Vec<crate::output::DisplayInfo>,
     /// Layout preset manager for saving/restoring UI arrangements
     pub layout_preset_manager: crate::ui::LayoutPresetManager,
 
@@ -576,6 +578,7 @@ impl App {
             converter_window: crate::converter::ConverterWindow::new(),
             preferences_window: crate::ui::PreferencesWindow::new(),
             advanced_output_window: crate::ui::AdvancedOutputWindow::new(),
+            available_displays: Vec::new(),
             layout_preset_manager: {
                 let mut manager = crate::ui::LayoutPresetManager::new();
                 manager.load_user_presets();
@@ -1322,6 +1325,13 @@ impl App {
         self.output_manager.as_mut().unwrap()
     }
 
+    /// Update the list of available displays for output selection
+    ///
+    /// Called from main.rs when DisplayManager refreshes
+    pub fn set_available_displays(&mut self, displays: Vec<crate::output::DisplayInfo>) {
+        self.available_displays = displays;
+    }
+
     /// Render a frame with egui UI
     pub fn render(&mut self) -> Result<bool, wgpu::SurfaceError> {
         // Apply low latency mode changes BEFORE acquiring surface texture.
@@ -1781,6 +1791,7 @@ impl App {
             &self.egui_ctx,
             self.output_manager.as_ref(),
             layer_count,
+            &self.available_displays,
         );
         for action in output_actions {
             self.handle_advanced_output_action(action);
@@ -5876,7 +5887,8 @@ impl App {
                         }
                     }
                     // Sync runtime to pick up changes
-                    manager.sync_runtime(&self.device, screen_id);
+                    let target_fps = self.settings.target_fps as f32;
+                    manager.sync_runtime(&self.device, screen_id, target_fps);
                 }
             }
             AdvancedOutputAction::UpdateScreen { screen_id, screen: updated_screen } => {
@@ -5885,6 +5897,9 @@ impl App {
                     if let Some(screen) = manager.get_screen_mut(screen_id) {
                         screen.name = updated_screen.name;
                         screen.enabled = updated_screen.enabled;
+                        screen.device = updated_screen.device.clone();
+                        screen.delay_ms = updated_screen.delay_ms;
+                        screen.color = updated_screen.color.clone();
                         // Note: width/height changes require texture recreation
                         if screen.width != updated_screen.width || screen.height != updated_screen.height {
                             screen.width = updated_screen.width;
@@ -5892,7 +5907,8 @@ impl App {
                         }
                     }
                     // Sync runtime to pick up changes
-                    manager.sync_runtime(&self.device, screen_id);
+                    let target_fps = self.settings.target_fps as f32;
+                    manager.sync_runtime(&self.device, screen_id, target_fps);
                 }
             }
         }

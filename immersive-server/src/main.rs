@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
+use immersive_server::output::DisplayManager;
 use immersive_server::settings::{AppPreferences, EnvironmentSettings};
 use immersive_server::ui::{activate_macos_app, focus_window_on_click, is_native_menu_supported, DockAction, NativeMenu, NativeMenuEvent, WindowRegistry};
 use immersive_server::App;
@@ -223,6 +224,8 @@ enum AppState {
         has_activated: bool,
         /// Registry for tracking all windows (main + panel windows)
         window_registry: WindowRegistry,
+        /// Manager for connected displays (for multi-output)
+        display_manager: DisplayManager,
     },
 }
 
@@ -233,7 +236,12 @@ struct ImmersiveApp {
     last_target_fps: u32,
     /// Current modifier key state
     modifiers: Modifiers,
+    /// Last time we checked for display hot-plug events
+    last_display_check: Instant,
 }
+
+/// How often to check for display hot-plug events (in seconds)
+const DISPLAY_CHECK_INTERVAL_SECS: u64 = 1;
 
 impl ImmersiveApp {
     fn new(settings: EnvironmentSettings, initial_file: Option<PathBuf>) -> Self {
@@ -246,6 +254,7 @@ impl ImmersiveApp {
             next_redraw_at: Instant::now(),
             last_target_fps: initial_target_fps,
             modifiers: Modifiers::default(),
+            last_display_check: Instant::now(),
         }
     }
 
@@ -317,6 +326,207 @@ impl ImmersiveApp {
                     // or we can close it programmatically here
                     if let Some(window_id) = window_registry.get_panel_window_id(&panel_id) {
                         window_registry.mark_closed(window_id);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Handle display window creation/destruction for screens with Display output devices
+    fn handle_display_windows(
+        event_loop: &ActiveEventLoop,
+        app: &mut App,
+        window_registry: &mut WindowRegistry,
+        display_manager: &DisplayManager,
+        gpu: &Arc<immersive_server::GpuContext>,
+    ) {
+        // Collect stale and pending windows info first (immutable borrow)
+        let (stale_screens, pending) = {
+            let Some(output_manager) = app.output_manager() else {
+                return;
+            };
+            (
+                output_manager.stale_display_windows(),
+                output_manager.pending_display_windows(),
+            )
+        };
+
+        // Handle stale windows (mutable borrow)
+        if !stale_screens.is_empty() {
+            if let Some(output_manager) = app.output_manager_mut() {
+                for screen_id in stale_screens {
+                    if let Some(window_id) = output_manager.remove_window_for_screen(screen_id) {
+                        tracing::info!("Closing stale display window for screen {:?}", screen_id);
+                        window_registry.mark_closed(window_id);
+                    }
+                }
+            }
+        }
+
+        // Handle pending windows - collect info we need
+        struct PendingWindow {
+            screen_id: immersive_server::output::ScreenId,
+            display_name: String,
+            monitor_handle: winit::monitor::MonitorHandle,
+            width: u32,
+            height: u32,
+        }
+
+        let mut windows_to_create: Vec<PendingWindow> = Vec::new();
+
+        for (screen_id, display_id) in pending {
+            // Get display info
+            let Some(display_info) = display_manager.get(display_id) else {
+                tracing::warn!(
+                    "Screen {:?} references display {} which is not connected",
+                    screen_id,
+                    display_id
+                );
+                continue;
+            };
+
+            // Get screen dimensions (immutable borrow)
+            let Some(output_manager) = app.output_manager() else {
+                continue;
+            };
+            let Some(screen) = output_manager.get_screen(screen_id) else {
+                continue;
+            };
+
+            windows_to_create.push(PendingWindow {
+                screen_id,
+                display_name: display_info.name.clone(),
+                monitor_handle: display_info.monitor_handle().clone(),
+                width: screen.width,
+                height: screen.height,
+            });
+        }
+
+        // Now create the windows
+        for pending_window in windows_to_create {
+            tracing::info!(
+                "Creating display window for screen {:?} on {} ({}x{})",
+                pending_window.screen_id,
+                pending_window.display_name,
+                pending_window.width,
+                pending_window.height
+            );
+
+            // Create fullscreen window on this display
+            let window_attrs = WindowAttributes::default()
+                .with_title(format!("Immersive Output - {}", pending_window.display_name))
+                .with_fullscreen(Some(winit::window::Fullscreen::Borderless(Some(
+                    pending_window.monitor_handle,
+                ))));
+
+            match event_loop.create_window(window_attrs) {
+                Ok(window) => {
+                    let window = Arc::new(window);
+                    let window_id = window.id();
+
+                    // Register in window registry
+                    window_registry.register_monitor_window(
+                        window.clone(),
+                        pending_window.screen_id.0, // Use screen ID as output_id
+                        gpu,
+                    );
+
+                    // Associate window with screen in OutputManager
+                    if let Some(output_manager) = app.output_manager_mut() {
+                        output_manager.set_window_for_screen(pending_window.screen_id, window_id);
+                    }
+
+                    tracing::info!(
+                        "Display window created for screen {:?} on {}",
+                        pending_window.screen_id,
+                        pending_window.display_name
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to create display window for screen {:?}: {}",
+                        pending_window.screen_id,
+                        e
+                    );
+                }
+            }
+        }
+    }
+
+    /// Handle display hot-plug events (connect/disconnect)
+    ///
+    /// Checks for display changes and handles:
+    /// - Disconnected displays: closes monitor windows, falls back to Virtual
+    /// - Connected displays: syncs to app for UI updates
+    fn handle_display_hotplug(
+        event_loop: &ActiveEventLoop,
+        app: &mut App,
+        window_registry: &mut WindowRegistry,
+        display_manager: &mut DisplayManager,
+    ) {
+        use immersive_server::output::{DisplayEvent, OutputDevice, ScreenId};
+
+        // Check for display changes
+        let events = display_manager.check_connections(event_loop);
+
+        if events.is_empty() {
+            return;
+        }
+
+        // Update available displays in App for UI
+        app.set_available_displays(display_manager.displays().cloned().collect());
+
+        // Process each event
+        for event in events {
+            match event {
+                DisplayEvent::Connected(info) => {
+                    tracing::info!(
+                        "Display connected: {} ({}x{}) id={}",
+                        info.name,
+                        info.size.0,
+                        info.size.1,
+                        info.id
+                    );
+                    // Note: We don't auto-activate screens on reconnect
+                    // User must manually select the display again in UI
+                }
+                DisplayEvent::Disconnected(display_id) => {
+                    tracing::warn!("Display disconnected: id={}", display_id);
+
+                    // Find all screens using this display and fall back to Virtual
+                    if let Some(output_manager) = app.output_manager_mut() {
+                        let screens_to_update: Vec<ScreenId> = output_manager
+                            .screens()
+                            .filter_map(|s| {
+                                if let OutputDevice::Display { display_id: id } = &s.device {
+                                    if *id == display_id {
+                                        return Some(s.id);
+                                    }
+                                }
+                                None
+                            })
+                            .collect();
+
+                        for screen_id in screens_to_update {
+                            // Close any monitor window for this screen
+                            if let Some(window_id) = output_manager.remove_window_for_screen(screen_id) {
+                                tracing::info!(
+                                    "Closing monitor window for screen {:?} (display disconnected)",
+                                    screen_id
+                                );
+                                window_registry.mark_closed(window_id);
+                            }
+
+                            // Fall back to Virtual
+                            if let Some(screen) = output_manager.get_screen_mut(screen_id) {
+                                screen.device = OutputDevice::Virtual;
+                                tracing::info!(
+                                    "Screen {:?} '{}' fell back to Virtual (display disconnected)",
+                                    screen_id,
+                                    screen.name
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -466,6 +676,86 @@ impl ImmersiveApp {
             app.dock_manager.request_redock(&panel_id);
         }
     }
+
+    /// Render content into a monitor output window
+    fn render_monitor_window(
+        window_id: winit::window::WindowId,
+        window_registry: &mut WindowRegistry,
+        app: &mut App,
+    ) {
+        use immersive_server::output::ScreenId;
+
+        // Get the window entry
+        let Some(entry) = window_registry.get(window_id) else {
+            return;
+        };
+
+        // Get the output_id (which is screen_id.0)
+        let Some(output_id) = entry.output_id() else {
+            return;
+        };
+        let screen_id = ScreenId(output_id);
+
+        // Get GPU context reference
+        let Some(gpu_context) = entry.gpu_context.as_ref() else {
+            return;
+        };
+        let surface_format = gpu_context.config.format;
+
+        // Get the surface texture
+        let surface_texture = match gpu_context.surface.get_current_texture() {
+            Ok(tex) => tex,
+            Err(e) => {
+                tracing::warn!("Failed to get monitor window surface: {:?}", e);
+                return;
+            }
+        };
+
+        let surface_view = surface_texture.texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // Get GPU and OutputManager
+        let gpu = app.gpu_context();
+
+        // Create command encoder
+        let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Monitor Window Encoder"),
+        });
+
+        // Use OutputManager to blit screen content to surface (mutable for delay buffer)
+        let presented = if let Some(output_manager) = app.output_manager_mut() {
+            output_manager.present_to_surface(
+                &gpu.device,
+                &mut encoder,
+                screen_id,
+                &surface_view,
+                surface_format,
+            )
+        } else {
+            false
+        };
+
+        if !presented {
+            // No content to present - clear to black
+            let _render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Monitor Window Clear"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &surface_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+        }
+
+        // Submit and present
+        gpu.queue.submit(std::iter::once(encoder.finish()));
+        surface_texture.present();
+    }
 }
 
 impl ApplicationHandler for ImmersiveApp {
@@ -555,6 +845,17 @@ impl ApplicationHandler for ImmersiveApp {
             // consistent window tracking when panel windows are added later.
             // For now, just track that we have a main window.
 
+            // Initialize display manager and enumerate connected displays
+            let mut display_manager = DisplayManager::new();
+            display_manager.refresh(event_loop);
+            tracing::info!(
+                "Enumerated {} connected displays",
+                display_manager.count()
+            );
+
+            // Sync available displays to App for UI
+            app.set_available_displays(display_manager.displays().cloned().collect());
+
             self.state = AppState::Running {
                 window,
                 app,
@@ -563,6 +864,7 @@ impl ApplicationHandler for ImmersiveApp {
                 native_menu,
                 has_activated: false,
                 window_registry,
+                display_manager,
             };
         }
     }
@@ -582,6 +884,7 @@ impl ApplicationHandler for ImmersiveApp {
             native_menu,
             has_activated,
             window_registry,
+            display_manager,
         } = &mut self.state
         else {
             return;
@@ -590,44 +893,85 @@ impl ApplicationHandler for ImmersiveApp {
         // Check if this is the main window or a panel window
         let is_main_window = window.id() == window_id;
 
-        // For now, only handle events for the main window
-        // Panel window event handling will be added in Phase E
+        // Handle non-main window events (panel windows and monitor windows)
         if !is_main_window {
-            // Handle panel window events
-            match event {
-                WindowEvent::CloseRequested => {
-                    // Panel window closed - trigger re-docking
-                    if let Some(entry) = window_registry.get(window_id) {
-                        if let Some(panel_id) = entry.panel_id() {
-                            tracing::info!("Panel window closed, re-docking: {}", panel_id);
-                            app.dock_manager.redock_panel(panel_id);
+            // Determine what kind of window this is
+            let is_monitor = window_registry.get(window_id).map(|e| e.is_monitor()).unwrap_or(false);
+
+            if is_monitor {
+                // Handle monitor window events
+                match event {
+                    WindowEvent::CloseRequested => {
+                        use immersive_server::output::ScreenId;
+                        // Monitor window closed - update screen output device
+                        if let Some(entry) = window_registry.get(window_id) {
+                            if let Some(output_id) = entry.output_id() {
+                                let screen_id = ScreenId(output_id);
+                                tracing::info!("Monitor window closed for screen {:?}", screen_id);
+                                // Remove the window association
+                                if let Some(output_manager) = app.output_manager_mut() {
+                                    output_manager.remove_window_for_screen(screen_id);
+                                    // Set screen device to Virtual
+                                    if let Some(screen) = output_manager.get_screen_mut(screen_id) {
+                                        screen.device = immersive_server::output::OutputDevice::Virtual;
+                                    }
+                                }
+                            }
+                        }
+                        window_registry.mark_closed(window_id);
+                    }
+                    WindowEvent::Resized(new_size) => {
+                        // Update monitor window GPU context
+                        let gpu = app.gpu_context();
+                        if let Some(entry) = window_registry.get_mut(window_id) {
+                            entry.resize(&gpu, new_size);
                         }
                     }
-                    window_registry.mark_closed(window_id);
+                    WindowEvent::RedrawRequested => {
+                        // Render the screen content
+                        Self::render_monitor_window(window_id, window_registry, app);
+                    }
+                    _ => {
+                        // Monitor windows don't need egui event forwarding
+                    }
                 }
-                WindowEvent::Resized(new_size) => {
-                    // Update panel window GPU context
-                    let gpu = app.gpu_context();
-                    if let Some(entry) = window_registry.get_mut(window_id) {
-                        entry.resize(&gpu, new_size);
-                        // Also forward to egui_state so it knows the new window size
-                        let _ = entry.egui_state.on_window_event(&entry.window, &event);
-                        // Update panel geometry
-                        if let Some(panel_id) = entry.panel_id().map(|s| s.to_string()) {
-                            if let Some(panel) = app.dock_manager.get_panel_mut(&panel_id) {
-                                panel.undocked_geometry.set_size(new_size.width as f32, new_size.height as f32);
+            } else {
+                // Handle panel window events
+                match event {
+                    WindowEvent::CloseRequested => {
+                        // Panel window closed - trigger re-docking
+                        if let Some(entry) = window_registry.get(window_id) {
+                            if let Some(panel_id) = entry.panel_id() {
+                                tracing::info!("Panel window closed, re-docking: {}", panel_id);
+                                app.dock_manager.redock_panel(panel_id);
+                            }
+                        }
+                        window_registry.mark_closed(window_id);
+                    }
+                    WindowEvent::Resized(new_size) => {
+                        // Update panel window GPU context
+                        let gpu = app.gpu_context();
+                        if let Some(entry) = window_registry.get_mut(window_id) {
+                            entry.resize(&gpu, new_size);
+                            // Also forward to egui_state so it knows the new window size
+                            let _ = entry.egui_state.on_window_event(&entry.window, &event);
+                            // Update panel geometry
+                            if let Some(panel_id) = entry.panel_id().map(|s| s.to_string()) {
+                                if let Some(panel) = app.dock_manager.get_panel_mut(&panel_id) {
+                                    panel.undocked_geometry.set_size(new_size.width as f32, new_size.height as f32);
+                                }
                             }
                         }
                     }
-                }
-                WindowEvent::RedrawRequested => {
-                    // Render the undocked panel
-                    Self::render_panel_window(window_id, window_registry, app);
-                }
-                _ => {
-                    // Forward other events to egui for the panel window
-                    if let Some(entry) = window_registry.get_mut(window_id) {
-                        let _ = entry.egui_state.on_window_event(&entry.window, &event);
+                    WindowEvent::RedrawRequested => {
+                        // Render the undocked panel
+                        Self::render_panel_window(window_id, window_registry, app);
+                    }
+                    _ => {
+                        // Forward other events to egui for the panel window
+                        if let Some(entry) = window_registry.get_mut(window_id) {
+                            let _ = entry.egui_state.on_window_event(&entry.window, &event);
+                        }
                     }
                 }
             }
@@ -934,6 +1278,15 @@ impl ApplicationHandler for ImmersiveApp {
                 // Handle dock actions (create/destroy panel windows)
                 let gpu = app.gpu_context();
                 Self::handle_dock_actions(event_loop, app, window_registry, &gpu);
+
+                // Handle display window creation (for screens with Display output devices)
+                Self::handle_display_windows(
+                    event_loop,
+                    app,
+                    window_registry,
+                    display_manager,
+                    &gpu,
+                );
             }
 
             _ => {}
@@ -944,7 +1297,7 @@ impl ApplicationHandler for ImmersiveApp {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        let AppState::Running { window, app, window_registry, .. } = &mut self.state else {
+        let AppState::Running { window, app, window_registry, display_manager, .. } = &mut self.state else {
             event_loop.set_control_flow(ControlFlow::Wait);
             return;
         };
@@ -956,6 +1309,13 @@ impl ApplicationHandler for ImmersiveApp {
                 tracing::info!("Cleaned up panel window: {}", panel_id);
                 // Future: Trigger re-docking logic here
             }
+        }
+
+        // Check for display hot-plug events periodically
+        let now = Instant::now();
+        if now.duration_since(self.last_display_check) >= Duration::from_secs(DISPLAY_CHECK_INTERVAL_SECS) {
+            self.last_display_check = now;
+            Self::handle_display_hotplug(event_loop, app, window_registry, display_manager);
         }
 
         let target_fps = app.settings.target_fps.max(1);
