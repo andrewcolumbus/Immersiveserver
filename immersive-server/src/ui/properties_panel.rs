@@ -172,6 +172,8 @@ pub enum PropertiesAction {
     SetFloorSyncEnabled { enabled: bool },
     /// Floor layer index changed
     SetFloorLayerIndex { index: usize },
+    /// Low latency mode changed (trades stability for reduced input lag)
+    SetLowLatencyMode { enabled: bool },
 }
 
 /// Context for rendering effect stacks (determines which PropertiesAction variants to emit)

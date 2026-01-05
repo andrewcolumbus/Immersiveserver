@@ -333,6 +333,18 @@ impl PreferencesWindow {
             });
         });
 
+        ui.add_space(8.0);
+
+        // Low Latency Mode toggle
+        let mut low_latency = settings.low_latency_mode;
+        if ui
+            .checkbox(&mut low_latency, "Low Latency Mode")
+            .on_hover_text("Reduces input lag by ~16ms but may cause stuttering under heavy GPU load. Disable for smoother playback.")
+            .changed()
+        {
+            actions.push(PropertiesAction::SetLowLatencyMode { enabled: low_latency });
+        }
+
         ui.add_space(16.0);
         ui.separator();
 

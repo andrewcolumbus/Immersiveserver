@@ -3,7 +3,7 @@
 //! A modal window for configuring multi-screen outputs with slice-based input selection.
 //! Accessible via View → Advanced Output.
 
-use crate::output::{EdgeBlendConfig, OutputDevice, OutputManager, Screen, ScreenId, Slice, SliceId, SliceInput, WarpMesh};
+use crate::output::{EdgeBlendConfig, MaskShape, OutputDevice, OutputManager, Point2D as MaskPoint2D, Screen, ScreenId, Slice, SliceId, SliceInput, SliceMask, WarpMesh};
 use crate::output::slice::Point2D;
 
 /// Actions returned from the Advanced Output window
@@ -49,6 +49,8 @@ pub struct AdvancedOutputWindow {
     pub preview_texture_id: Option<egui::TextureId>,
     /// Currently dragged warp point (col, row)
     dragging_warp_point: Option<(usize, usize)>,
+    /// Currently dragged mask vertex index
+    dragging_mask_vertex: Option<usize>,
 }
 
 impl Default for AdvancedOutputWindow {
@@ -70,6 +72,7 @@ impl AdvancedOutputWindow {
             temp_height: String::new(),
             preview_texture_id: None,
             dragging_warp_point: None,
+            dragging_mask_vertex: None,
         }
     }
 
@@ -447,6 +450,103 @@ impl AdvancedOutputWindow {
                                         }
                                     }
                                 }
+
+                                // Draw mask outline for selected slice
+                                if let Some(mask) = &slice.mask {
+                                    if mask.enabled {
+                                        let mask_color = egui::Color32::from_rgba_unmultiplied(255, 100, 255, 200);
+                                        let point_color = egui::Color32::from_rgb(255, 100, 255);
+
+                                        match &mask.shape {
+                                            MaskShape::Rectangle { x, y, width, height } => {
+                                                let mask_rect = egui::Rect::from_min_size(
+                                                    slice_rect.min + egui::vec2(
+                                                        x * slice_rect.width(),
+                                                        y * slice_rect.height(),
+                                                    ),
+                                                    egui::vec2(
+                                                        width * slice_rect.width(),
+                                                        height * slice_rect.height(),
+                                                    ),
+                                                );
+                                                ui.painter().rect_stroke(
+                                                    mask_rect,
+                                                    0.0,
+                                                    egui::Stroke::new(2.0, mask_color),
+                                                    egui::StrokeKind::Inside,
+                                                );
+                                            }
+                                            MaskShape::Ellipse { center, radius_x, radius_y } => {
+                                                let center_pos = slice_rect.min + egui::vec2(
+                                                    center.x * slice_rect.width(),
+                                                    center.y * slice_rect.height(),
+                                                );
+                                                // Draw approximate ellipse using line segments
+                                                let segments = 32;
+                                                let rx = radius_x * slice_rect.width();
+                                                let ry = radius_y * slice_rect.height();
+                                                for i in 0..segments {
+                                                    let a1 = (i as f32 / segments as f32) * std::f32::consts::TAU;
+                                                    let a2 = ((i + 1) as f32 / segments as f32) * std::f32::consts::TAU;
+                                                    let p1 = center_pos + egui::vec2(a1.cos() * rx, a1.sin() * ry);
+                                                    let p2 = center_pos + egui::vec2(a2.cos() * rx, a2.sin() * ry);
+                                                    ui.painter().line_segment([p1, p2], egui::Stroke::new(2.0, mask_color));
+                                                }
+                                                // Draw center point
+                                                ui.painter().circle_filled(center_pos, 4.0, point_color);
+                                            }
+                                            MaskShape::Polygon { points } => {
+                                                // Draw polygon edges
+                                                for i in 0..points.len() {
+                                                    let p1 = &points[i];
+                                                    let p2 = &points[(i + 1) % points.len()];
+                                                    let pos1 = slice_rect.min + egui::vec2(
+                                                        p1.x * slice_rect.width(),
+                                                        p1.y * slice_rect.height(),
+                                                    );
+                                                    let pos2 = slice_rect.min + egui::vec2(
+                                                        p2.x * slice_rect.width(),
+                                                        p2.y * slice_rect.height(),
+                                                    );
+                                                    ui.painter().line_segment([pos1, pos2], egui::Stroke::new(2.0, mask_color));
+                                                }
+                                                // Draw vertices as draggable points
+                                                for (i, p) in points.iter().enumerate() {
+                                                    let pos = slice_rect.min + egui::vec2(
+                                                        p.x * slice_rect.width(),
+                                                        p.y * slice_rect.height(),
+                                                    );
+                                                    let is_dragging = self.dragging_mask_vertex == Some(i);
+                                                    let radius = if is_dragging { 6.0 } else { 4.0 };
+                                                    ui.painter().circle_filled(pos, radius, point_color);
+                                                }
+                                            }
+                                            MaskShape::Bezier { segments } => {
+                                                // Draw bezier segments
+                                                let bezier_color = mask_color;
+                                                for segment in segments {
+                                                    // Draw bezier curve using line approximation
+                                                    let steps = 16;
+                                                    for i in 0..steps {
+                                                        let t1 = i as f32 / steps as f32;
+                                                        let t2 = (i + 1) as f32 / steps as f32;
+                                                        let p1 = segment.evaluate(t1);
+                                                        let p2 = segment.evaluate(t2);
+                                                        let pos1 = slice_rect.min + egui::vec2(
+                                                            p1.x * slice_rect.width(),
+                                                            p1.y * slice_rect.height(),
+                                                        );
+                                                        let pos2 = slice_rect.min + egui::vec2(
+                                                            p2.x * slice_rect.width(),
+                                                            p2.y * slice_rect.height(),
+                                                        );
+                                                        ui.painter().line_segment([pos1, pos2], egui::Stroke::new(2.0, bezier_color));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -530,6 +630,79 @@ impl AdvancedOutputWindow {
                                     // On drag end, clear dragging state
                                     if response.drag_stopped() {
                                         self.dragging_warp_point = None;
+                                    }
+                                }
+
+                                // Handle mask vertex dragging for polygon masks
+                                if let Some(mask) = &slice.mask {
+                                    if mask.enabled {
+                                        if let MaskShape::Polygon { points } = &mask.shape {
+                                            // Calculate slice rect in preview coordinates
+                                            let slice_rect = egui::Rect::from_min_size(
+                                                rect.min + egui::vec2(
+                                                    slice.output.rect.x * preview_size.x,
+                                                    slice.output.rect.y * preview_size.y,
+                                                ),
+                                                egui::vec2(
+                                                    slice.output.rect.width * preview_size.x,
+                                                    slice.output.rect.height * preview_size.y,
+                                                ),
+                                            );
+
+                                            // On click start, find nearest mask vertex
+                                            if response.drag_started() && self.dragging_warp_point.is_none() {
+                                                if let Some(pointer_pos) = response.interact_pointer_pos() {
+                                                    let mut best_dist = 15.0_f32; // Click radius threshold
+                                                    let mut best_vertex: Option<usize> = None;
+
+                                                    for (i, point) in points.iter().enumerate() {
+                                                        let pos = slice_rect.min + egui::vec2(
+                                                            point.x * slice_rect.width(),
+                                                            point.y * slice_rect.height(),
+                                                        );
+                                                        let dist = pointer_pos.distance(pos);
+                                                        if dist < best_dist {
+                                                            best_dist = dist;
+                                                            best_vertex = Some(i);
+                                                        }
+                                                    }
+
+                                                    self.dragging_mask_vertex = best_vertex;
+                                                }
+                                            }
+
+                                            // During drag, update vertex position
+                                            if response.dragged() {
+                                                if let Some(vertex_idx) = self.dragging_mask_vertex {
+                                                    if let Some(pointer_pos) = response.interact_pointer_pos() {
+                                                        // Convert pointer to normalized coordinates
+                                                        let local = pointer_pos - slice_rect.min;
+                                                        let norm_x = (local.x / slice_rect.width()).clamp(0.0, 1.0);
+                                                        let norm_y = (local.y / slice_rect.height()).clamp(0.0, 1.0);
+
+                                                        // Update the mask vertex and trigger action
+                                                        let mut updated_slice = slice.clone();
+                                                        if let Some(mask) = &mut updated_slice.mask {
+                                                            if let MaskShape::Polygon { points } = &mut mask.shape {
+                                                                if vertex_idx < points.len() {
+                                                                    points[vertex_idx] = MaskPoint2D { x: norm_x, y: norm_y };
+                                                                    actions.push(AdvancedOutputAction::UpdateSlice {
+                                                                        screen_id,
+                                                                        slice_id,
+                                                                        slice: updated_slice,
+                                                                    });
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+
+                                            // On drag end, clear dragging state
+                                            if response.drag_stopped() {
+                                                self.dragging_mask_vertex = None;
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -1211,6 +1384,162 @@ impl AdvancedOutputWindow {
                     }
                 });
             });
+        }
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(4.0);
+
+        // Mask section
+        ui.horizontal(|ui| {
+            ui.label("Mask");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if slice_copy.mask.is_some() {
+                    if ui.small_button("Remove").on_hover_text("Remove mask").clicked() {
+                        slice_copy.mask = None;
+                        changed = true;
+                    }
+                }
+            });
+        });
+        ui.add_space(4.0);
+
+        if slice_copy.mask.is_none() {
+            // Show preset buttons to add a mask
+            ui.horizontal(|ui| {
+                if ui.small_button("Rectangle").on_hover_text("Add rectangle mask").clicked() {
+                    slice_copy.mask = Some(SliceMask {
+                        shape: MaskShape::Rectangle {
+                            x: 0.1,
+                            y: 0.1,
+                            width: 0.8,
+                            height: 0.8,
+                        },
+                        feather: 0.0,
+                        inverted: false,
+                        enabled: true,
+                    });
+                    changed = true;
+                }
+                if ui.small_button("Ellipse").on_hover_text("Add ellipse mask").clicked() {
+                    slice_copy.mask = Some(SliceMask {
+                        shape: MaskShape::Ellipse {
+                            center: MaskPoint2D { x: 0.5, y: 0.5 },
+                            radius_x: 0.4,
+                            radius_y: 0.4,
+                        },
+                        feather: 0.0,
+                        inverted: false,
+                        enabled: true,
+                    });
+                    changed = true;
+                }
+                if ui.small_button("Polygon").on_hover_text("Add polygon mask").clicked() {
+                    slice_copy.mask = Some(SliceMask {
+                        shape: MaskShape::Polygon {
+                            points: vec![
+                                MaskPoint2D { x: 0.2, y: 0.2 },
+                                MaskPoint2D { x: 0.8, y: 0.2 },
+                                MaskPoint2D { x: 0.8, y: 0.8 },
+                                MaskPoint2D { x: 0.2, y: 0.8 },
+                            ],
+                        },
+                        feather: 0.0,
+                        inverted: false,
+                        enabled: true,
+                    });
+                    changed = true;
+                }
+            });
+        } else if let Some(mask) = &mut slice_copy.mask {
+            // Mask controls
+            ui.horizontal(|ui| {
+                if ui.checkbox(&mut mask.enabled, "Enabled").changed() {
+                    changed = true;
+                }
+                if ui.checkbox(&mut mask.inverted, "Invert").changed() {
+                    changed = true;
+                }
+            });
+
+            // Feather slider
+            ui.horizontal(|ui| {
+                ui.label("Feather:");
+                if ui.add(egui::Slider::new(&mut mask.feather, 0.0..=0.1).max_decimals(3)).changed() {
+                    changed = true;
+                }
+            });
+
+            ui.add_space(4.0);
+
+            // Shape-specific controls
+            match &mut mask.shape {
+                MaskShape::Rectangle { x, y, width, height } => {
+                    ui.label(egui::RichText::new("Rectangle").weak());
+                    ui.horizontal(|ui| {
+                        ui.label("X:");
+                        if ui.add(egui::DragValue::new(x).range(0.0..=1.0).speed(0.01)).changed() {
+                            changed = true;
+                        }
+                        ui.label("Y:");
+                        if ui.add(egui::DragValue::new(y).range(0.0..=1.0).speed(0.01)).changed() {
+                            changed = true;
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("W:");
+                        if ui.add(egui::DragValue::new(width).range(0.0..=1.0).speed(0.01)).changed() {
+                            changed = true;
+                        }
+                        ui.label("H:");
+                        if ui.add(egui::DragValue::new(height).range(0.0..=1.0).speed(0.01)).changed() {
+                            changed = true;
+                        }
+                    });
+                }
+                MaskShape::Ellipse { center, radius_x, radius_y } => {
+                    ui.label(egui::RichText::new("Ellipse").weak());
+                    ui.horizontal(|ui| {
+                        ui.label("Center X:");
+                        if ui.add(egui::DragValue::new(&mut center.x).range(0.0..=1.0).speed(0.01)).changed() {
+                            changed = true;
+                        }
+                        ui.label("Y:");
+                        if ui.add(egui::DragValue::new(&mut center.y).range(0.0..=1.0).speed(0.01)).changed() {
+                            changed = true;
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Radius X:");
+                        if ui.add(egui::DragValue::new(radius_x).range(0.0..=1.0).speed(0.01)).changed() {
+                            changed = true;
+                        }
+                        ui.label("Y:");
+                        if ui.add(egui::DragValue::new(radius_y).range(0.0..=1.0).speed(0.01)).changed() {
+                            changed = true;
+                        }
+                    });
+                }
+                MaskShape::Polygon { points } => {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(format!("Polygon ({} vertices)", points.len())).weak());
+                        if ui.small_button("Add").on_hover_text("Add vertex at center").clicked() {
+                            // Add a new point at the center of the polygon
+                            if !points.is_empty() {
+                                let cx: f32 = points.iter().map(|p| p.x).sum::<f32>() / points.len() as f32;
+                                let cy: f32 = points.iter().map(|p| p.y).sum::<f32>() / points.len() as f32;
+                                points.push(MaskPoint2D { x: cx, y: cy });
+                                changed = true;
+                            }
+                        }
+                    });
+                    ui.label(egui::RichText::new("Drag points in preview to edit").italics().weak());
+                }
+                MaskShape::Bezier { segments } => {
+                    ui.label(egui::RichText::new(format!("Bezier ({} segments)", segments.len())).weak());
+                    ui.label(egui::RichText::new("Bezier editing coming soon").italics().weak());
+                }
+            }
         }
 
         ui.add_space(8.0);

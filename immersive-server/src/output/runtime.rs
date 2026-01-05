@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use super::{Screen, ScreenId, Slice, SliceId, SliceInput, WarpMesh};
+use super::{MaskShape, Screen, ScreenId, Slice, SliceId, SliceInput, SliceMask, WarpMesh};
 
 /// Screen-level color correction parameters (matches shader uniform)
 #[repr(C)]
@@ -38,7 +38,7 @@ impl ScreenParams {
 ///
 /// IMPORTANT: This struct must match the WGSL SliceParams layout exactly.
 /// WGSL alignment rules: vec2 needs 8-byte alignment, vec4 needs 16-byte alignment.
-/// Total size: 224 bytes
+/// Total size: 240 bytes
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct SliceParams {
@@ -91,7 +91,16 @@ pub struct SliceParams {
     pub edge_top: [f32; 4],          // offset 192, size 16
     /// Edge blend bottom: [enabled, width, gamma, black_level]
     pub edge_bottom: [f32; 4],       // offset 208, size 16
-}                                    // Total: 224 bytes
+    // --- Mask fields (offset 224) ---
+    /// Mask enabled flag (1.0 = enabled, 0.0 = disabled)
+    pub mask_enabled: f32,           // offset 224, size 4
+    /// Mask inverted flag (1.0 = show outside, 0.0 = show inside)
+    pub mask_inverted: f32,          // offset 228, size 4
+    /// Mask feather amount (0.0-0.5)
+    pub mask_feather: f32,           // offset 232, size 4
+    /// Padding for alignment
+    pub _pad4: f32,                  // offset 236, size 4
+}                                    // Total: 240 bytes
 
 impl Default for SliceParams {
     fn default() -> Self {
@@ -122,6 +131,11 @@ impl Default for SliceParams {
             edge_right: [0.0, 0.15, 2.2, 0.0],
             edge_top: [0.0, 0.15, 2.2, 0.0],
             edge_bottom: [0.0, 0.15, 2.2, 0.0],
+            // Mask defaults (disabled)
+            mask_enabled: 0.0,
+            mask_inverted: 0.0,
+            mask_feather: 0.0,
+            _pad4: 0.0,
         }
     }
 }
@@ -220,6 +234,11 @@ impl SliceParams {
             edge_right,
             edge_top,
             edge_bottom,
+            // Extract mask config
+            mask_enabled: if slice.mask.as_ref().is_some_and(|m| m.enabled) { 1.0 } else { 0.0 },
+            mask_inverted: if slice.mask.as_ref().is_some_and(|m| m.inverted) { 1.0 } else { 0.0 },
+            mask_feather: slice.mask.as_ref().map(|m| m.feather).unwrap_or(0.0),
+            _pad4: 0.0,
         }
     }
 }
@@ -257,6 +276,18 @@ pub struct SliceRuntime {
 
     /// Bind group for mesh warp data (optional)
     pub warp_bind_group: Option<wgpu::BindGroup>,
+
+    /// Mask texture (optional, CPU-rasterized)
+    pub mask_texture: Option<wgpu::Texture>,
+
+    /// Mask texture view for binding
+    pub mask_texture_view: Option<wgpu::TextureView>,
+
+    /// Bind group for mask data (optional)
+    pub mask_bind_group: Option<wgpu::BindGroup>,
+
+    /// Flag to track if mask needs re-rasterization
+    pub mask_dirty: bool,
 
     /// Cached slice dimensions
     pub width: u32,
@@ -306,6 +337,10 @@ impl SliceRuntime {
             params_buffer,
             warp_buffer: None,
             warp_bind_group: None,
+            mask_texture: None,
+            mask_texture_view: None,
+            mask_bind_group: None,
+            mask_dirty: false,
             width,
             height,
         }
@@ -376,6 +411,84 @@ impl SliceRuntime {
         self.warp_buffer.is_some()
     }
 
+    /// Check if masking is enabled (has a mask texture)
+    pub fn has_mask(&self) -> bool {
+        self.mask_texture.is_some()
+    }
+
+    /// Update the mask texture with rasterized mask data
+    ///
+    /// Creates the texture if it doesn't exist.
+    /// Clears the texture if mask is None.
+    pub fn update_mask_texture(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        mask: Option<&super::SliceMask>,
+    ) {
+        match mask {
+            Some(mask) if mask.enabled => {
+                // Rasterize mask to 256x256 texture
+                const MASK_SIZE: u32 = 256;
+                let pixels = rasterize_mask(mask, MASK_SIZE);
+
+                // Create texture if it doesn't exist
+                if self.mask_texture.is_none() {
+                    let texture = device.create_texture(&wgpu::TextureDescriptor {
+                        label: Some(&format!("Slice {} Mask Texture", self.slice_id.0)),
+                        size: wgpu::Extent3d {
+                            width: MASK_SIZE,
+                            height: MASK_SIZE,
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                        view_formats: &[],
+                    });
+                    let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+                    self.mask_texture = Some(texture);
+                    self.mask_texture_view = Some(texture_view);
+                    self.mask_bind_group = None; // Needs recreation
+                }
+
+                // Upload pixel data
+                if let Some(texture) = &self.mask_texture {
+                    queue.write_texture(
+                        wgpu::ImageCopyTexture {
+                            texture,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d::ZERO,
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        &pixels,
+                        wgpu::ImageDataLayout {
+                            offset: 0,
+                            bytes_per_row: Some(MASK_SIZE * 4),
+                            rows_per_image: Some(MASK_SIZE),
+                        },
+                        wgpu::Extent3d {
+                            width: MASK_SIZE,
+                            height: MASK_SIZE,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                }
+
+                self.mask_dirty = false;
+            }
+            _ => {
+                // Clear mask texture when disabled
+                self.mask_texture = None;
+                self.mask_texture_view = None;
+                self.mask_bind_group = None;
+                self.mask_dirty = false;
+            }
+        }
+    }
+
     /// Resize the slice texture if needed
     pub fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32, format: wgpu::TextureFormat) {
         if self.width == width && self.height == height {
@@ -404,6 +517,228 @@ impl SliceRuntime {
         self.height = height;
         self.bind_group = None; // Needs recreation
     }
+}
+
+/// Rasterize a mask shape to an RGBA pixel buffer
+///
+/// Returns a Vec<u8> with size * size * 4 bytes (RGBA format).
+/// The alpha channel contains the mask value (255 = inside, 0 = outside).
+fn rasterize_mask(mask: &SliceMask, size: u32) -> Vec<u8> {
+    let mut pixels = vec![0u8; (size * size * 4) as usize];
+
+    match &mask.shape {
+        MaskShape::Rectangle { x, y, width, height } => {
+            rasterize_rectangle(&mut pixels, size, *x, *y, *width, *height, mask.feather);
+        }
+        MaskShape::Ellipse { center, radius_x, radius_y } => {
+            rasterize_ellipse(&mut pixels, size, center.x, center.y, *radius_x, *radius_y, mask.feather);
+        }
+        MaskShape::Polygon { points } => {
+            rasterize_polygon(&mut pixels, size, points, mask.feather);
+        }
+        MaskShape::Bezier { segments } => {
+            // Tesselate bezier to polygon and rasterize
+            let mut points = Vec::new();
+            for segment in segments {
+                // Sample each bezier segment at multiple points
+                for i in 0..16 {
+                    let t = i as f32 / 16.0;
+                    let pt = segment.evaluate(t);
+                    points.push(super::Point2D::new(pt.x, pt.y));
+                }
+            }
+            if !points.is_empty() {
+                rasterize_polygon(&mut pixels, size, &points, mask.feather);
+            }
+        }
+    }
+
+    pixels
+}
+
+/// Rasterize a rectangle mask
+fn rasterize_rectangle(pixels: &mut [u8], size: u32, x: f32, y: f32, width: f32, height: f32, feather: f32) {
+    let size_f = size as f32;
+
+    for py in 0..size {
+        for px in 0..size {
+            let u = px as f32 / size_f;
+            let v = py as f32 / size_f;
+
+            // Calculate signed distance to rectangle edges
+            let dx = if u < x {
+                x - u
+            } else if u > x + width {
+                u - (x + width)
+            } else {
+                0.0
+            };
+            let dy = if v < y {
+                y - v
+            } else if v > y + height {
+                v - (y + height)
+            } else {
+                0.0
+            };
+
+            // Distance to nearest edge (positive = outside, negative = inside)
+            let dist = if dx == 0.0 && dy == 0.0 {
+                // Inside rectangle - calculate distance to nearest edge
+                let left_dist = u - x;
+                let right_dist = (x + width) - u;
+                let top_dist = v - y;
+                let bottom_dist = (y + height) - v;
+                -left_dist.min(right_dist).min(top_dist).min(bottom_dist)
+            } else {
+                (dx * dx + dy * dy).sqrt()
+            };
+
+            // Apply feathering
+            let alpha = if feather > 0.0 {
+                1.0 - (dist / feather).clamp(0.0, 1.0)
+            } else {
+                if dist <= 0.0 { 1.0 } else { 0.0 }
+            };
+
+            let idx = ((py * size + px) * 4) as usize;
+            pixels[idx] = 255;     // R
+            pixels[idx + 1] = 255; // G
+            pixels[idx + 2] = 255; // B
+            pixels[idx + 3] = (alpha * 255.0) as u8; // A
+        }
+    }
+}
+
+/// Rasterize an ellipse mask
+fn rasterize_ellipse(pixels: &mut [u8], size: u32, cx: f32, cy: f32, rx: f32, ry: f32, feather: f32) {
+    let size_f = size as f32;
+
+    for py in 0..size {
+        for px in 0..size {
+            let u = px as f32 / size_f;
+            let v = py as f32 / size_f;
+
+            // Normalized distance from center (1.0 = on ellipse edge)
+            let dx = (u - cx) / rx.max(0.0001);
+            let dy = (v - cy) / ry.max(0.0001);
+            let normalized_dist = (dx * dx + dy * dy).sqrt();
+
+            // Convert to actual distance for feathering
+            // This is an approximation - actual ellipse distance is complex
+            let avg_radius = (rx + ry) / 2.0;
+            let dist = (normalized_dist - 1.0) * avg_radius;
+
+            // Apply feathering
+            let alpha = if feather > 0.0 {
+                1.0 - (dist / feather).clamp(0.0, 1.0)
+            } else {
+                if normalized_dist <= 1.0 { 1.0 } else { 0.0 }
+            };
+
+            let idx = ((py * size + px) * 4) as usize;
+            pixels[idx] = 255;     // R
+            pixels[idx + 1] = 255; // G
+            pixels[idx + 2] = 255; // B
+            pixels[idx + 3] = (alpha * 255.0) as u8; // A
+        }
+    }
+}
+
+/// Rasterize a polygon mask using point-in-polygon test
+fn rasterize_polygon(pixels: &mut [u8], size: u32, points: &[super::Point2D], feather: f32) {
+    if points.len() < 3 {
+        return;
+    }
+
+    let size_f = size as f32;
+
+    for py in 0..size {
+        for px in 0..size {
+            let u = px as f32 / size_f;
+            let v = py as f32 / size_f;
+
+            // Point-in-polygon test using ray casting
+            let inside = point_in_polygon(u, v, points);
+
+            // Calculate distance to nearest edge for feathering
+            let dist = if feather > 0.0 {
+                distance_to_polygon_edge(u, v, points)
+            } else {
+                0.0
+            };
+
+            // Apply feathering
+            let alpha = if feather > 0.0 {
+                if inside {
+                    1.0 - ((-dist) / feather).clamp(0.0, 1.0).max(0.0)
+                } else {
+                    1.0 - (dist / feather).clamp(0.0, 1.0)
+                }
+            } else {
+                if inside { 1.0 } else { 0.0 }
+            };
+
+            let idx = ((py * size + px) * 4) as usize;
+            pixels[idx] = 255;     // R
+            pixels[idx + 1] = 255; // G
+            pixels[idx + 2] = 255; // B
+            pixels[idx + 3] = (alpha * 255.0) as u8; // A
+        }
+    }
+}
+
+/// Point-in-polygon test using ray casting algorithm
+fn point_in_polygon(x: f32, y: f32, points: &[super::Point2D]) -> bool {
+    let n = points.len();
+    let mut inside = false;
+
+    let mut j = n - 1;
+    for i in 0..n {
+        let xi = points[i].x;
+        let yi = points[i].y;
+        let xj = points[j].x;
+        let yj = points[j].y;
+
+        if ((yi > y) != (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi) {
+            inside = !inside;
+        }
+        j = i;
+    }
+
+    inside
+}
+
+/// Calculate minimum distance from a point to polygon edges
+fn distance_to_polygon_edge(x: f32, y: f32, points: &[super::Point2D]) -> f32 {
+    let n = points.len();
+    let mut min_dist = f32::MAX;
+
+    for i in 0..n {
+        let j = (i + 1) % n;
+        let dist = point_to_segment_distance(x, y, points[i].x, points[i].y, points[j].x, points[j].y);
+        min_dist = min_dist.min(dist);
+    }
+
+    min_dist
+}
+
+/// Distance from point (px, py) to line segment from (x1, y1) to (x2, y2)
+fn point_to_segment_distance(px: f32, py: f32, x1: f32, y1: f32, x2: f32, y2: f32) -> f32 {
+    let dx = x2 - x1;
+    let dy = y2 - y1;
+    let len_sq = dx * dx + dy * dy;
+
+    if len_sq < 0.0001 {
+        // Degenerate segment (point)
+        return ((px - x1).powi(2) + (py - y1).powi(2)).sqrt();
+    }
+
+    // Project point onto line, clamping to segment
+    let t = (((px - x1) * dx + (py - y1) * dy) / len_sq).clamp(0.0, 1.0);
+    let proj_x = x1 + t * dx;
+    let proj_y = y1 + t * dy;
+
+    ((px - proj_x).powi(2) + (py - proj_y).powi(2)).sqrt()
 }
 
 /// Runtime GPU resources for a screen
@@ -565,6 +900,18 @@ pub struct OutputManager {
 
     /// Dummy warp bind group for slices without mesh warp
     dummy_warp_bind_group: Option<wgpu::BindGroup>,
+
+    /// Bind group layout for mask texture (texture + sampler)
+    mask_bind_group_layout: Option<wgpu::BindGroupLayout>,
+
+    /// Dummy mask texture for slices without masking (1x1 white)
+    dummy_mask_texture: Option<wgpu::Texture>,
+
+    /// Dummy mask texture view for slices without masking
+    dummy_mask_texture_view: Option<wgpu::TextureView>,
+
+    /// Dummy mask bind group for slices without masking
+    dummy_mask_bind_group: Option<wgpu::BindGroup>,
 }
 
 impl OutputManager {
@@ -586,6 +933,10 @@ impl OutputManager {
             screen_params_buffer: None,
             dummy_warp_buffer: None,
             dummy_warp_bind_group: None,
+            mask_bind_group_layout: None,
+            dummy_mask_texture: None,
+            dummy_mask_texture_view: None,
+            dummy_mask_bind_group: None,
         }
     }
 
@@ -737,6 +1088,69 @@ impl OutputManager {
         self.dummy_warp_buffer = Some(dummy_warp_buffer);
         self.dummy_warp_bind_group = Some(dummy_warp_bind_group);
 
+        // Create mask bind group layout (for mask texture + sampler)
+        let mask_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Mask Bind Group Layout"),
+            entries: &[
+                // Mask texture
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // Mask sampler
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
+        // Create dummy mask texture (1x1 white with full alpha - passes through everything)
+        let dummy_mask_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Dummy Mask Texture"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let dummy_mask_texture_view = dummy_mask_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // Create dummy mask bind group
+        let dummy_mask_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Dummy Mask Bind Group"),
+            layout: &mask_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&dummy_mask_texture_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(self.sampler.as_ref().unwrap()),
+                },
+            ],
+        });
+
+        self.mask_bind_group_layout = Some(mask_bind_group_layout);
+        self.dummy_mask_texture = Some(dummy_mask_texture);
+        self.dummy_mask_texture_view = Some(dummy_mask_texture_view);
+        self.dummy_mask_bind_group = Some(dummy_mask_bind_group);
+
         // Create screen bind group layout
         let screen_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Screen Bind Group Layout"),
@@ -782,7 +1196,11 @@ impl OutputManager {
 
         let slice_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Slice Pipeline Layout"),
-            bind_group_layouts: &[&slice_bind_group_layout, self.warp_bind_group_layout.as_ref().unwrap()],
+            bind_group_layouts: &[
+                &slice_bind_group_layout,
+                self.warp_bind_group_layout.as_ref().unwrap(),
+                self.mask_bind_group_layout.as_ref().unwrap(),
+            ],
             push_constant_ranges: &[],
         });
 
@@ -1072,6 +1490,12 @@ impl OutputManager {
         let Some(dummy_warp_bind_group) = &self.dummy_warp_bind_group else {
             return;
         };
+        let Some(mask_bind_group_layout) = &self.mask_bind_group_layout else {
+            return;
+        };
+        let Some(dummy_mask_bind_group) = &self.dummy_mask_bind_group else {
+            return;
+        };
 
         // Get screen config and runtime
         let Some(screen) = self.screens.get(&screen_id) else {
@@ -1134,24 +1558,42 @@ impl OutputManager {
             // Update warp buffer if mesh warp is enabled
             slice_runtime.update_warp_buffer(device, queue, slice.output.mesh.as_ref());
 
-            // Create or get warp bind group
-            let warp_bind_group = if let Some(warp_buffer) = &slice_runtime.warp_buffer {
-                // Mesh warp is enabled - create bind group if needed
-                if slice_runtime.warp_bind_group.is_none() {
-                    slice_runtime.warp_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some(&format!("Slice {} Warp Bind Group", slice.id.0)),
-                        layout: warp_bind_group_layout,
-                        entries: &[wgpu::BindGroupEntry {
+            // Update mask texture if mask is enabled (before borrowing bind groups)
+            slice_runtime.update_mask_texture(device, queue, slice.mask.as_ref());
+
+            // Create warp bind group if needed (must be done before borrowing)
+            if slice_runtime.warp_buffer.is_some() && slice_runtime.warp_bind_group.is_none() {
+                slice_runtime.warp_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some(&format!("Slice {} Warp Bind Group", slice.id.0)),
+                    layout: warp_bind_group_layout,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: slice_runtime.warp_buffer.as_ref().unwrap().as_entire_binding(),
+                    }],
+                }));
+            }
+
+            // Create mask bind group if needed (must be done before borrowing)
+            if slice_runtime.mask_texture_view.is_some() && slice_runtime.mask_bind_group.is_none() {
+                slice_runtime.mask_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some(&format!("Slice {} Mask Bind Group", slice.id.0)),
+                    layout: mask_bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
                             binding: 0,
-                            resource: warp_buffer.as_entire_binding(),
-                        }],
-                    }));
-                }
-                slice_runtime.warp_bind_group.as_ref().unwrap()
-            } else {
-                // No mesh warp - use dummy bind group
-                dummy_warp_bind_group
-            };
+                            resource: wgpu::BindingResource::TextureView(slice_runtime.mask_texture_view.as_ref().unwrap()),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Sampler(sampler),
+                        },
+                    ],
+                }));
+            }
+
+            // Get bind groups (immutable borrows after mutable work is done)
+            let warp_bind_group = slice_runtime.warp_bind_group.as_ref().unwrap_or(dummy_warp_bind_group);
+            let mask_bind_group = slice_runtime.mask_bind_group.as_ref().unwrap_or(dummy_mask_bind_group);
 
             // Create bind group for this slice
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1195,6 +1637,7 @@ impl OutputManager {
                 render_pass.set_pipeline(slice_pipeline);
                 render_pass.set_bind_group(0, &bind_group, &[]);
                 render_pass.set_bind_group(1, warp_bind_group, &[]);
+                render_pass.set_bind_group(2, mask_bind_group, &[]);
                 render_pass.draw(0..3, 0..1); // Fullscreen triangle
             }
         }

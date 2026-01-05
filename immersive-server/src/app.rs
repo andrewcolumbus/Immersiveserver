@@ -2729,6 +2729,56 @@ impl App {
             }
         }
 
+        // ============================================================================
+        // Advanced Output Rendering
+        // ============================================================================
+        // Render slices to screen output textures for all enabled screens
+        if let Some(output_manager) = &mut self.output_manager {
+            // Ensure pipelines are created
+            if !output_manager.has_pipelines() {
+                output_manager.create_pipelines(&self.device);
+            }
+
+            // Collect layer texture views for SliceInput::Layer
+            let layer_textures: std::collections::HashMap<u32, &wgpu::TextureView> = self
+                .layer_runtimes
+                .iter()
+                .filter_map(|(id, rt)| rt.texture.as_ref().map(|t| (*id, t.view())))
+                .collect();
+
+            // Render each enabled screen
+            let screen_ids = output_manager.enabled_screen_ids();
+            for screen_id in screen_ids {
+                output_manager.render_screen(
+                    &self.device,
+                    &self.queue,
+                    &mut encoder,
+                    screen_id,
+                    self.environment.texture_view(),
+                    &layer_textures,
+                );
+            }
+        }
+
+        // Register Advanced Output preview texture with egui (if window is open)
+        if self.advanced_output_window.open {
+            if let Some(screen_id) = self.advanced_output_window.selected_screen_id() {
+                if let Some(output_manager) = &self.output_manager {
+                    if let Some(runtime) = output_manager.get_runtime(screen_id) {
+                        let texture_id = self.egui_renderer.register_native_texture(
+                            &self.device,
+                            runtime.output_view(),
+                            wgpu::FilterMode::Linear,
+                        );
+                        self.advanced_output_window.preview_texture_id = Some(texture_id);
+                    }
+                }
+            } else {
+                // No screen selected, clear preview
+                self.advanced_output_window.preview_texture_id = None;
+            }
+        }
+
         // Capture environment texture for OMT output (before we move on to present)
         if self.omt_broadcast_enabled {
             if let Some(capture) = &mut self.omt_capture {

@@ -9,7 +9,7 @@ struct VertexOutput {
 }
 
 // Slice parameters uniform
-// IMPORTANT: This struct must match the Rust SliceParams layout exactly (224 bytes)
+// IMPORTANT: This struct must match the Rust SliceParams layout exactly (240 bytes)
 struct SliceParams {
     // Input rect (x, y, width, height) - normalized 0.0-1.0
     input_rect: vec4<f32>,
@@ -44,6 +44,11 @@ struct SliceParams {
     edge_right: vec4<f32>,
     edge_top: vec4<f32>,
     edge_bottom: vec4<f32>,
+    // Mask parameters
+    mask_enabled: f32,    // 1.0 = enabled, 0.0 = disabled
+    mask_inverted: f32,   // 1.0 = show outside, 0.0 = show inside
+    mask_feather: f32,    // Feather amount (0.0-0.5)
+    _pad2: f32,
 }
 
 // Warp point in storage buffer: [uv.x, uv.y, position.x, position.y]
@@ -59,6 +64,11 @@ struct WarpPoint {
 // Optional: Mesh warp points storage buffer (bind group 1)
 // Only bound when mesh warp is enabled
 @group(1) @binding(0) var<storage, read> warp_points: array<WarpPoint>;
+
+// Optional: Mask texture (bind group 2)
+// Only bound when masking is enabled
+@group(2) @binding(0) var t_mask: texture_2d<f32>;
+@group(2) @binding(1) var s_mask: sampler;
 
 // Vertex shader - generates fullscreen triangle
 @vertex
@@ -194,6 +204,26 @@ fn apply_edge_blend(color: vec3<f32>, uv: vec2<f32>) -> vec3<f32> {
     return color * alpha;
 }
 
+// Apply mask from rasterized mask texture
+// Samples mask texture and applies alpha based on mask shape
+// uv is in 0-1 range (output rect normalized coordinates)
+fn apply_mask(color: vec4<f32>, uv: vec2<f32>) -> vec4<f32> {
+    if (params.mask_enabled < 0.5) {
+        return color;
+    }
+
+    // Sample mask texture (alpha channel contains mask value)
+    var mask_alpha = textureSample(t_mask, s_mask, uv).a;
+
+    // Apply inversion if requested
+    if (params.mask_inverted > 0.5) {
+        mask_alpha = 1.0 - mask_alpha;
+    }
+
+    // Apply mask to color alpha
+    return vec4<f32>(color.rgb, color.a * mask_alpha);
+}
+
 // Fragment shader - samples input with slice transformation
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
@@ -274,7 +304,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let blended = apply_edge_blend(corrected, output_uv);
 
     // Apply opacity
-    return vec4<f32>(blended, color.a * params.opacity);
+    let with_opacity = vec4<f32>(blended, color.a * params.opacity);
+
+    // Apply mask (using output UV for mask sampling)
+    return apply_mask(with_opacity, output_uv);
 }
 
 // Simple passthrough fragment shader (for direct copy)
