@@ -140,7 +140,12 @@ impl AdvancedOutputWindow {
         }
 
         // Three-column layout: Screens | Preview | Properties
-        ui.horizontal(|ui| {
+        // Use allocate_ui_with_layout to fill available vertical space
+        let available = ui.available_size();
+        ui.allocate_ui_with_layout(
+            available,
+            egui::Layout::left_to_right(egui::Align::TOP),
+            |ui| {
             // LEFT COLUMN: Screens and Slices list
             ui.vertical(|ui| {
                 ui.set_min_width(150.0);
