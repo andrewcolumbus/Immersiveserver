@@ -153,6 +153,8 @@ pub struct App {
     pub converter_window: crate::converter::ConverterWindow,
     /// Preferences window for environment settings
     pub preferences_window: crate::ui::PreferencesWindow,
+    /// Advanced Output window for multi-screen configuration
+    pub advanced_output_window: crate::ui::AdvancedOutputWindow,
     /// Layout preset manager for saving/restoring UI arrangements
     pub layout_preset_manager: crate::ui::LayoutPresetManager,
 
@@ -573,6 +575,7 @@ impl App {
             thumbnail_cache: crate::ui::ThumbnailCache::new(),
             converter_window: crate::converter::ConverterWindow::new(),
             preferences_window: crate::ui::PreferencesWindow::new(),
+            advanced_output_window: crate::ui::AdvancedOutputWindow::new(),
             layout_preset_manager: {
                 let mut manager = crate::ui::LayoutPresetManager::new();
                 manager.load_user_presets();
@@ -1700,6 +1703,9 @@ impl App {
                 crate::ui::menu_bar::MenuAction::OpenPreferences => {
                     self.preferences_window.open = true;
                 }
+                crate::ui::menu_bar::MenuAction::OpenAdvancedOutput => {
+                    self.advanced_output_window.open = true;
+                }
                 crate::ui::menu_bar::MenuAction::ApplyLayoutPreset { index } => {
                     if self.layout_preset_manager.apply_preset(index, &mut self.dock_manager) {
                         if let Some(preset) = self.layout_preset_manager.get_preset(index) {
@@ -1767,6 +1773,17 @@ impl App {
         );
         for action in pref_actions {
             self.handle_properties_action(action);
+        }
+
+        // Render Advanced Output window
+        let layer_count = self.environment.layers().len();
+        let output_actions = self.advanced_output_window.render(
+            &self.egui_ctx,
+            self.output_manager.as_ref(),
+            layer_count,
+        );
+        for action in output_actions {
+            self.handle_advanced_output_action(action);
         }
 
         // Render Performance panel
@@ -5748,6 +5765,75 @@ impl App {
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+
+    /// Handle an advanced output window action from the UI
+    fn handle_advanced_output_action(&mut self, action: crate::ui::AdvancedOutputAction) {
+        use crate::ui::AdvancedOutputAction;
+
+        match action {
+            AdvancedOutputAction::AddScreen => {
+                // Ensure output manager exists first
+                let _ = self.ensure_output_manager();
+                // Now get screen count before adding
+                let screen_num = self.output_manager.as_ref().map(|m| m.screen_count() + 1).unwrap_or(1);
+                // Add screen (borrows device and manager separately)
+                if let Some(manager) = self.output_manager.as_mut() {
+                    let screen_id = manager.add_screen(&self.device, format!("Screen {}", screen_num));
+                    self.menu_bar.set_status(format!("Added Screen {}", screen_num));
+                    tracing::info!("Added screen {:?}", screen_id);
+                }
+            }
+            AdvancedOutputAction::RemoveScreen { screen_id } => {
+                if let Some(manager) = self.output_manager.as_mut() {
+                    manager.remove_screen(screen_id);
+                    self.menu_bar.set_status("Removed screen");
+                }
+            }
+            AdvancedOutputAction::AddSlice { screen_id } => {
+                if let Some(manager) = self.output_manager.as_mut() {
+                    let slice_num = manager.get_screen(screen_id).map(|s| s.slices.len() + 1).unwrap_or(1);
+                    if let Some(slice_id) = manager.add_slice(&self.device, screen_id, format!("Slice {}", slice_num)) {
+                        self.menu_bar.set_status(format!("Added Slice {}", slice_num));
+                        tracing::info!("Added slice {:?} to screen {:?}", slice_id, screen_id);
+                    }
+                }
+            }
+            AdvancedOutputAction::RemoveSlice { screen_id, slice_id } => {
+                if let Some(manager) = self.output_manager.as_mut() {
+                    manager.remove_slice(screen_id, slice_id);
+                    self.menu_bar.set_status("Removed slice");
+                }
+            }
+            AdvancedOutputAction::UpdateSlice { screen_id, slice_id, slice } => {
+                if let Some(manager) = self.output_manager.as_mut() {
+                    // Update slice data on the screen
+                    if let Some(screen) = manager.get_screen_mut(screen_id) {
+                        if let Some(existing) = screen.slices.iter_mut().find(|s| s.id == slice_id) {
+                            *existing = slice;
+                        }
+                    }
+                    // Sync runtime to pick up changes
+                    manager.sync_runtime(&self.device, screen_id);
+                }
+            }
+            AdvancedOutputAction::UpdateScreen { screen_id, screen: updated_screen } => {
+                if let Some(manager) = self.output_manager.as_mut() {
+                    // Update screen data
+                    if let Some(screen) = manager.get_screen_mut(screen_id) {
+                        screen.name = updated_screen.name;
+                        screen.enabled = updated_screen.enabled;
+                        // Note: width/height changes require texture recreation
+                        if screen.width != updated_screen.width || screen.height != updated_screen.height {
+                            screen.width = updated_screen.width;
+                            screen.height = updated_screen.height;
+                        }
+                    }
+                    // Sync runtime to pick up changes
+                    manager.sync_runtime(&self.device, screen_id);
                 }
             }
         }

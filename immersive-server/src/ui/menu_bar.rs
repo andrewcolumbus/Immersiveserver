@@ -44,6 +44,8 @@ pub enum MenuAction {
     OpenHAPConverter,
     /// Open the Preferences window
     OpenPreferences,
+    /// Open the Advanced Output window
+    OpenAdvancedOutput,
     /// Apply a layout preset by index
     ApplyLayoutPreset { index: usize },
     /// Save the current layout

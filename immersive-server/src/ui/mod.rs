@@ -2,6 +2,7 @@
 //!
 //! Contains egui-based menu bar and panels, plus native OS menu bar support.
 
+pub mod advanced_output_window;
 pub mod clip_grid_panel;
 pub mod dock;
 pub mod effects_browser_panel;
@@ -19,6 +20,7 @@ pub mod sources_panel;
 pub mod thumbnail_cache;
 pub mod window_registry;
 
+pub use advanced_output_window::{AdvancedOutputAction, AdvancedOutputWindow};
 pub use clip_grid_panel::{ClipGridAction, ClipGridPanel};
 pub use dock::{DockAction, DockManager, DockZone, DockablePanel};
 pub use effects_browser_panel::{DraggableEffect, EffectsBrowserAction, EffectsBrowserPanel, DRAG_EFFECT_PAYLOAD};

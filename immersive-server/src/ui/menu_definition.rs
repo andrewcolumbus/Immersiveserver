@@ -56,6 +56,9 @@ pub enum MenuItemId {
 
     // Tools menu
     HapConverter,
+
+    // Windows
+    AdvancedOutput,
 }
 
 impl MenuItemId {
@@ -80,6 +83,7 @@ impl MenuItemId {
             Self::LayoutSave => "layout_save".into(),
             Self::LayoutReset => "layout_reset".into(),
             Self::HapConverter => "tools_hap_converter".into(),
+            Self::AdvancedOutput => "view_advanced_output".into(),
         }
     }
 
@@ -103,6 +107,7 @@ impl MenuItemId {
             "layout_save" => Some(Self::LayoutSave),
             "layout_reset" => Some(Self::LayoutReset),
             "tools_hap_converter" => Some(Self::HapConverter),
+            "view_advanced_output" => Some(Self::AdvancedOutput),
             _ if s.starts_with("layout_preset_") => s
                 .strip_prefix("layout_preset_")
                 .and_then(|n| n.parse().ok())
@@ -160,6 +165,7 @@ impl MenuItemId {
             Self::LayoutSave => MenuItemAction::Menu(MenuAction::SaveLayout),
             Self::LayoutReset => MenuItemAction::Menu(MenuAction::ResetLayout),
             Self::HapConverter => MenuItemAction::Menu(MenuAction::OpenHAPConverter),
+            Self::AdvancedOutput => MenuItemAction::Menu(MenuAction::OpenAdvancedOutput),
         }
     }
 }
@@ -465,6 +471,14 @@ impl MenuBarDefinition {
                     label: "3D Preview Panel".into(),
                     shortcut: None,
                     default_checked: false,
+                },
+                MenuItem::Separator,
+                // Windows section
+                MenuItem::Action {
+                    id: MenuItemId::AdvancedOutput,
+                    label: "Advanced Output...".into(),
+                    shortcut: None,
+                    enabled: true,
                 },
                 MenuItem::Separator,
                 // Settings section
