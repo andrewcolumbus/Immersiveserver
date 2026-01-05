@@ -152,7 +152,7 @@ impl AdvancedOutputWindow {
 
                 egui::ScrollArea::vertical()
                     .id_salt("screens_list")
-                    .max_height(150.0)
+                    .max_height(200.0)
                     .show(ui, |ui| {
                         for screen in &screens {
                             let is_selected = self.selected_screen == Some(screen.id);
@@ -204,7 +204,7 @@ impl AdvancedOutputWindow {
                     if let Some(screen) = screens.iter().find(|s| s.id == screen_id) {
                         egui::ScrollArea::vertical()
                             .id_salt("slices_list")
-                            .max_height(150.0)
+                            .max_height(200.0)
                             .show(ui, |ui| {
                                 for slice in &screen.slices {
                                     let is_selected = self.selected_slice == Some(slice.id);
@@ -264,7 +264,9 @@ impl AdvancedOutputWindow {
                 ui.add_space(4.0);
 
                 // Preview area - use live texture if available
-                let preview_size = egui::vec2(200.0, 150.0);
+                // Calculate preview size based on available space (4:3 aspect ratio)
+                let available_height = (ui.available_height() - 100.0).max(100.0).min(400.0);
+                let preview_size = egui::vec2(available_height * 4.0 / 3.0, available_height);
                 let (rect, response) =
                     ui.allocate_exact_size(preview_size, egui::Sense::click_and_drag());
 
