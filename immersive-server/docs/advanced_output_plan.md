@@ -422,7 +422,7 @@ fn apply_edge_blend(color: vec3<f32>, uv: vec2<f32>, blend: EdgeBlendUniforms) -
 
 ### Phase 16: Per-Output Color Correction
 
-## Status: 🔵 READY TO IMPLEMENT
+## Status: ✅ COMPLETE
 
 **Goal:** Match projector brightness, contrast, and color characteristics across multiple projectors.
 
@@ -435,27 +435,23 @@ Color correction enables matching visual output across different projectors/disp
 - **Per-Screen Color Correction** - Apply global adjustment to entire screen output
 - **Real-time Preview** - See adjustments immediately in Advanced Output window
 
-### Existing Infrastructure
+### Implementation Summary
 
-The data model and shader foundations are already complete:
+**PR 16: Slice Color Shader + UI** ✅
+- Added HSL conversion functions to slice_render.wgsl
+- Added saturation support to apply_color_correction()
+- Added Color section to slice properties UI
 
-**Data Models (complete):**
-- `SliceColorCorrection` in `color.rs` - brightness, contrast, gamma, RGB, opacity
-- `OutputColorCorrection` in `color.rs` - brightness, contrast, gamma, RGB, saturation
-- `Slice.color` field exists
-- `Screen.color` field exists
+**PR 17: Screen Color Pipeline** ✅
+- Added ScreenParams::from_color() helper
+- Added ping-pong textures to ScreenRuntime
+- Implemented apply_screen_color() method
+- Wired into render loop (skips if identity)
 
-**Shader Support (partially complete):**
-- `SliceParams` has `color_adjust` and `color_rgb` fields ✅
-- `apply_color_correction()` in slice_render.wgsl - missing saturation ⚠️
-- `apply_screen_color_correction()` in screen_composite.wgsl - full implementation ✅
-- Screen composite pass not wired into render pipeline ❌
-
-**What's Missing:**
-1. Saturation in slice shader's `apply_color_correction()`
-2. Screen-level color correction pass in render pipeline
-3. UI controls for slice color correction
-4. UI controls for screen color correction
+**PR 18: Screen Color UI** ✅
+- Added Color Correction section to screen properties
+- All sliders: brightness, contrast, gamma, saturation, RGB
+- Reset button and "(color modified)" indicator
 
 ---
 
@@ -739,7 +735,7 @@ impl ScreenParams {
 
 ---
 
-## PR 18: Screen Color Correction UI
+## PR 18: Screen Color Correction UI ✅ COMPLETE
 
 **Goal:** Add UI controls for per-screen color correction.
 
@@ -829,12 +825,12 @@ ui.collapsing("Color Correction", |ui| {
 | `src/ui/advanced_output_window.rs` | Add Color Correction section to screen properties |
 
 ### Verification
-- [ ] Color Correction section appears for selected screen
-- [ ] All sliders adjust screen color in real-time
-- [ ] Saturation slider produces grayscale at 0, oversaturated at 2
-- [ ] RGB sliders allow individual channel adjustment
-- [ ] Reset button restores identity values
-- [ ] Settings persist in .immersive files
+- [x] Color Correction section appears for selected screen
+- [x] All sliders adjust screen color in real-time
+- [x] Saturation slider produces grayscale at 0, oversaturated at 2
+- [x] RGB sliders allow individual channel adjustment
+- [x] Reset button restores identity values
+- [x] Settings persist in .immersive files (uses existing serde serialization)
 
 ---
 
