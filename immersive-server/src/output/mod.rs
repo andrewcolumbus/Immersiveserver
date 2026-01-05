@@ -1,0 +1,22 @@
+//! Advanced Output system for multi-screen projection mapping
+//!
+//! This module provides support for:
+//! - Multiple output screens with independent configurations
+//! - Slice-based input selection (crop/position from composition or layers)
+//! - Output transformations (perspective warp, mesh deformation)
+//! - Edge blending for seamless projector overlap
+//! - Per-output masking and color correction
+
+mod color;
+mod edge_blend;
+mod mask;
+mod screen;
+mod slice;
+mod warp;
+
+pub use color::{OutputColorCorrection, SliceColorCorrection};
+pub use edge_blend::{EdgeBlendConfig, EdgeBlendRegion};
+pub use mask::{BezierSegment, MaskShape, Point2D, SliceMask};
+pub use screen::{OutputDevice, Screen, ScreenId};
+pub use slice::{Rect, Slice, SliceId, SliceInput, SliceOutput};
+pub use warp::{WarpInterpolation, WarpMesh, WarpPoint};

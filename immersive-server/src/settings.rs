@@ -10,6 +10,7 @@ use std::path::PathBuf;
 
 use crate::compositor::Layer;
 use crate::effects::EffectStack;
+use crate::output::Screen;
 use crate::previs::PrevisSettings;
 
 /// Thumbnail display mode for clip grid cells
@@ -125,6 +126,10 @@ pub struct EnvironmentSettings {
     #[serde(rename = "effects", default)]
     pub effects: EffectStack,
 
+    /// Advanced output screens (multi-display, projection mapping)
+    #[serde(rename = "screens", default)]
+    pub screens: Vec<Screen>,
+
     /// 3D previsualization settings
     #[serde(rename = "previsSettings", default)]
     pub previs_settings: PrevisSettings,
@@ -137,6 +142,12 @@ pub struct EnvironmentSettings {
     /// Which layer index to use as the floor layer (0 = first layer)
     #[serde(rename = "floorLayerIndex", default)]
     pub floor_layer_index: usize,
+
+    /// Low latency mode: trades stability for reduced input lag
+    /// - true:  1 frame in flight (~16ms less latency, may stutter under load)
+    /// - false: 2 frames in flight (smoother, but ~16ms more latency)
+    #[serde(rename = "lowLatencyMode", default)]
+    pub low_latency_mode: bool,
 }
 
 /// Default show BPM setting
@@ -190,9 +201,11 @@ impl Default for EnvironmentSettings {
             api_port: default_api_port(),
             thumbnail_mode: ThumbnailMode::default(),
             effects: EffectStack::new(),
+            screens: Vec::new(),
             previs_settings: PrevisSettings::default(),
             floor_sync_enabled: false,
             floor_layer_index: 0,
+            low_latency_mode: false, // Default to stability (2 frames in flight)
         }
     }
 }
