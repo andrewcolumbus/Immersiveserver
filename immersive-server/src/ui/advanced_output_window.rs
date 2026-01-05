@@ -105,9 +105,9 @@ impl AdvancedOutputWindow {
         egui::Window::new("Advanced Output")
             .id(egui::Id::new("advanced_output_window"))
             .open(&mut open)
-            .default_size([700.0, 500.0])
+            .default_size([700.0, 650.0])
             .min_width(500.0)
-            .min_height(350.0)
+            .min_height(400.0)
             .resizable(true)
             .collapsible(true)
             .show(ctx, |ui| {
