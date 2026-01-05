@@ -2749,6 +2749,7 @@ impl App {
             // Render each enabled screen
             let screen_ids = output_manager.enabled_screen_ids();
             for screen_id in screen_ids {
+                // Render all slices to screen output
                 output_manager.render_screen(
                     &self.device,
                     &self.queue,
@@ -2756,6 +2757,14 @@ impl App {
                     screen_id,
                     self.environment.texture_view(),
                     &layer_textures,
+                );
+
+                // Apply per-screen color correction (if not identity)
+                output_manager.apply_screen_color(
+                    &self.device,
+                    &self.queue,
+                    &mut encoder,
+                    screen_id,
                 );
             }
         }

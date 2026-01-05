@@ -32,6 +32,25 @@ impl ScreenParams {
     pub fn identity() -> Self {
         Self::default()
     }
+
+    /// Create params from OutputColorCorrection
+    pub fn from_color(color: &super::OutputColorCorrection) -> Self {
+        Self {
+            color_adjust: [color.brightness, color.contrast, color.gamma, color.saturation],
+            color_rgb: [color.red, color.green, color.blue, 0.0],
+        }
+    }
+
+    /// Check if color correction is at identity (no correction needed)
+    pub fn is_identity(&self) -> bool {
+        (self.color_adjust[0] - 0.0).abs() < f32::EPSILON  // brightness
+            && (self.color_adjust[1] - 1.0).abs() < f32::EPSILON  // contrast
+            && (self.color_adjust[2] - 1.0).abs() < f32::EPSILON  // gamma
+            && (self.color_adjust[3] - 1.0).abs() < f32::EPSILON  // saturation
+            && (self.color_rgb[0] - 1.0).abs() < f32::EPSILON     // red
+            && (self.color_rgb[1] - 1.0).abs() < f32::EPSILON     // green
+            && (self.color_rgb[2] - 1.0).abs() < f32::EPSILON     // blue
+    }
 }
 
 /// Uniform buffer data for slice rendering
@@ -752,6 +771,15 @@ pub struct ScreenRuntime {
     /// Output texture view for binding
     pub output_view: wgpu::TextureView,
 
+    /// Secondary texture for color correction ping-pong
+    pub color_temp_texture: wgpu::Texture,
+
+    /// Secondary texture view for color correction
+    pub color_temp_view: wgpu::TextureView,
+
+    /// Bind group for color correction (samples from output_texture)
+    pub color_bind_group: Option<wgpu::BindGroup>,
+
     /// Slice runtimes for this screen
     pub slices: HashMap<SliceId, SliceRuntime>,
 
@@ -791,10 +819,33 @@ impl ScreenRuntime {
 
         let output_view = output_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
+        // Create secondary texture for color correction ping-pong
+        let color_temp_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(&format!("Screen {} Color Temp", screen_id.0)),
+            size: wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+
+        let color_temp_view = color_temp_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
         Self {
             screen_id,
             output_texture,
             output_view,
+            color_temp_texture,
+            color_temp_view,
+            color_bind_group: None,
             slices: HashMap::new(),
             width,
             height,
@@ -826,6 +877,30 @@ impl ScreenRuntime {
         });
 
         self.output_view = self.output_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // Also resize the secondary texture for color correction
+        self.color_temp_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(&format!("Screen {} Color Temp", self.screen_id.0)),
+            size: wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+
+        self.color_temp_view = self.color_temp_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // Invalidate color bind group (will be recreated when needed)
+        self.color_bind_group = None;
+
         self.width = width;
         self.height = height;
     }
@@ -1651,6 +1726,122 @@ impl OutputManager {
     /// Get the shared sampler
     pub fn sampler(&self) -> Option<&wgpu::Sampler> {
         self.sampler.as_ref()
+    }
+
+    /// Apply screen-level color correction
+    ///
+    /// This should be called after render_screen() to apply per-screen color correction.
+    /// Uses a ping-pong approach: renders from output_texture to color_temp_texture with
+    /// color correction, then copies back to output_texture.
+    ///
+    /// If the screen's color correction is at identity, this is a no-op.
+    pub fn apply_screen_color(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        screen_id: ScreenId,
+    ) {
+        // Get screen config
+        let Some(screen) = self.screens.get(&screen_id) else {
+            return;
+        };
+
+        // Skip if color correction is at identity
+        if screen.color.is_identity() {
+            return;
+        }
+
+        // Get required pipeline infrastructure
+        let Some(screen_pipeline) = &self.screen_composite_pipeline else {
+            tracing::warn!("Screen composite pipeline not initialized");
+            return;
+        };
+        let Some(screen_bind_group_layout) = &self.screen_bind_group_layout else {
+            return;
+        };
+        let Some(sampler) = &self.sampler else {
+            return;
+        };
+        let Some(screen_params_buffer) = &self.screen_params_buffer else {
+            return;
+        };
+
+        // Get screen runtime
+        let Some(runtime) = self.runtimes.get_mut(&screen_id) else {
+            return;
+        };
+
+        // Update screen params buffer with color correction values
+        let screen_params = ScreenParams::from_color(&screen.color);
+        queue.write_buffer(screen_params_buffer, 0, bytemuck::bytes_of(&screen_params));
+
+        // Create or get color bind group (samples from output_texture)
+        if runtime.color_bind_group.is_none() {
+            runtime.color_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(&format!("Screen {} Color Bind Group", screen_id.0)),
+                layout: screen_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&runtime.output_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: screen_params_buffer.as_entire_binding(),
+                    },
+                ],
+            }));
+        }
+
+        let color_bind_group = runtime.color_bind_group.as_ref().unwrap();
+
+        // Pass 1: Render from output_texture to color_temp_texture with color correction
+        {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Screen Color Correction Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &runtime.color_temp_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+
+            render_pass.set_pipeline(screen_pipeline);
+            render_pass.set_bind_group(0, color_bind_group, &[]);
+            render_pass.draw(0..3, 0..1); // Fullscreen triangle
+        }
+
+        // Pass 2: Copy from color_temp_texture back to output_texture
+        encoder.copy_texture_to_texture(
+            wgpu::ImageCopyTexture {
+                texture: &runtime.color_temp_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyTexture {
+                texture: &runtime.output_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: runtime.width,
+                height: runtime.height,
+                depth_or_array_layers: 1,
+            },
+        );
     }
 }
 
