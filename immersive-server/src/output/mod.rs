@@ -10,6 +10,7 @@
 mod color;
 mod edge_blend;
 mod mask;
+pub mod runtime;
 mod screen;
 mod slice;
 mod warp;
@@ -17,6 +18,7 @@ mod warp;
 pub use color::{OutputColorCorrection, SliceColorCorrection};
 pub use edge_blend::{EdgeBlendConfig, EdgeBlendRegion};
 pub use mask::{BezierSegment, MaskShape, Point2D, SliceMask};
+pub use runtime::{OutputManager, ScreenRuntime, SliceParams, SliceRuntime};
 pub use screen::{OutputDevice, Screen, ScreenId};
 pub use slice::{Rect, Slice, SliceId, SliceInput, SliceOutput};
 pub use warp::{WarpInterpolation, WarpMesh, WarpPoint};

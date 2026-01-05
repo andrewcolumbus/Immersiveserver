@@ -14,6 +14,12 @@ use std::time::{Duration, Instant};
 /// The embedded fullscreen quad shader (fallback if file is missing)
 pub const FULLSCREEN_QUAD_SHADER: &str = include_str!("fullscreen_quad.wgsl");
 
+/// The embedded slice render shader
+pub const SLICE_RENDER_SHADER: &str = include_str!("output/slice_render.wgsl");
+
+/// The embedded screen composite shader
+pub const SCREEN_COMPOSITE_SHADER: &str = include_str!("output/screen_composite.wgsl");
+
 /// Get the path to the shaders directory
 pub fn shaders_dir() -> PathBuf {
     // In development, this is relative to the cargo manifest directory
@@ -21,9 +27,24 @@ pub fn shaders_dir() -> PathBuf {
     PathBuf::from(manifest_dir).join("src").join("shaders")
 }
 
+/// Get the path to the output shaders directory
+pub fn output_shaders_dir() -> PathBuf {
+    shaders_dir().join("output")
+}
+
 /// Get the path to the fullscreen quad shader file
 pub fn fullscreen_quad_path() -> PathBuf {
     shaders_dir().join("fullscreen_quad.wgsl")
+}
+
+/// Get the path to the slice render shader file
+pub fn slice_render_path() -> PathBuf {
+    output_shaders_dir().join("slice_render.wgsl")
+}
+
+/// Get the path to the screen composite shader file
+pub fn screen_composite_path() -> PathBuf {
+    output_shaders_dir().join("screen_composite.wgsl")
 }
 
 /// Load the fullscreen quad shader source from disk
@@ -31,6 +52,21 @@ pub fn fullscreen_quad_path() -> PathBuf {
 /// Falls back to the embedded shader if the file cannot be read.
 pub fn load_fullscreen_quad_shader() -> Result<String, std::io::Error> {
     std::fs::read_to_string(fullscreen_quad_path())
+}
+
+/// Load the slice render shader source from disk
+///
+/// Falls back to the embedded shader if the file cannot be read.
+pub fn load_slice_render_shader() -> String {
+    std::fs::read_to_string(slice_render_path()).unwrap_or_else(|_| SLICE_RENDER_SHADER.to_string())
+}
+
+/// Load the screen composite shader source from disk
+///
+/// Falls back to the embedded shader if the file cannot be read.
+pub fn load_screen_composite_shader() -> String {
+    std::fs::read_to_string(screen_composite_path())
+        .unwrap_or_else(|_| SCREEN_COMPOSITE_SHADER.to_string())
 }
 
 // ============================================================================

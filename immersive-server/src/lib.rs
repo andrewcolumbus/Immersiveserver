@@ -37,8 +37,9 @@ pub use audio::{AudioBand, AudioManager, FftData};
 pub use previs::{OrbitCamera, PrevisMesh, PrevisRenderer, PrevisSettings, PrevisVertex, SurfaceType};
 pub use gpu_context::{GpuContext, WindowGpuContext};
 pub use output::{
-    EdgeBlendConfig, EdgeBlendRegion, MaskShape, OutputColorCorrection, OutputDevice, Point2D,
-    Rect, Screen, ScreenId, Slice, SliceColorCorrection, SliceId, SliceInput, SliceMask,
-    SliceOutput, WarpInterpolation, WarpMesh, WarpPoint,
+    EdgeBlendConfig, EdgeBlendRegion, MaskShape, OutputColorCorrection, OutputDevice, OutputManager,
+    Point2D, Rect, Screen, ScreenId, ScreenRuntime, Slice, SliceColorCorrection, SliceId,
+    SliceInput, SliceMask, SliceOutput, SliceParams, SliceRuntime, WarpInterpolation, WarpMesh,
+    WarpPoint,
 };
 

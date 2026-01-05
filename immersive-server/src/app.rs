@@ -9,7 +9,7 @@
 //! Video decoding runs on a background thread at the video's native frame rate; the
 //! main thread picks up decoded frames for GPU upload without blocking.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 use winit::dpi::PhysicalSize;
@@ -225,6 +225,10 @@ pub struct App {
     /// Audio manager for FFT analysis of audio sources
     audio_manager: crate::audio::AudioManager,
 
+    // Advanced Output system
+    /// Output manager for multi-screen projection mapping
+    output_manager: Option<crate::output::OutputManager>,
+
     // REST API server
     /// Whether the API server is running
     api_server_running: bool,
@@ -240,6 +244,13 @@ pub struct App {
     frame_profiler: crate::telemetry::FrameProfiler,
     /// GPU profiler for render pass timing
     gpu_profiler: crate::telemetry::GpuProfiler,
+
+    // Frame pacing (GPU double-buffering)
+    /// Tracks submission indices of frames currently in flight to the GPU.
+    /// Used to prevent unbounded GPU queue growth and control latency vs stability tradeoff.
+    frames_in_flight: VecDeque<wgpu::SubmissionIndex>,
+    /// Last known low_latency_mode value, for detecting changes and reconfiguring surface.
+    last_low_latency_mode: bool,
 }
 
 impl App {
@@ -315,6 +326,12 @@ impl App {
 
         tracing::info!("Present mode: {:?}", present_mode);
 
+        // Configure frame latency based on low_latency_mode setting:
+        // - Low latency mode (true): 1 frame buffer, ~16ms less latency but may stutter
+        // - Smooth mode (false): 2 frame buffer, more stable pacing
+        let initial_low_latency_mode = settings.low_latency_mode;
+        let desired_frame_latency = if initial_low_latency_mode { 1 } else { 2 };
+
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
@@ -323,7 +340,7 @@ impl App {
             present_mode,
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
-            desired_maximum_frame_latency: 1, // Minimize latency
+            desired_maximum_frame_latency: desired_frame_latency,
         };
 
         surface.configure(&device, &config);
@@ -414,6 +431,20 @@ impl App {
         let mut style = (*egui_ctx.style()).clone();
         style.visuals.window_shadow = egui::epaint::Shadow::NONE;
         egui_ctx.set_style(style);
+
+        // Add NotoSans font for better Unicode coverage (geometric shapes, braille, etc.)
+        let mut fonts = egui::FontDefinitions::default();
+        fonts.font_data.insert(
+            "NotoSans".to_owned(),
+            std::sync::Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/NotoSans-Regular.ttf"))),
+        );
+        // Add as fallback for proportional fonts
+        fonts.families.get_mut(&egui::FontFamily::Proportional).unwrap()
+            .insert(1, "NotoSans".to_owned());
+        // Add as fallback for monospace fonts
+        fonts.families.get_mut(&egui::FontFamily::Monospace).unwrap()
+            .insert(1, "NotoSans".to_owned());
+        egui_ctx.set_fonts(fonts);
 
         let egui_state = egui_winit::State::new(
             egui_ctx.clone(),
@@ -593,6 +624,9 @@ impl App {
                 manager
             },
 
+            // Advanced Output system
+            output_manager: None, // Initialized lazily when screens are added
+
             // API server
             api_server_running: false,
             api_shared_state: None,
@@ -602,6 +636,10 @@ impl App {
             // Performance profiling
             frame_profiler: crate::telemetry::FrameProfiler::new(),
             gpu_profiler,
+
+            // Frame pacing (GPU double-buffering)
+            frames_in_flight: VecDeque::with_capacity(3),
+            last_low_latency_mode: initial_low_latency_mode,
         }
     }
 
@@ -1133,12 +1171,34 @@ impl App {
         self.update_layer_params_for_environment();
     }
 
-    /// Sync layers and effects from environment to settings (for saving)
+    /// Sync low_latency_mode setting - reconfigures surface if changed
+    fn sync_low_latency_mode(&mut self) {
+        if self.settings.low_latency_mode != self.last_low_latency_mode {
+            self.last_low_latency_mode = self.settings.low_latency_mode;
+
+            // Update surface configuration for new frame latency
+            let desired_frame_latency = if self.settings.low_latency_mode { 1 } else { 2 };
+            self.config.desired_maximum_frame_latency = desired_frame_latency;
+            self.surface.configure(&self.device, &self.config);
+
+            tracing::info!(
+                "Low latency mode {}: frame latency set to {}",
+                if self.settings.low_latency_mode { "enabled" } else { "disabled" },
+                desired_frame_latency
+            );
+        }
+    }
+
+    /// Sync layers, effects, and screens from environment to settings (for saving)
     pub fn sync_layers_to_settings(&mut self) {
         let layers: Vec<_> = self.environment.layers().to_vec();
         self.settings.set_layers(&layers);
         // Also sync environment effects
         self.settings.effects = self.environment.effects().clone();
+        // Also sync screens from output manager
+        if let Some(manager) = &self.output_manager {
+            self.settings.screens = manager.export_screens();
+        }
     }
 
     /// Restore layers from settings (after loading)
@@ -1218,8 +1278,57 @@ impl App {
         }
     }
 
+    /// Sync output manager from settings (after loading)
+    pub fn sync_output_manager_from_settings(&mut self) {
+        if self.settings.screens.is_empty() {
+            // No screens configured, don't initialize output manager
+            return;
+        }
+
+        // Create output manager from settings screens
+        let format = self.config.format;
+        let mut manager =
+            crate::output::OutputManager::from_screens(self.settings.screens.clone(), format);
+
+        // Initialize GPU runtimes
+        manager.init_runtimes(&self.device);
+
+        self.output_manager = Some(manager);
+        tracing::info!(
+            "Output manager initialized with {} screens",
+            self.settings.screens.len()
+        );
+    }
+
+    /// Get a reference to the output manager (if initialized)
+    pub fn output_manager(&self) -> Option<&crate::output::OutputManager> {
+        self.output_manager.as_ref()
+    }
+
+    /// Get a mutable reference to the output manager (if initialized)
+    pub fn output_manager_mut(&mut self) -> Option<&mut crate::output::OutputManager> {
+        self.output_manager.as_mut()
+    }
+
+    /// Ensure output manager exists and return a mutable reference
+    pub fn ensure_output_manager(&mut self) -> &mut crate::output::OutputManager {
+        if self.output_manager.is_none() {
+            let format = self.config.format;
+            self.output_manager = Some(crate::output::OutputManager::new(format));
+        }
+        self.output_manager.as_mut().unwrap()
+    }
+
     /// Render a frame with egui UI
     pub fn render(&mut self) -> Result<bool, wgpu::SurfaceError> {
+        // Apply low latency mode changes BEFORE acquiring surface texture.
+        // Surface must be reconfigured before get_current_texture() is called.
+        self.sync_low_latency_mode();
+
+        // Acquire surface texture early - allows GPU to prepare it while CPU does other work.
+        // This overlaps GPU surface preparation with CPU work (egui building, video polling).
+        let output = self.surface.get_current_texture()?;
+
         // Update effect manager timing (BPM clock, frame time)
         self.effect_manager.update();
 
@@ -2714,8 +2823,7 @@ impl App {
             &screen_descriptor,
         );
 
-        // Present Environment to the window surface
-        let output = self.surface.get_current_texture()?;
+        // Present Environment to the window surface (output was acquired early in render())
         let surface_view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -2755,7 +2863,22 @@ impl App {
             self.egui_renderer.free_texture(id);
         }
 
-        self.queue.submit(std::iter::once(encoder.finish()));
+        // Submit GPU work and track the submission for frame pacing
+        let submission_index = self.queue.submit(std::iter::once(encoder.finish()));
+        self.frames_in_flight.push_back(submission_index);
+
+        // Determine max frames in flight based on low latency mode setting
+        // Low latency: 1 frame (~16ms less latency, may stutter under load)
+        // Smooth mode: 2 frames (more stable, but ~16ms more latency)
+        let max_in_flight = if self.settings.low_latency_mode { 1 } else { 2 };
+
+        // Wait for oldest frame if exceeding max (prevents unbounded GPU queue growth)
+        while self.frames_in_flight.len() > max_in_flight {
+            if let Some(oldest) = self.frames_in_flight.pop_front() {
+                self.device.poll(wgpu::Maintain::WaitForSubmissionIndex(oldest));
+            }
+        }
+
         output.present();
 
         // Process OMT capture pipeline (non-blocking)
@@ -3359,19 +3482,25 @@ impl App {
     }
 
     /// Update all layer videos - pick up decoded frames (non-blocking)
-    /// 
-    /// Uploads ALL available frames each update cycle.
-    /// The previous rate limiting (1 upload/frame) was too aggressive and caused video starvation.
+    ///
+    /// Rate-limits texture uploads to MAX_UPLOADS_PER_FRAME to prevent GPU bandwidth spikes.
+    /// Uses round-robin ordering to ensure fair distribution across layers.
     pub fn update_videos(&mut self) {
+        // Limit texture uploads per frame to prevent bandwidth spikes.
+        // With 16 layers triggering simultaneously, uploads complete over multiple frames
+        // instead of causing a single-frame spike.
+        const MAX_UPLOADS_PER_FRAME: usize = 4;
+        let mut uploads_this_frame = 0;
+
         // Collect layer IDs for round-robin iteration
         let mut layer_ids: Vec<u32> = self.layer_runtimes.keys().copied().collect();
         layer_ids.sort(); // Ensure consistent ordering
-        
+
         // Find starting position in round-robin order
         let start_idx = layer_ids.iter()
             .position(|&id| id > self.last_upload_layer)
             .unwrap_or(0);
-        
+
         // Collect layers that have completed fade-out (need to be cleared after iteration)
         let mut fade_out_complete: Vec<u32> = Vec::new();
 
@@ -3379,7 +3508,7 @@ impl App {
         for i in 0..layer_ids.len() {
             let idx = (start_idx + i) % layer_ids.len();
             let layer_id = layer_ids[idx];
-            
+
             if let Some(runtime) = self.layer_runtimes.get_mut(&layer_id) {
                 // Check if transition is complete
                 if runtime.transition_active && runtime.is_transition_complete() {
@@ -3390,10 +3519,13 @@ impl App {
                 if runtime.is_fade_out_complete() {
                     fade_out_complete.push(layer_id);
                 }
-                
-                // Upload all available frames - no rate limiting
-                if runtime.try_update_texture(&self.queue) {
-                    self.last_upload_layer = layer_id;
+
+                // Rate-limited texture upload
+                if uploads_this_frame < MAX_UPLOADS_PER_FRAME {
+                    if runtime.try_update_texture(&self.queue) {
+                        self.last_upload_layer = layer_id;
+                        uploads_this_frame += 1;
+                    }
                 }
             }
         }
@@ -3411,12 +3543,17 @@ impl App {
             tracing::info!("⏹️ Fade-out complete, stopped clip on layer {}", layer_id);
         }
         
-        // Update pending runtimes - these get priority since user is waiting
+        // Update pending runtimes - these get priority since user is waiting for first frame
+        // Still count toward upload limit to prevent bandwidth spikes
         for runtime in self.pending_runtimes.values_mut() {
-            let _ = runtime.try_update_texture(&self.queue);
+            if uploads_this_frame < MAX_UPLOADS_PER_FRAME {
+                if runtime.try_update_texture(&self.queue) {
+                    uploads_this_frame += 1;
+                }
+            }
         }
 
-        // Update preview player
+        // Preview player always gets one upload (not counted toward limit)
         self.preview_player.update(&self.queue);
 
         // Swap pending runtimes into active once they have a frame
@@ -5582,6 +5719,10 @@ impl App {
             }
             PropertiesAction::SetFloorLayerIndex { index } => {
                 self.settings.floor_layer_index = index;
+            }
+            PropertiesAction::SetLowLatencyMode { enabled } => {
+                self.settings.low_latency_mode = enabled;
+                // Note: sync_low_latency_mode() will reconfigure the surface on next render
             }
             PropertiesAction::StartScrub { layer_id } => {
                 // Store whether the video was playing before scrubbing
