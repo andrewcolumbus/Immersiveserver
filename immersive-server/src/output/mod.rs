@@ -12,7 +12,7 @@ mod edge_blend;
 mod mask;
 pub mod runtime;
 mod screen;
-mod slice;
+pub mod slice;
 mod warp;
 
 pub use color::{OutputColorCorrection, SliceColorCorrection};
