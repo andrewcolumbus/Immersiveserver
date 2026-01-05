@@ -459,7 +459,7 @@ The data model and shader foundations are already complete:
 
 ---
 
-## PR 16: Slice Color Correction Shader + UI
+## PR 16: Slice Color Correction Shader + UI ✅ COMPLETE
 
 **Goal:** Complete slice-level color correction with saturation and add UI controls.
 
@@ -635,13 +635,13 @@ ui.collapsing("RGB Channels", |ui| {
 | `src/ui/advanced_output_window.rs` | Add Color section to slice properties |
 
 ### Verification
-- [ ] Brightness slider adjusts slice brightness (-1 to +1)
-- [ ] Contrast slider adjusts slice contrast (0 to 2)
-- [ ] Gamma slider adjusts slice gamma curve (0.1 to 4)
-- [ ] RGB sliders adjust individual channels (0 to 2)
-- [ ] Opacity slider adjusts slice transparency (0 to 1)
-- [ ] Reset button returns all values to defaults
-- [ ] Settings persist in .immersive files
+- [x] Brightness slider adjusts slice brightness (-1 to +1)
+- [x] Contrast slider adjusts slice contrast (0 to 2)
+- [x] Gamma slider adjusts slice gamma curve (0.1 to 4)
+- [x] RGB sliders adjust individual channels (0 to 2)
+- [x] Opacity slider adjusts slice transparency (0 to 1)
+- [x] Reset button returns all values to defaults
+- [x] Settings persist in .immersive files (uses existing serde serialization)
 
 ---
 

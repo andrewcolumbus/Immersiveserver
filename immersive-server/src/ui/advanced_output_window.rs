@@ -1546,6 +1546,82 @@ impl AdvancedOutputWindow {
         ui.separator();
         ui.add_space(4.0);
 
+        // Color Correction section
+        ui.horizontal(|ui| {
+            ui.label("Color");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("Reset").on_hover_text("Reset color to defaults").clicked() {
+                    slice_copy.color = crate::output::SliceColorCorrection::default();
+                    changed = true;
+                }
+            });
+        });
+        ui.add_space(4.0);
+
+        // Opacity slider (most commonly used)
+        ui.horizontal(|ui| {
+            ui.label("Opacity:");
+            if ui.add(egui::Slider::new(&mut slice_copy.color.opacity, 0.0..=1.0).max_decimals(2)).changed() {
+                changed = true;
+            }
+        });
+
+        // Brightness slider
+        ui.horizontal(|ui| {
+            ui.label("Brightness:");
+            if ui.add(egui::Slider::new(&mut slice_copy.color.brightness, -1.0..=1.0).max_decimals(2)).changed() {
+                changed = true;
+            }
+        });
+
+        // Contrast slider
+        ui.horizontal(|ui| {
+            ui.label("Contrast:");
+            if ui.add(egui::Slider::new(&mut slice_copy.color.contrast, 0.0..=2.0).max_decimals(2)).changed() {
+                changed = true;
+            }
+        });
+
+        // Gamma slider
+        ui.horizontal(|ui| {
+            ui.label("Gamma:");
+            if ui.add(egui::Slider::new(&mut slice_copy.color.gamma, 0.1..=4.0).logarithmic(true).max_decimals(2)).changed() {
+                changed = true;
+            }
+        });
+
+        // RGB Channels (collapsing section for less common adjustments)
+        ui.collapsing("RGB Channels", |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Red:");
+                if ui.add(egui::Slider::new(&mut slice_copy.color.red, 0.0..=2.0).max_decimals(2)).changed() {
+                    changed = true;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Green:");
+                if ui.add(egui::Slider::new(&mut slice_copy.color.green, 0.0..=2.0).max_decimals(2)).changed() {
+                    changed = true;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Blue:");
+                if ui.add(egui::Slider::new(&mut slice_copy.color.blue, 0.0..=2.0).max_decimals(2)).changed() {
+                    changed = true;
+                }
+            });
+        });
+
+        // Show indicator if any color correction is applied
+        if !slice_copy.color.is_identity() {
+            ui.add_space(2.0);
+            ui.colored_label(egui::Color32::GREEN, "(color modified)");
+        }
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(4.0);
+
         // Enabled toggle
         let mut enabled = slice_copy.enabled;
         if ui.checkbox(&mut enabled, "Enabled").changed() {

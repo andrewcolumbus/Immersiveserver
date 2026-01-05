@@ -138,7 +138,74 @@ fn apply_mesh_warp(uv: vec2<f32>) -> vec2<f32> {
     return mix(top, bottom, local.y);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Color Correction Functions
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Convert RGB to HSL color space
+// Returns vec3(hue, saturation, lightness) where h is 0-1
+fn rgb_to_hsl(rgb: vec3<f32>) -> vec3<f32> {
+    let max_c = max(max(rgb.r, rgb.g), rgb.b);
+    let min_c = min(min(rgb.r, rgb.g), rgb.b);
+    let delta = max_c - min_c;
+
+    let l = (max_c + min_c) * 0.5;
+
+    var h = 0.0;
+    var s = 0.0;
+
+    if (delta > 0.0001) {
+        s = delta / (1.0 - abs(2.0 * l - 1.0));
+
+        if (max_c == rgb.r) {
+            h = ((rgb.g - rgb.b) / delta) % 6.0;
+        } else if (max_c == rgb.g) {
+            h = (rgb.b - rgb.r) / delta + 2.0;
+        } else {
+            h = (rgb.r - rgb.g) / delta + 4.0;
+        }
+        h = h / 6.0;
+        if (h < 0.0) {
+            h = h + 1.0;
+        }
+    }
+
+    return vec3<f32>(h, s, l);
+}
+
+// Convert HSL to RGB color space
+// Takes vec3(hue, saturation, lightness) where h is 0-1
+fn hsl_to_rgb(hsl: vec3<f32>) -> vec3<f32> {
+    let h = hsl.x;
+    let s = hsl.y;
+    let l = hsl.z;
+
+    let c = (1.0 - abs(2.0 * l - 1.0)) * s;
+    let x = c * (1.0 - abs((h * 6.0) % 2.0 - 1.0));
+    let m = l - c * 0.5;
+
+    var rgb = vec3<f32>(0.0);
+
+    let h6 = h * 6.0;
+    if (h6 < 1.0) {
+        rgb = vec3<f32>(c, x, 0.0);
+    } else if (h6 < 2.0) {
+        rgb = vec3<f32>(x, c, 0.0);
+    } else if (h6 < 3.0) {
+        rgb = vec3<f32>(0.0, c, x);
+    } else if (h6 < 4.0) {
+        rgb = vec3<f32>(0.0, x, c);
+    } else if (h6 < 5.0) {
+        rgb = vec3<f32>(x, 0.0, c);
+    } else {
+        rgb = vec3<f32>(c, 0.0, x);
+    }
+
+    return rgb + vec3<f32>(m);
+}
+
 // Apply color correction to a color
+// Supports brightness, contrast, gamma, saturation, and RGB channel multipliers
 fn apply_color_correction(color: vec3<f32>, params: SliceParams) -> vec3<f32> {
     var c = color;
 
@@ -146,6 +213,7 @@ fn apply_color_correction(color: vec3<f32>, params: SliceParams) -> vec3<f32> {
     let brightness = params.color_adjust.x;  // -1.0 to 1.0
     let contrast = params.color_adjust.y;    // 0.0 to 2.0
     let gamma = params.color_adjust.z;       // 0.1 to 4.0
+    let saturation = params.color_adjust.w;  // 0.0 to 2.0
 
     // Apply brightness (add)
     c = c + vec3<f32>(brightness);
@@ -155,6 +223,13 @@ fn apply_color_correction(color: vec3<f32>, params: SliceParams) -> vec3<f32> {
 
     // Apply gamma
     c = pow(max(c, vec3<f32>(0.0)), vec3<f32>(1.0 / gamma));
+
+    // Apply saturation via HSL conversion (only if not identity)
+    if (abs(saturation - 1.0) > 0.001) {
+        let hsl = rgb_to_hsl(clamp(c, vec3<f32>(0.0), vec3<f32>(1.0)));
+        let adjusted_hsl = vec3<f32>(hsl.x, hsl.y * saturation, hsl.z);
+        c = hsl_to_rgb(adjusted_hsl);
+    }
 
     // Apply RGB channel multipliers
     c = c * params.color_rgb.xyz;
