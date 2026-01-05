@@ -422,29 +422,480 @@ fn apply_edge_blend(color: vec3<f32>, uv: vec2<f32>, blend: EdgeBlendUniforms) -
 
 ### Phase 16: Per-Output Color Correction
 
-**Goal:** Match projector brightness, contrast, and color characteristics.
+## Status: 🔵 READY TO IMPLEMENT
 
-- [ ] Add color correction uniforms to slice shader
-- [ ] Add color correction to screen composite shader
-- [ ] Create color correction UI panel (per-slice and per-screen)
-- [ ] Add brightness slider (-100% to +100%)
-- [ ] Add contrast slider (0.0 to 2.0)
-- [ ] Add gamma slider (0.1 to 4.0)
-- [ ] Add RGB channel sliders (0.0 to 2.0)
-- [ ] Add saturation slider (0.0 = grayscale, 2.0 = oversaturated)
-- [ ] Add "Reset to default" button
-- [ ] Support multi-select to adjust multiple slices together
+**Goal:** Match projector brightness, contrast, and color characteristics across multiple projectors.
 
-**Verification Checklist:**
-- [ ] Brightness adjustment works (-100% = black, +100% = white)
-- [ ] Contrast adjustment works (0 = flat gray, 2 = high contrast)
-- [ ] Gamma curve applies correctly (visible on gradients)
-- [ ] RGB channels can be adjusted independently
-- [ ] Saturation works (0 = grayscale, 1 = normal)
-- [ ] Per-slice correction applies before per-screen
-- [ ] Multi-select adjusts all selected slices together
-- [ ] Reset button restores default values
+---
+
+## Overview
+
+Color correction enables matching visual output across different projectors/displays:
+- **Per-Slice Color Correction** - Adjust individual slices before compositing
+- **Per-Screen Color Correction** - Apply global adjustment to entire screen output
+- **Real-time Preview** - See adjustments immediately in Advanced Output window
+
+### Existing Infrastructure
+
+The data model and shader foundations are already complete:
+
+**Data Models (complete):**
+- `SliceColorCorrection` in `color.rs` - brightness, contrast, gamma, RGB, opacity
+- `OutputColorCorrection` in `color.rs` - brightness, contrast, gamma, RGB, saturation
+- `Slice.color` field exists
+- `Screen.color` field exists
+
+**Shader Support (partially complete):**
+- `SliceParams` has `color_adjust` and `color_rgb` fields ✅
+- `apply_color_correction()` in slice_render.wgsl - missing saturation ⚠️
+- `apply_screen_color_correction()` in screen_composite.wgsl - full implementation ✅
+- Screen composite pass not wired into render pipeline ❌
+
+**What's Missing:**
+1. Saturation in slice shader's `apply_color_correction()`
+2. Screen-level color correction pass in render pipeline
+3. UI controls for slice color correction
+4. UI controls for screen color correction
+
+---
+
+## PR 16: Slice Color Correction Shader + UI
+
+**Goal:** Complete slice-level color correction with saturation and add UI controls.
+
+### Shader Changes
+
+Update `src/shaders/output/slice_render.wgsl` to add saturation:
+
+```wgsl
+// Convert RGB to HSL (for saturation adjustment)
+fn rgb_to_hsl(rgb: vec3<f32>) -> vec3<f32> {
+    let max_c = max(max(rgb.r, rgb.g), rgb.b);
+    let min_c = min(min(rgb.r, rgb.g), rgb.b);
+    let delta = max_c - min_c;
+    let l = (max_c + min_c) * 0.5;
+    var h = 0.0;
+    var s = 0.0;
+    if (delta > 0.0001) {
+        s = delta / (1.0 - abs(2.0 * l - 1.0));
+        if (max_c == rgb.r) {
+            h = ((rgb.g - rgb.b) / delta) % 6.0;
+        } else if (max_c == rgb.g) {
+            h = (rgb.b - rgb.r) / delta + 2.0;
+        } else {
+            h = (rgb.r - rgb.g) / delta + 4.0;
+        }
+        h = h / 6.0;
+        if (h < 0.0) { h = h + 1.0; }
+    }
+    return vec3<f32>(h, s, l);
+}
+
+// Convert HSL to RGB
+fn hsl_to_rgb(hsl: vec3<f32>) -> vec3<f32> {
+    let c = (1.0 - abs(2.0 * hsl.z - 1.0)) * hsl.y;
+    let x = c * (1.0 - abs((hsl.x * 6.0) % 2.0 - 1.0));
+    let m = hsl.z - c * 0.5;
+    var rgb = vec3<f32>(0.0);
+    let h6 = hsl.x * 6.0;
+    if (h6 < 1.0) { rgb = vec3<f32>(c, x, 0.0); }
+    else if (h6 < 2.0) { rgb = vec3<f32>(x, c, 0.0); }
+    else if (h6 < 3.0) { rgb = vec3<f32>(0.0, c, x); }
+    else if (h6 < 4.0) { rgb = vec3<f32>(0.0, x, c); }
+    else if (h6 < 5.0) { rgb = vec3<f32>(x, 0.0, c); }
+    else { rgb = vec3<f32>(c, 0.0, x); }
+    return rgb + vec3<f32>(m);
+}
+
+// Updated apply_color_correction with saturation
+fn apply_color_correction(color: vec3<f32>, params: SliceParams) -> vec3<f32> {
+    var c = color;
+    let brightness = params.color_adjust.x;
+    let contrast = params.color_adjust.y;
+    let gamma = params.color_adjust.z;
+    let saturation = params.color_adjust.w;  // NEW: use saturation
+
+    c = c + vec3<f32>(brightness);
+    c = (c - 0.5) * contrast + 0.5;
+    c = pow(max(c, vec3<f32>(0.0)), vec3<f32>(1.0 / gamma));
+
+    // NEW: Apply saturation via HSL
+    if (abs(saturation - 1.0) > 0.001) {
+        let hsl = rgb_to_hsl(clamp(c, vec3<f32>(0.0), vec3<f32>(1.0)));
+        c = hsl_to_rgb(vec3<f32>(hsl.x, hsl.y * saturation, hsl.z));
+    }
+
+    c = c * params.color_rgb.xyz;
+    return clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
+}
+```
+
+### Runtime Changes
+
+Update `src/output/runtime.rs` - `SliceParams::from_slice()`:
+
+```rust
+// Change line 220 (currently hardcoded to 1.0):
+color_adjust: [
+    slice.color.brightness,
+    slice.color.contrast,
+    slice.color.gamma,
+    1.0, // saturation placeholder  <-- CHANGE TO:
+    // slice.color.saturation (need to add field to SliceColorCorrection)
+],
+```
+
+Note: `SliceColorCorrection` doesn't have saturation field - need to either:
+- Add saturation field to `SliceColorCorrection`, OR
+- Use a simpler approach: skip saturation for per-slice (only per-screen)
+
+**Recommendation:** Skip saturation for per-slice to keep it simple. Saturation is more useful at screen level for projector matching.
+
+### UI Changes
+
+Add "Color" section to slice properties in `src/ui/advanced_output_window.rs`:
+
+```rust
+// Color Correction section (after Mask section)
+ui.add_space(8.0);
+ui.separator();
+ui.add_space(4.0);
+
+ui.horizontal(|ui| {
+    ui.label("Color");
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        if ui.small_button("Reset").clicked() {
+            slice_copy.color = SliceColorCorrection::default();
+            changed = true;
+        }
+    });
+});
+ui.add_space(4.0);
+
+// Opacity slider
+ui.horizontal(|ui| {
+    ui.label("Opacity:");
+    if ui.add(egui::Slider::new(&mut slice_copy.color.opacity, 0.0..=1.0)).changed() {
+        changed = true;
+    }
+});
+
+// Brightness slider
+ui.horizontal(|ui| {
+    ui.label("Brightness:");
+    if ui.add(egui::Slider::new(&mut slice_copy.color.brightness, -1.0..=1.0)).changed() {
+        changed = true;
+    }
+});
+
+// Contrast slider
+ui.horizontal(|ui| {
+    ui.label("Contrast:");
+    if ui.add(egui::Slider::new(&mut slice_copy.color.contrast, 0.0..=2.0)).changed() {
+        changed = true;
+    }
+});
+
+// Gamma slider
+ui.horizontal(|ui| {
+    ui.label("Gamma:");
+    if ui.add(egui::Slider::new(&mut slice_copy.color.gamma, 0.1..=4.0).logarithmic(true)).changed() {
+        changed = true;
+    }
+});
+
+// RGB collapsing section
+ui.collapsing("RGB Channels", |ui| {
+    ui.horizontal(|ui| {
+        ui.label("Red:");
+        if ui.add(egui::Slider::new(&mut slice_copy.color.red, 0.0..=2.0)).changed() {
+            changed = true;
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label("Green:");
+        if ui.add(egui::Slider::new(&mut slice_copy.color.green, 0.0..=2.0)).changed() {
+            changed = true;
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label("Blue:");
+        if ui.add(egui::Slider::new(&mut slice_copy.color.blue, 0.0..=2.0)).changed() {
+            changed = true;
+        }
+    });
+});
+```
+
+### Files to Modify
+
+| File | Change |
+|------|--------|
+| `src/shaders/output/slice_render.wgsl` | Add HSL functions, update apply_color_correction() |
+| `src/ui/advanced_output_window.rs` | Add Color section to slice properties |
+
+### Verification
+- [ ] Brightness slider adjusts slice brightness (-1 to +1)
+- [ ] Contrast slider adjusts slice contrast (0 to 2)
+- [ ] Gamma slider adjusts slice gamma curve (0.1 to 4)
+- [ ] RGB sliders adjust individual channels (0 to 2)
+- [ ] Opacity slider adjusts slice transparency (0 to 1)
+- [ ] Reset button returns all values to defaults
 - [ ] Settings persist in .immersive files
+
+---
+
+## PR 17: Screen Color Correction Pass
+
+**Goal:** Wire screen-level color correction through render pipeline.
+
+### Approach
+
+Currently `render_screen()` renders slices directly to the screen output texture. To apply screen color correction, we need a two-pass approach:
+
+1. **Pass 1:** Render all slices to an intermediate texture
+2. **Pass 2:** Apply screen color correction from intermediate to final output
+
+However, for simplicity, we can modify the existing approach:
+- Render slices to output texture (current behavior)
+- Add a second pass that reads from output, applies color, writes back
+
+**Optimization:** Only run color correction pass if screen color is non-identity.
+
+### Runtime Changes
+
+Add to `OutputManager`:
+
+```rust
+// New fields
+screen_color_pipeline: Option<wgpu::RenderPipeline>,
+screen_params_buffer: Option<wgpu::Buffer>,
+screen_color_bind_group_layout: Option<wgpu::BindGroupLayout>,
+
+// Add method to create screen color pipeline
+fn create_screen_color_pipeline(&mut self, device: &wgpu::Device) {
+    // Load screen_composite.wgsl shader
+    // Create pipeline with bind group layout for texture + sampler + params
+}
+
+// Add method to apply screen color correction
+pub fn apply_screen_color(
+    &mut self,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    encoder: &mut wgpu::CommandEncoder,
+    screen_id: ScreenId,
+) {
+    let Some(screen) = self.screens.get(&screen_id) else { return; };
+
+    // Skip if color is identity
+    if screen.color.is_identity() {
+        return;
+    }
+
+    // Update screen params buffer
+    let screen_params = ScreenParams::from_color(&screen.color);
+    queue.write_buffer(&self.screen_params_buffer, 0, bytemuck::bytes_of(&screen_params));
+
+    // Create temporary texture to hold current output
+    // Render color correction pass from temp to output
+}
+```
+
+**Alternative (Simpler):** Use ping-pong textures
+- ScreenRuntime gets a second texture `color_corrected_texture`
+- After slice rendering, if color != identity, render color pass
+
+### ScreenParams Update
+
+Add helper to create `ScreenParams` from `OutputColorCorrection`:
+
+```rust
+impl ScreenParams {
+    pub fn from_color(color: &OutputColorCorrection) -> Self {
+        Self {
+            color_adjust: [color.brightness, color.contrast, color.gamma, color.saturation],
+            color_rgb: [color.red, color.green, color.blue, 0.0],
+        }
+    }
+}
+```
+
+### Files to Modify
+
+| File | Change |
+|------|--------|
+| `src/output/runtime.rs` | Add screen color pipeline, ScreenParams::from_color() |
+| `src/app.rs` | Call apply_screen_color() after render_screen() |
+
+### Verification
+- [ ] Screen with identity color: no extra GPU work
+- [ ] Screen brightness adjustment affects all slices
+- [ ] Screen contrast adjustment works
+- [ ] Screen gamma adjustment works
+- [ ] Screen saturation adjustment works (HSL conversion)
+- [ ] Screen RGB channel adjustment works
+- [ ] Color correction is visibly applied in preview
+
+---
+
+## PR 18: Screen Color Correction UI
+
+**Goal:** Add UI controls for per-screen color correction.
+
+### UI Changes
+
+Add "Screen Color" section to screen properties panel (after screen resolution):
+
+```rust
+// Screen Color Correction section
+ui.add_space(8.0);
+ui.collapsing("Color Correction", |ui| {
+    let color = &mut screen.color;
+    let mut changed = false;
+
+    // Brightness
+    ui.horizontal(|ui| {
+        ui.label("Brightness:");
+        if ui.add(egui::Slider::new(&mut color.brightness, -1.0..=1.0)).changed() {
+            changed = true;
+        }
+    });
+
+    // Contrast
+    ui.horizontal(|ui| {
+        ui.label("Contrast:");
+        if ui.add(egui::Slider::new(&mut color.contrast, 0.0..=2.0)).changed() {
+            changed = true;
+        }
+    });
+
+    // Gamma
+    ui.horizontal(|ui| {
+        ui.label("Gamma:");
+        if ui.add(egui::Slider::new(&mut color.gamma, 0.1..=4.0).logarithmic(true)).changed() {
+            changed = true;
+        }
+    });
+
+    // Saturation
+    ui.horizontal(|ui| {
+        ui.label("Saturation:");
+        if ui.add(egui::Slider::new(&mut color.saturation, 0.0..=2.0)).changed() {
+            changed = true;
+        }
+    });
+
+    // RGB Channels
+    ui.collapsing("RGB Channels", |ui| {
+        ui.horizontal(|ui| {
+            ui.label("Red:");
+            if ui.add(egui::Slider::new(&mut color.red, 0.0..=2.0)).changed() {
+                changed = true;
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Green:");
+            if ui.add(egui::Slider::new(&mut color.green, 0.0..=2.0)).changed() {
+                changed = true;
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Blue:");
+            if ui.add(egui::Slider::new(&mut color.blue, 0.0..=2.0)).changed() {
+                changed = true;
+            }
+        });
+    });
+
+    // Reset button
+    ui.horizontal(|ui| {
+        if ui.button("Reset to Default").clicked() {
+            *color = OutputColorCorrection::default();
+            changed = true;
+        }
+    });
+
+    if changed {
+        // Mark screen as needing update
+    }
+});
+```
+
+### Files to Modify
+
+| File | Change |
+|------|--------|
+| `src/ui/advanced_output_window.rs` | Add Color Correction section to screen properties |
+
+### Verification
+- [ ] Color Correction section appears for selected screen
+- [ ] All sliders adjust screen color in real-time
+- [ ] Saturation slider produces grayscale at 0, oversaturated at 2
+- [ ] RGB sliders allow individual channel adjustment
+- [ ] Reset button restores identity values
+- [ ] Settings persist in .immersive files
+
+---
+
+## Critical Files for Phase 16
+
+| File | Purpose |
+|------|---------|
+| `src/output/color.rs` | Color correction data models (already complete) |
+| `src/output/runtime.rs` | Add ScreenParams::from_color(), screen color pipeline |
+| `src/shaders/output/slice_render.wgsl` | Add HSL functions, saturation support |
+| `src/shaders/output/screen_composite.wgsl` | Already has full color correction (no changes) |
+| `src/ui/advanced_output_window.rs` | Add slice + screen color UI controls |
+| `src/app.rs` | Call screen color correction pass |
+
+---
+
+## Phase 16 Verification Checklist
+
+- [ ] **Slice Color Correction:**
+  - [ ] Brightness adjustment works (-1 = black, +1 = white)
+  - [ ] Contrast adjustment works (0 = flat, 2 = high contrast)
+  - [ ] Gamma curve applies correctly
+  - [ ] RGB channels adjustable independently
+  - [ ] Opacity slider works
+  - [ ] Reset button restores defaults
+
+- [ ] **Screen Color Correction:**
+  - [ ] Brightness affects entire screen output
+  - [ ] Contrast affects entire screen output
+  - [ ] Gamma affects entire screen output
+  - [ ] Saturation works (0 = grayscale, 1 = normal, 2 = oversaturated)
+  - [ ] RGB channels adjustable independently
+  - [ ] Reset button restores defaults
+
+- [ ] **Integration:**
+  - [ ] Per-slice correction applies before per-screen
+  - [ ] Identity color correction skips GPU work
+  - [ ] Settings persist in .immersive files
+  - [ ] Preview shows color correction in real-time
+
+---
+
+## Implementation Order
+
+1. **PR 16: Slice Color Shader + UI** (~1 hour)
+   - Add HSL conversion functions to slice shader
+   - Add saturation to apply_color_correction() (optional, can skip)
+   - Add Color section to slice properties UI
+   - Test slice color controls
+
+2. **PR 17: Screen Color Pipeline** (~1-2 hours)
+   - Add ScreenParams::from_color() helper
+   - Create screen color correction pipeline
+   - Wire into render_screen() as second pass
+   - Skip if color is identity
+
+3. **PR 18: Screen Color UI** (~30 min)
+   - Add Color Correction section to screen properties
+   - Add all sliders (brightness, contrast, gamma, saturation, RGB)
+   - Add Reset button
+   - Test end-to-end
 
 ---
 
