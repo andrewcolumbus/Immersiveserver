@@ -1316,11 +1316,20 @@ impl App {
         self.output_manager.as_mut()
     }
 
-    /// Ensure output manager exists and return a mutable reference
+    /// Ensure output manager exists with a default screen and return a mutable reference
     pub fn ensure_output_manager(&mut self) -> &mut crate::output::OutputManager {
         if self.output_manager.is_none() {
             let format = self.config.format;
-            self.output_manager = Some(crate::output::OutputManager::new(format));
+            let mut manager = crate::output::OutputManager::new(format);
+            // Always create a default screen
+            manager.add_screen(&self.device, "Screen 1");
+            self.output_manager = Some(manager);
+        }
+        // Ensure there's always at least one screen
+        if self.output_manager.as_ref().map(|m| m.screen_count()).unwrap_or(0) == 0 {
+            if let Some(manager) = self.output_manager.as_mut() {
+                manager.add_screen(&self.device, "Screen 1");
+            }
         }
         self.output_manager.as_mut().unwrap()
     }
@@ -5873,9 +5882,12 @@ impl App {
                 let _ = self.ensure_output_manager();
                 // Now get screen count before adding
                 let screen_num = self.output_manager.as_ref().map(|m| m.screen_count() + 1).unwrap_or(1);
+                let screen_name = format!("Screen {}", screen_num);
                 // Add screen (borrows device and manager separately)
                 if let Some(manager) = self.output_manager.as_mut() {
-                    let screen_id = manager.add_screen(&self.device, format!("Screen {}", screen_num));
+                    let screen_id = manager.add_screen(&self.device, &screen_name);
+                    // Auto-select the newly added screen
+                    self.advanced_output_window.select_screen(screen_id, &screen_name, 1920, 1080);
                     self.menu_bar.set_status(format!("Added Screen {}", screen_num));
                     tracing::info!("Added screen {:?}", screen_id);
                 }

@@ -31,6 +31,8 @@ pub struct Environment {
     next_layer_id: u32,
     /// Master effect stack (applied to entire composition)
     effects: EffectStack,
+    /// Whether test pattern mode is enabled (replaces all layer composition)
+    test_pattern_enabled: bool,
 }
 
 impl Environment {
@@ -55,6 +57,7 @@ impl Environment {
             layers: Vec::new(),
             next_layer_id: 1,
             effects: EffectStack::new(),
+            test_pattern_enabled: false,
         }
     }
 
@@ -221,6 +224,18 @@ impl Environment {
     /// Set the master effect stack.
     pub fn set_effects(&mut self, effects: EffectStack) {
         self.effects = effects;
+    }
+
+    // ========== Test Pattern ==========
+
+    /// Check if test pattern mode is enabled.
+    pub fn test_pattern_enabled(&self) -> bool {
+        self.test_pattern_enabled
+    }
+
+    /// Enable or disable test pattern mode.
+    pub fn set_test_pattern_enabled(&mut self, enabled: bool) {
+        self.test_pattern_enabled = enabled;
     }
 
     // ========== Private Helpers ==========

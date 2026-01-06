@@ -3,6 +3,7 @@
 //! A modal window for configuring multi-screen outputs with slice-based input selection.
 //! Accessible via View → Advanced Output.
 
+use crate::compositor::Viewport;
 use crate::output::{DisplayInfo, EdgeBlendConfig, MaskShape, OutputDevice, OutputManager, Point2D as MaskPoint2D, Screen, ScreenId, Slice, SliceId, SliceInput, SliceMask, WarpMesh};
 use crate::output::slice::{Point2D, Rect};
 
@@ -100,6 +101,12 @@ pub struct AdvancedOutputWindow {
     pub environment_texture_id: Option<egui::TextureId>,
     /// State for dragging input_rect handles in environment view
     input_rect_drag: InputRectDragState,
+    /// Viewport for environment preview (Screens tab) pan/zoom
+    env_viewport: Viewport,
+    /// Viewport for screen output preview (Output Transformation tab) pan/zoom
+    output_viewport: Viewport,
+    /// Track last frame time for viewport animation
+    last_viewport_update: std::time::Instant,
 }
 
 impl Default for AdvancedOutputWindow {
@@ -127,12 +134,24 @@ impl AdvancedOutputWindow {
             current_tab: AdvancedOutputTab::default(),
             environment_texture_id: None,
             input_rect_drag: InputRectDragState::default(),
+            env_viewport: Viewport::new(),
+            output_viewport: Viewport::new(),
+            last_viewport_update: std::time::Instant::now(),
         }
     }
 
     /// Get the currently selected screen ID (for texture registration in app.rs)
     pub fn selected_screen_id(&self) -> Option<ScreenId> {
         self.selected_screen
+    }
+
+    /// Select a screen and update temp fields with its values
+    pub fn select_screen(&mut self, screen_id: ScreenId, name: &str, width: u32, height: u32) {
+        self.selected_screen = Some(screen_id);
+        self.selected_slice = None;
+        self.temp_screen_name = name.to_string();
+        self.temp_width = width.to_string();
+        self.temp_height = height.to_string();
     }
 
     /// Toggle the window open/closed
@@ -187,6 +206,21 @@ impl AdvancedOutputWindow {
 
         if !self.open {
             return actions;
+        }
+
+        // Update viewport animations
+        let env_content_size = (env_dimensions.0 as f32, env_dimensions.1 as f32);
+        let output_content_size = output_manager
+            .and_then(|m| {
+                self.selected_screen
+                    .and_then(|id| m.screens().find(|s| s.id == id))
+                    .map(|s| (s.width as f32, s.height as f32))
+            });
+        self.update_viewports(env_content_size, output_content_size);
+
+        // Request repaint if viewports are animating
+        if self.viewports_need_update() {
+            ctx.request_repaint();
         }
 
         let mut open = self.open;
@@ -300,7 +334,13 @@ impl AdvancedOutputWindow {
                     if ui.small_button("+").clicked() {
                         actions.push(AdvancedOutputAction::AddScreen);
                     }
-                    if ui.add_enabled(self.selected_screen.is_some(), egui::Button::new("-").small()).clicked() {
+                    if ui
+                        .add_enabled(
+                            self.selected_screen.is_some() && screens.len() > 1,
+                            egui::Button::new("-").small(),
+                        )
+                        .clicked()
+                    {
                         if let Some(screen_id) = self.selected_screen {
                             actions.push(AdvancedOutputAction::RemoveScreen { screen_id });
                             self.selected_screen = None;
@@ -358,16 +398,42 @@ impl AdvancedOutputWindow {
 
             let (rect, response) = ui.allocate_exact_size(preview_size, egui::Sense::click_and_drag());
 
+            // Environment content size (16:9 - use 1920x1080 as reference)
+            let env_content_size = (1920.0_f32, 1080.0_f32);
+
+            // Handle viewport pan/zoom (right-click drag, scroll wheel)
+            self.handle_viewport_input(ui, &response, rect, preview_size, env_content_size, true);
+
             // Draw environment texture background
             ui.painter().rect_filled(rect, 4.0, egui::Color32::from_rgb(30, 30, 30));
 
             if let Some(tex_id) = self.environment_texture_id {
-                ui.painter().image(
-                    tex_id,
+                // Transform full environment (0,0)-(1,1) through viewport to get destination rect
+                let full_env_rect = Rect { x: 0.0, y: 0.0, width: 1.0, height: 1.0 };
+                let env_dest_rect = self.transform_rect_to_screen(
+                    &self.env_viewport,
+                    &full_env_rect,
                     rect,
-                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                    egui::Color32::WHITE,
+                    preview_size,
+                    env_content_size,
                 );
+
+                // Calculate intersection with preview rect (clip)
+                let visible_rect = env_dest_rect.intersect(rect);
+                if visible_rect.width() > 0.0 && visible_rect.height() > 0.0 {
+                    // Calculate UV coords for the visible portion
+                    let uv_left = (visible_rect.left() - env_dest_rect.left()) / env_dest_rect.width();
+                    let uv_top = (visible_rect.top() - env_dest_rect.top()) / env_dest_rect.height();
+                    let uv_right = (visible_rect.right() - env_dest_rect.left()) / env_dest_rect.width();
+                    let uv_bottom = (visible_rect.bottom() - env_dest_rect.top()) / env_dest_rect.height();
+
+                    let uv_rect = egui::Rect::from_min_max(
+                        egui::pos2(uv_left, uv_top),
+                        egui::pos2(uv_right, uv_bottom),
+                    );
+
+                    ui.painter().image(tex_id, visible_rect, uv_rect, egui::Color32::WHITE);
+                }
             } else {
                 // Show placeholder text if environment texture not yet registered
                 ui.painter().text(
@@ -379,18 +445,21 @@ impl AdvancedOutputWindow {
                 );
             }
 
-            // Draw input_rect rectangles for each screen
-            self.draw_screen_input_rects(ui, rect, preview_size, screens);
+            // Draw input_rect rectangles for each screen (with viewport transform)
+            self.draw_screen_input_rects(ui, rect, preview_size, screens, env_content_size);
 
             // Draw blend gradient overlays where screens overlap with blending enabled
-            self.draw_screen_blend_overlaps(ui, rect, preview_size, screens);
+            self.draw_screen_blend_overlaps(ui, rect, preview_size, screens, env_content_size);
 
             // Handle interactions (click to select, drag to edit)
-            self.handle_environment_interactions(ui, rect, preview_size, screens, actions, &response);
+            self.handle_environment_interactions(ui, rect, preview_size, screens, actions, &response, env_content_size);
 
-            // Show resolution info
+            // Show resolution info and zoom level
             ui.add_space(4.0);
-            ui.label(egui::RichText::new("Click screen to select, drag handles to resize").small().weak());
+            let zoom_percent = (self.env_viewport.zoom() * 100.0).round() as i32;
+            ui.label(egui::RichText::new(
+                format!("Zoom: {}% | Right-drag to pan, scroll to zoom", zoom_percent)
+            ).small().weak());
         });
     }
 
@@ -401,8 +470,13 @@ impl AdvancedOutputWindow {
         preview_rect: egui::Rect,
         preview_size: egui::Vec2,
         screens: &[&Screen],
+        content_size: (f32, f32),
     ) {
+        // Create a clipped painter that only draws within preview_rect
+        let painter = ui.painter().with_clip_rect(preview_rect);
+
         let outline_color = egui::Color32::from_rgb(100, 149, 237); // Cornflower blue
+        let zoom = self.env_viewport.zoom();
 
         for (index, screen) in screens.iter().enumerate() {
             // Get the input_rect for this screen (use first slice, or default to full)
@@ -410,17 +484,19 @@ impl AdvancedOutputWindow {
                 .map(|s| s.input_rect)
                 .unwrap_or_else(Rect::full);
 
-            // Convert normalized rect to screen coordinates
-            let screen_rect = egui::Rect::from_min_size(
-                preview_rect.min + egui::vec2(
-                    input_rect.x * preview_size.x,
-                    input_rect.y * preview_size.y,
-                ),
-                egui::vec2(
-                    input_rect.width * preview_size.x,
-                    input_rect.height * preview_size.y,
-                ),
+            // Convert normalized rect to screen coordinates using viewport transform
+            let screen_rect = self.transform_rect_to_screen(
+                &self.env_viewport,
+                &input_rect,
+                preview_rect,
+                preview_size,
+                content_size,
             );
+
+            // Skip if completely outside preview area
+            if !screen_rect.intersects(preview_rect) {
+                continue;
+            }
 
             let is_selected = self.selected_screen == Some(screen.id);
             let stroke_width = if is_selected { 3.0 } else { 2.0 };
@@ -429,44 +505,50 @@ impl AdvancedOutputWindow {
                 outline_color.r(), outline_color.g(), outline_color.b(), alpha
             );
 
-            // Draw rectangle outline
-            ui.painter().rect_stroke(
+            // Draw rectangle outline (clipped to preview)
+            painter.rect_stroke(
                 screen_rect,
                 2.0,
                 egui::Stroke::new(stroke_width, stroke_color),
                 egui::StrokeKind::Outside,
             );
 
-            // Draw screen number in center (circle with number)
-            let number_text = format!("{}", index + 1);
-            let font_id = egui::FontId::proportional(20.0);
+            // Draw screen number in center (circle with number) - scale with zoom
             let text_pos = screen_rect.center();
 
-            // Draw background circle
-            let circle_color = if is_selected {
-                egui::Color32::from_rgb(100, 149, 237)
-            } else {
-                egui::Color32::from_rgba_unmultiplied(100, 149, 237, 150)
-            };
-            ui.painter().circle_filled(text_pos, 14.0, circle_color);
-            ui.painter().text(
-                text_pos,
-                egui::Align2::CENTER_CENTER,
-                &number_text,
-                font_id,
-                egui::Color32::WHITE,
-            );
+            // Only draw label if center is within preview
+            if preview_rect.contains(text_pos) {
+                let number_text = format!("{}", index + 1);
+                let font_size = (20.0 * zoom).clamp(10.0, 40.0);
+                let font_id = egui::FontId::proportional(font_size);
+                let circle_radius = (14.0 * zoom).clamp(8.0, 28.0);
 
-            // Draw corner/edge handles for selected screen
+                // Draw background circle
+                let circle_color = if is_selected {
+                    egui::Color32::from_rgb(100, 149, 237)
+                } else {
+                    egui::Color32::from_rgba_unmultiplied(100, 149, 237, 150)
+                };
+                painter.circle_filled(text_pos, circle_radius, circle_color);
+                painter.text(
+                    text_pos,
+                    egui::Align2::CENTER_CENTER,
+                    &number_text,
+                    font_id,
+                    egui::Color32::WHITE,
+                );
+            }
+
+            // Draw corner/edge handles for selected screen (clipped)
             if is_selected {
-                self.draw_rect_handles(ui, screen_rect);
+                self.draw_rect_handles(&painter, screen_rect, preview_rect, zoom);
             }
         }
     }
 
     /// Draw corner and edge handles for the selected screen's input_rect
-    fn draw_rect_handles(&self, ui: &egui::Ui, rect: egui::Rect) {
-        let handle_radius = 8.0; // Larger handles for easier grabbing
+    fn draw_rect_handles(&self, ui: &egui::Ui, rect: egui::Rect, clip_rect: egui::Rect, zoom: f32) {
+        let handle_radius = (8.0 * zoom).clamp(4.0, 16.0);
         let handle_color = egui::Color32::WHITE;
         let handle_stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(100, 149, 237));
 
@@ -479,12 +561,14 @@ impl AdvancedOutputWindow {
         ];
 
         for pos in corners {
-            ui.painter().circle_filled(pos, handle_radius, handle_color);
-            ui.painter().circle_stroke(pos, handle_radius, handle_stroke);
+            if clip_rect.contains(pos) {
+                ui.painter().circle_filled(pos, handle_radius, handle_color);
+                ui.painter().circle_stroke(pos, handle_radius, handle_stroke);
+            }
         }
 
-        // Edge midpoint handles (slightly smaller)
-        let edge_handle_radius = 6.0;
+        // Edge midpoint handles (scale with zoom)
+        let edge_handle_radius = (6.0 * zoom).clamp(3.0, 12.0);
         let edges = [
             egui::pos2(rect.center().x, rect.top()),
             egui::pos2(rect.center().x, rect.bottom()),
@@ -493,8 +577,10 @@ impl AdvancedOutputWindow {
         ];
 
         for pos in edges {
-            ui.painter().circle_filled(pos, edge_handle_radius, handle_color);
-            ui.painter().circle_stroke(pos, edge_handle_radius, handle_stroke);
+            if clip_rect.contains(pos) {
+                ui.painter().circle_filled(pos, edge_handle_radius, handle_color);
+                ui.painter().circle_stroke(pos, edge_handle_radius, handle_stroke);
+            }
         }
     }
 
@@ -505,6 +591,7 @@ impl AdvancedOutputWindow {
         preview_rect: egui::Rect,
         preview_size: egui::Vec2,
         screens: &[&Screen],
+        content_size: (f32, f32),
     ) {
         // Get input_rects and edge blend configs for all screens
         let screen_data: Vec<_> = screens
@@ -533,17 +620,19 @@ impl AdvancedOutputWindow {
                     continue;
                 }
 
-                // Convert intersection to screen coordinates
-                let overlap_rect = egui::Rect::from_min_size(
-                    preview_rect.min + egui::vec2(
-                        intersection.x * preview_size.x,
-                        intersection.y * preview_size.y,
-                    ),
-                    egui::vec2(
-                        intersection.width * preview_size.x,
-                        intersection.height * preview_size.y,
-                    ),
+                // Convert intersection to screen coordinates using viewport transform
+                let overlap_rect = self.transform_rect_to_screen(
+                    &self.env_viewport,
+                    &intersection,
+                    preview_rect,
+                    preview_size,
+                    content_size,
                 );
+
+                // Skip if completely outside preview area
+                if !overlap_rect.intersects(preview_rect) {
+                    continue;
+                }
 
                 // Determine which blend edges are active between these screens
                 // Horizontal overlap: A's right meets B's left, or B's right meets A's left
@@ -726,23 +815,26 @@ impl AdvancedOutputWindow {
         screens: &[&Screen],
         actions: &mut Vec<AdvancedOutputAction>,
         response: &egui::Response,
+        content_size: (f32, f32),
     ) {
-        // Helper to find screen at position
-        let find_screen_at = |pos: egui::Pos2| -> Option<(ScreenId, Rect, egui::Rect)> {
+        // Skip left-click handling if right-click dragging (viewport pan takes priority)
+        if response.dragged_by(egui::PointerButton::Secondary) {
+            return;
+        }
+
+        // Helper to find screen at position (using viewport transform)
+        let find_screen_at = |this: &Self, pos: egui::Pos2| -> Option<(ScreenId, Rect, egui::Rect)> {
             for screen in screens.iter().rev() {
                 let input_rect = screen.slices.first()
                     .map(|s| s.input_rect)
                     .unwrap_or_else(Rect::full);
 
-                let screen_rect = egui::Rect::from_min_size(
-                    preview_rect.min + egui::vec2(
-                        input_rect.x * preview_size.x,
-                        input_rect.y * preview_size.y,
-                    ),
-                    egui::vec2(
-                        input_rect.width * preview_size.x,
-                        input_rect.height * preview_size.y,
-                    ),
+                let screen_rect = this.transform_rect_to_screen(
+                    &this.env_viewport,
+                    &input_rect,
+                    preview_rect,
+                    preview_size,
+                    content_size,
                 );
 
                 if screen_rect.contains(pos) {
@@ -777,15 +869,12 @@ impl AdvancedOutputWindow {
                             .map(|s| s.input_rect)
                             .unwrap_or_else(Rect::full);
 
-                        let screen_rect = egui::Rect::from_min_size(
-                            preview_rect.min + egui::vec2(
-                                input_rect.x * preview_size.x,
-                                input_rect.y * preview_size.y,
-                            ),
-                            egui::vec2(
-                                input_rect.width * preview_size.x,
-                                input_rect.height * preview_size.y,
-                            ),
+                        let screen_rect = self.transform_rect_to_screen(
+                            &self.env_viewport,
+                            &input_rect,
+                            preview_rect,
+                            preview_size,
+                            content_size,
                         );
 
                         if let Some(handle) = self.hit_test_rect_handle(pointer_pos, screen_rect) {
@@ -798,7 +887,7 @@ impl AdvancedOutputWindow {
 
             // Check hover over any screen (for potential selection)
             if !cursor_set {
-                if find_screen_at(pointer_pos).is_some() {
+                if find_screen_at(self, pointer_pos).is_some() {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                 }
             }
@@ -808,7 +897,7 @@ impl AdvancedOutputWindow {
         // Skip if we're in an active drag to prevent focus switch when dragging over other screens
         if response.clicked() && self.input_rect_drag.dragging_screen.is_none() {
             if let Some(pointer_pos) = response.interact_pointer_pos() {
-                if let Some((screen_id, _, _)) = find_screen_at(pointer_pos) {
+                if let Some((screen_id, _, _)) = find_screen_at(self, pointer_pos) {
                     self.selected_screen = Some(screen_id);
                     self.selected_slice = None;
                     if let Some(screen) = screens.iter().find(|s| s.id == screen_id) {
@@ -821,10 +910,11 @@ impl AdvancedOutputWindow {
         }
 
         // Handle drag start - also select the screen if clicking on one
-        if response.drag_started() {
+        // Only for left-click drags (primary button)
+        if response.drag_started_by(egui::PointerButton::Primary) {
             if let Some(pointer_pos) = response.interact_pointer_pos() {
                 // First, try to find a screen under the pointer
-                if let Some((screen_id, input_rect, screen_rect)) = find_screen_at(pointer_pos) {
+                if let Some((screen_id, input_rect, screen_rect)) = find_screen_at(self, pointer_pos) {
                     // Select this screen
                     self.selected_screen = Some(screen_id);
                     self.selected_slice = None;
@@ -836,9 +926,14 @@ impl AdvancedOutputWindow {
 
                     // Check if we're on a handle of this screen
                     if let Some(handle) = self.hit_test_rect_handle(pointer_pos, screen_rect) {
-                        // Store starting position (normalized)
-                        let start_norm_x = (pointer_pos.x - preview_rect.left()) / preview_size.x;
-                        let start_norm_y = (pointer_pos.y - preview_rect.top()) / preview_size.y;
+                        // Store starting position (normalized, using viewport inverse transform)
+                        let (start_norm_x, start_norm_y) = self.transform_point_from_screen(
+                            &self.env_viewport,
+                            pointer_pos,
+                            preview_rect,
+                            preview_size,
+                            content_size,
+                        );
 
                         self.input_rect_drag = InputRectDragState {
                             dragging_screen: Some(screen_id),
@@ -855,20 +950,22 @@ impl AdvancedOutputWindow {
                             .map(|s| s.input_rect)
                             .unwrap_or_else(Rect::full);
 
-                        let screen_rect = egui::Rect::from_min_size(
-                            preview_rect.min + egui::vec2(
-                                input_rect.x * preview_size.x,
-                                input_rect.y * preview_size.y,
-                            ),
-                            egui::vec2(
-                                input_rect.width * preview_size.x,
-                                input_rect.height * preview_size.y,
-                            ),
+                        let screen_rect = self.transform_rect_to_screen(
+                            &self.env_viewport,
+                            &input_rect,
+                            preview_rect,
+                            preview_size,
+                            content_size,
                         );
 
                         if let Some(handle) = self.hit_test_rect_handle(pointer_pos, screen_rect) {
-                            let start_norm_x = (pointer_pos.x - preview_rect.left()) / preview_size.x;
-                            let start_norm_y = (pointer_pos.y - preview_rect.top()) / preview_size.y;
+                            let (start_norm_x, start_norm_y) = self.transform_point_from_screen(
+                                &self.env_viewport,
+                                pointer_pos,
+                                preview_rect,
+                                preview_size,
+                                content_size,
+                            );
 
                             self.input_rect_drag = InputRectDragState {
                                 dragging_screen: Some(screen_id),
@@ -882,20 +979,21 @@ impl AdvancedOutputWindow {
             }
         }
 
-        // Handle drag
-        if response.dragged() {
+        // Handle drag (left-click only)
+        if response.dragged_by(egui::PointerButton::Primary) {
             if let Some(screen_id) = self.input_rect_drag.dragging_screen {
                 if let Some(handle) = self.input_rect_drag.dragging_handle {
                     if let Some(original_rect) = self.input_rect_drag.original_rect {
                         if let Some(start_pos) = self.input_rect_drag.start_pos {
                             if let Some(pointer_pos) = response.interact_pointer_pos() {
-                                let new_rect = self.compute_dragged_rect(
+                                let new_rect = self.compute_dragged_rect_with_viewport(
                                     pointer_pos,
                                     preview_rect,
                                     preview_size,
                                     original_rect,
                                     handle,
                                     start_pos,
+                                    content_size,
                                 );
 
                                 actions.push(AdvancedOutputAction::UpdateScreenInputRect {
@@ -910,13 +1008,13 @@ impl AdvancedOutputWindow {
         }
 
         // Handle drag end
-        if response.drag_stopped() {
+        if response.drag_stopped_by(egui::PointerButton::Primary) {
             self.input_rect_drag = InputRectDragState::default();
         }
     }
 
-    /// Compute the new rect based on which handle is being dragged
-    fn compute_dragged_rect(
+    /// Compute the new rect based on which handle is being dragged (viewport-aware)
+    fn compute_dragged_rect_with_viewport(
         &self,
         pointer_pos: egui::Pos2,
         preview_rect: egui::Rect,
@@ -924,10 +1022,16 @@ impl AdvancedOutputWindow {
         original_rect: Rect,
         handle: RectHandle,
         start_pos: [f32; 2],
+        content_size: (f32, f32),
     ) -> Rect {
-        // Convert pointer position to normalized coordinates
-        let norm_x = ((pointer_pos.x - preview_rect.left()) / preview_size.x).clamp(0.0, 1.0);
-        let norm_y = ((pointer_pos.y - preview_rect.top()) / preview_size.y).clamp(0.0, 1.0);
+        // Convert pointer position to normalized coordinates using viewport inverse transform
+        let (norm_x, norm_y) = self.transform_point_from_screen(
+            &self.env_viewport,
+            pointer_pos,
+            preview_rect,
+            preview_size,
+            content_size,
+        );
 
         let mut new_rect = original_rect;
         let min_size = 0.05; // Minimum 5% size
@@ -1724,7 +1828,7 @@ impl AdvancedOutputWindow {
                     }
                     if ui
                         .add_enabled(
-                            self.selected_screen.is_some(),
+                            self.selected_screen.is_some() && screens.len() > 1,
                             egui::Button::new("-").small(),
                         )
                         .clicked()
@@ -1809,11 +1913,22 @@ impl AdvancedOutputWindow {
                 ui.add_space(4.0);
 
                 // Preview area - use live texture if available
-                // Calculate preview size based on available space (4:3 aspect ratio)
+                // Get screen aspect ratio and dimensions (default to 16:9 1920x1080 if no screen selected)
+                let (screen_width, screen_height) = self.selected_screen
+                    .and_then(|screen_id| screens.iter().find(|s| s.id == screen_id))
+                    .map(|screen| (screen.width as f32, screen.height as f32))
+                    .unwrap_or((1920.0, 1080.0));
+                let aspect_ratio = screen_width / screen_height;
+                let output_content_size = (screen_width, screen_height);
+
+                // Calculate preview size based on available space using screen's aspect ratio
                 let available_height = (ui.available_height() - 100.0).max(100.0).min(400.0);
-                let preview_size = egui::vec2(available_height * 4.0 / 3.0, available_height);
+                let preview_size = egui::vec2(available_height * aspect_ratio, available_height);
                 let (rect, response) =
                     ui.allocate_exact_size(preview_size, egui::Sense::click_and_drag());
+
+                // Handle viewport pan/zoom (right-click drag, scroll wheel)
+                self.handle_viewport_input(ui, &response, rect, preview_size, output_content_size, false);
 
                 // Draw preview background
                 ui.painter().rect_filled(
@@ -1827,13 +1942,32 @@ impl AdvancedOutputWindow {
                         // Draw live texture if available and screen is enabled
                         if screen.enabled {
                             if let Some(tex_id) = self.preview_texture_id {
-                                // Draw live preview texture
-                                ui.painter().image(
-                                    tex_id,
+                                // Transform full screen (0,0)-(1,1) through viewport to get destination rect
+                                let full_screen_rect = Rect { x: 0.0, y: 0.0, width: 1.0, height: 1.0 };
+                                let screen_dest_rect = self.transform_rect_to_screen(
+                                    &self.output_viewport,
+                                    &full_screen_rect,
                                     rect,
-                                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                                    egui::Color32::WHITE,
+                                    preview_size,
+                                    output_content_size,
                                 );
+
+                                // Calculate intersection with preview rect (clip)
+                                let visible_rect = screen_dest_rect.intersect(rect);
+                                if visible_rect.width() > 0.0 && visible_rect.height() > 0.0 {
+                                    // Calculate UV coords for the visible portion
+                                    let uv_left = (visible_rect.left() - screen_dest_rect.left()) / screen_dest_rect.width();
+                                    let uv_top = (visible_rect.top() - screen_dest_rect.top()) / screen_dest_rect.height();
+                                    let uv_right = (visible_rect.right() - screen_dest_rect.left()) / screen_dest_rect.width();
+                                    let uv_bottom = (visible_rect.bottom() - screen_dest_rect.top()) / screen_dest_rect.height();
+                                    let uv_rect = egui::Rect::from_min_max(
+                                        egui::pos2(uv_left, uv_top),
+                                        egui::pos2(uv_right, uv_bottom),
+                                    );
+
+                                    // Draw live preview texture
+                                    ui.painter().image(tex_id, visible_rect, uv_rect, egui::Color32::WHITE);
+                                }
                             } else {
                                 // Texture not yet registered
                                 ui.painter().text(
@@ -1856,18 +1990,22 @@ impl AdvancedOutputWindow {
                         }
 
                         // Draw slice rectangles overlay (semi-transparent outlines)
+                        // Convert slice output.rect to Rect type for transform
                         for slice in &screen.slices {
                             if slice.enabled {
-                                let slice_rect = egui::Rect::from_min_size(
-                                    rect.min
-                                        + egui::vec2(
-                                            slice.output.rect.x * preview_size.x,
-                                            slice.output.rect.y * preview_size.y,
-                                        ),
-                                    egui::vec2(
-                                        slice.output.rect.width * preview_size.x,
-                                        slice.output.rect.height * preview_size.y,
-                                    ),
+                                // Convert slice.output.rect (Point2D-based Rect) to our Rect for transform
+                                let slice_input_rect = Rect {
+                                    x: slice.output.rect.x,
+                                    y: slice.output.rect.y,
+                                    width: slice.output.rect.width,
+                                    height: slice.output.rect.height,
+                                };
+                                let slice_rect = self.transform_rect_to_screen(
+                                    &self.output_viewport,
+                                    &slice_input_rect,
+                                    rect,
+                                    preview_size,
+                                    output_content_size,
                                 );
 
                                 let is_selected = self.selected_slice == Some(slice.id);
@@ -2258,15 +2396,22 @@ impl AdvancedOutputWindow {
                 }
 
                 ui.add_space(4.0);
-                // Show resolution info
+                // Show resolution info and zoom level
+                let zoom_percent = (self.output_viewport.zoom() * 100.0).round() as i32;
                 if let Some(screen_id) = self.selected_screen {
                     if let Some(screen) = screens.iter().find(|s| s.id == screen_id) {
                         ui.label(
-                            egui::RichText::new(format!("{}x{}", screen.width, screen.height))
+                            egui::RichText::new(format!("{}x{} | Zoom: {}%", screen.width, screen.height, zoom_percent))
                                 .small()
                                 .weak(),
                         );
                     }
+                } else {
+                    ui.label(
+                        egui::RichText::new(format!("Zoom: {}%", zoom_percent))
+                            .small()
+                            .weak(),
+                    );
                 }
             });
 
@@ -3000,5 +3145,183 @@ impl AdvancedOutputWindow {
                 slice: slice_copy,
             });
         }
+    }
+
+    // =============================================================================
+    // Viewport Pan/Zoom Support Methods
+    // =============================================================================
+
+    /// Transform a normalized coordinate (0-1) to screen space, accounting for viewport pan/zoom
+    fn transform_point_to_screen(
+        &self,
+        viewport: &Viewport,
+        normalized: (f32, f32),
+        preview_rect: egui::Rect,
+        preview_size: egui::Vec2,
+        content_size: (f32, f32),
+    ) -> egui::Pos2 {
+        let (scale_x, scale_y, offset_x, offset_y) = viewport.get_shader_params(
+            (preview_size.x, preview_size.y),
+            content_size,
+        );
+
+        // Transform: apply zoom and offset
+        // The viewport centers content, so we map normalized (0-1) to centered (-0.5 to 0.5)
+        let centered_x = normalized.0 - 0.5;
+        let centered_y = normalized.1 - 0.5;
+
+        // Apply scale and offset
+        let transformed_x = centered_x * scale_x + 0.5 + offset_x;
+        let transformed_y = centered_y * scale_y + 0.5 + offset_y;
+
+        // Convert to screen pixels
+        preview_rect.min + egui::vec2(
+            transformed_x * preview_size.x,
+            transformed_y * preview_size.y,
+        )
+    }
+
+    /// Transform a screen space coordinate back to normalized (0-1) coordinate
+    fn transform_point_from_screen(
+        &self,
+        viewport: &Viewport,
+        screen_pos: egui::Pos2,
+        preview_rect: egui::Rect,
+        preview_size: egui::Vec2,
+        content_size: (f32, f32),
+    ) -> (f32, f32) {
+        let (scale_x, scale_y, offset_x, offset_y) = viewport.get_shader_params(
+            (preview_size.x, preview_size.y),
+            content_size,
+        );
+
+        // Convert from screen pixels to normalized viewport space (0-1)
+        let viewport_x = (screen_pos.x - preview_rect.left()) / preview_size.x;
+        let viewport_y = (screen_pos.y - preview_rect.top()) / preview_size.y;
+
+        // Inverse transform: remove offset and zoom
+        // viewport_x = centered_x * scale_x + 0.5 + offset_x
+        // centered_x = (viewport_x - 0.5 - offset_x) / scale_x
+        // normalized_x = centered_x + 0.5
+        let centered_x = (viewport_x - 0.5 - offset_x) / scale_x;
+        let centered_y = (viewport_y - 0.5 - offset_y) / scale_y;
+
+        let norm_x = (centered_x + 0.5).clamp(0.0, 1.0);
+        let norm_y = (centered_y + 0.5).clamp(0.0, 1.0);
+
+        (norm_x, norm_y)
+    }
+
+    /// Transform a normalized rect to screen space rect
+    fn transform_rect_to_screen(
+        &self,
+        viewport: &Viewport,
+        input_rect: &Rect,
+        preview_rect: egui::Rect,
+        preview_size: egui::Vec2,
+        content_size: (f32, f32),
+    ) -> egui::Rect {
+        let top_left = self.transform_point_to_screen(
+            viewport,
+            (input_rect.x, input_rect.y),
+            preview_rect,
+            preview_size,
+            content_size,
+        );
+        let bottom_right = self.transform_point_to_screen(
+            viewport,
+            (input_rect.x + input_rect.width, input_rect.y + input_rect.height),
+            preview_rect,
+            preview_size,
+            content_size,
+        );
+        egui::Rect::from_min_max(top_left, bottom_right)
+    }
+
+    /// Handle viewport input (right-click pan, scroll zoom)
+    /// Returns true if viewport input was handled (to skip other interactions)
+    fn handle_viewport_input(
+        &mut self,
+        ui: &egui::Ui,
+        response: &egui::Response,
+        rect: egui::Rect,
+        preview_size: egui::Vec2,
+        content_size: (f32, f32),
+        is_environment_preview: bool,
+    ) -> bool {
+        let viewport = if is_environment_preview {
+            &mut self.env_viewport
+        } else {
+            &mut self.output_viewport
+        };
+
+        let window_size = (preview_size.x, preview_size.y);
+        let mut handled = false;
+
+        // Handle right-click drag start
+        if response.drag_started_by(egui::PointerButton::Secondary) {
+            if let Some(pos) = response.interact_pointer_pos() {
+                let local_pos = (pos.x - rect.left(), pos.y - rect.top());
+                let _was_reset = viewport.on_right_mouse_down(local_pos);
+                handled = true;
+            }
+        }
+
+        // Handle right-click drag
+        if response.dragged_by(egui::PointerButton::Secondary) {
+            if let Some(pos) = response.interact_pointer_pos() {
+                let local_pos = (pos.x - rect.left(), pos.y - rect.top());
+                viewport.on_mouse_move(local_pos, window_size, content_size);
+                handled = true;
+            }
+        }
+
+        // Handle right-click drag end
+        if response.drag_stopped_by(egui::PointerButton::Secondary) {
+            viewport.on_right_mouse_up();
+            handled = true;
+        }
+
+        // Handle scroll wheel zoom (when hovered)
+        if response.hovered() {
+            let scroll = ui.input(|i| i.raw_scroll_delta.y);
+            if scroll.abs() > 0.5 {
+                if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
+                    let local_pos = (pos.x - rect.left(), pos.y - rect.top());
+                    // Normalize scroll to reasonable zoom increments
+                    let zoom_delta = scroll / 50.0;
+                    viewport.on_scroll(zoom_delta, local_pos, window_size, content_size);
+                    handled = true;
+                }
+            }
+        }
+
+        handled
+    }
+
+    /// Update viewport animations (call each frame when window is open)
+    pub fn update_viewports(&mut self, env_content_size: (f32, f32), output_content_size: Option<(f32, f32)>) {
+        let now = std::time::Instant::now();
+        let dt = now.duration_since(self.last_viewport_update).as_secs_f32();
+        self.last_viewport_update = now;
+
+        // Environment viewport
+        if self.env_viewport.needs_update() {
+            // Use a reasonable default preview size for animation calculations
+            let preview_size = (400.0, 225.0);
+            self.env_viewport.update(dt, preview_size, env_content_size);
+        }
+
+        // Output viewport
+        if self.output_viewport.needs_update() {
+            let content = output_content_size.unwrap_or((1920.0, 1080.0));
+            let preview_size = (400.0, 300.0);
+            self.output_viewport.update(dt, preview_size, content);
+        }
+    }
+
+    /// Check if any viewport needs animation update
+    pub fn viewports_need_update(&self) -> bool {
+        self.env_viewport.needs_update() || self.output_viewport.needs_update()
     }
 }
