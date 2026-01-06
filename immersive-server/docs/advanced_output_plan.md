@@ -895,44 +895,44 @@ ui.collapsing("Color Correction", |ui| {
 
 ---
 
-### Phase 17: Multi-Display Output
+### Phase 17: Multi-Display Output ✅ COMPLETE
 
 **Goal:** Route screens to physical displays, capture cards, NDI, OMT, Syphon/Spout.
 
-- [ ] Add display enumeration via winit
-- [ ] Create display selector dropdown in screen properties
-- [ ] Implement fullscreen window per physical display
-- [ ] Add multi-window event handling to main loop
-- [ ] Integrate ScreenRuntime with physical display output
-- [ ] **Capture Card Support (Blackmagic, AJA)**
+- [x] Add display enumeration via winit
+- [x] Create display selector dropdown in screen properties
+- [x] Implement fullscreen window per physical display
+- [x] Add multi-window event handling to main loop
+- [x] Integrate ScreenRuntime with physical display output
+- [ ] **Capture Card Support (Blackmagic, AJA)** *(deferred)*
   - [ ] Integrate Blackmagic DeckLink SDK (FFI bindings)
   - [ ] Enumerate available capture card outputs
   - [ ] Add video format selection (resolution, frame rate, interlaced)
   - [ ] Implement frame output to SDI/HDMI ports
   - [ ] Handle genlock/reference sync (optional)
-- [ ] Add NDI output per-screen (not just environment)
-- [ ] Add OMT output per-screen
-- [ ] Update Syphon/Spout to support per-screen outputs
-- [ ] Add output delay configuration (for projector sync)
-- [ ] Handle display/device hot-plug events
+- [x] Add NDI output per-screen (not just environment)
+- [x] Add OMT output per-screen
+- [x] Update Syphon/Spout to support per-screen outputs
+- [x] Add output delay configuration (for projector sync)
+- [x] Handle display/device hot-plug events
 
 **Verification Checklist:**
-- [ ] Application lists all connected displays by name/resolution
-- [ ] Screen can be assigned to any display
-- [ ] Fullscreen output renders correctly on each display
-- [ ] Multiple displays show independent screen content
-- [ ] **Capture card output:**
+- [x] Application lists all connected displays by name/resolution
+- [x] Screen can be assigned to any display
+- [x] Fullscreen output renders correctly on each display
+- [x] Multiple displays show independent screen content
+- [ ] **Capture card output:** *(deferred)*
   - [ ] Blackmagic devices detected and listed
   - [ ] SDI output works at 1080p60
   - [ ] SDI output works at 4K30
   - [ ] Frame timing matches selected format
   - [ ] No dropped frames under normal load
-- [ ] NDI output works per-screen (each screen = separate NDI source)
-- [ ] OMT output works per-screen
-- [ ] Syphon/Spout output works per-screen
-- [ ] Output delay correctly offsets frame timing
-- [ ] Display assignments persist across restart
-- [ ] Hot-plug: new displays/devices appear in list, disconnected shows warning
+- [x] NDI output works per-screen (each screen = separate NDI source)
+- [x] OMT output works per-screen
+- [x] Syphon/Spout output works per-screen
+- [x] Output delay correctly offsets frame timing
+- [x] Display assignments persist across restart
+- [x] Hot-plug: new displays/devices appear in list, disconnected shows warning
 
 ---
 

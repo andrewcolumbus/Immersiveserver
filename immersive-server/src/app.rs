@@ -1787,11 +1787,13 @@ impl App {
 
         // Render Advanced Output window
         let layer_count = self.environment.layers().len();
+        let env_dimensions = (self.environment.width(), self.environment.height());
         let output_actions = self.advanced_output_window.render(
             &self.egui_ctx,
             self.output_manager.as_ref(),
             layer_count,
             &self.available_displays,
+            env_dimensions,
         );
         for action in output_actions {
             self.handle_advanced_output_action(action);
@@ -2777,11 +2779,23 @@ impl App {
                     &mut encoder,
                     screen_id,
                 );
+
+                // Capture frame to NDI if this screen has NDI output
+                output_manager.capture_ndi_frame(&mut encoder, screen_id);
             }
         }
 
-        // Register Advanced Output preview texture with egui (if window is open)
+        // Register Advanced Output textures with egui (if window is open)
         if self.advanced_output_window.open {
+            // Register environment texture for Screens tab
+            let env_texture_id = self.egui_renderer.register_native_texture(
+                &self.device,
+                self.environment.texture_view(),
+                wgpu::FilterMode::Linear,
+            );
+            self.advanced_output_window.environment_texture_id = Some(env_texture_id);
+
+            // Register selected screen's output texture for Output Transformation tab
             if let Some(screen_id) = self.advanced_output_window.selected_screen_id() {
                 if let Some(output_manager) = &self.output_manager {
                     if let Some(runtime) = output_manager.get_runtime(screen_id) {
@@ -2797,6 +2811,10 @@ impl App {
                 // No screen selected, clear preview
                 self.advanced_output_window.preview_texture_id = None;
             }
+        } else {
+            // Clear textures when window is closed
+            self.advanced_output_window.environment_texture_id = None;
+            self.advanced_output_window.preview_texture_id = None;
         }
 
         // Capture environment texture for OMT output (before we move on to present)
@@ -2980,6 +2998,11 @@ impl App {
             if let Some(capture) = &mut self.ndi_capture {
                 capture.process(&self.device);
             }
+        }
+
+        // Process advanced output NDI captures (non-blocking)
+        if let Some(output_manager) = &mut self.output_manager {
+            output_manager.process_ndi_captures(&self.device);
         }
 
         // Process Spout capture pipeline (Windows, non-blocking)
@@ -5909,6 +5932,34 @@ impl App {
                     // Sync runtime to pick up changes
                     let target_fps = self.settings.target_fps as f32;
                     manager.sync_runtime(&self.device, screen_id, target_fps);
+                }
+            }
+            AdvancedOutputAction::UpdateScreenInputRect { screen_id, input_rect } => {
+                // Update input_rect on all slices of this screen
+                if let Some(manager) = self.output_manager.as_mut() {
+                    if let Some(screen) = manager.get_screen_mut(screen_id) {
+                        for slice in &mut screen.slices {
+                            slice.input_rect = input_rect;
+                        }
+                    }
+                    // Sync runtime to pick up changes
+                    let target_fps = self.settings.target_fps as f32;
+                    manager.sync_runtime(&self.device, screen_id, target_fps);
+                }
+            }
+            AdvancedOutputAction::SaveComposition => {
+                // Auto-save when closing the Advanced Output window
+                if let Some(path) = self.current_file.clone() {
+                    // Sync current state to settings
+                    self.sync_layers_to_settings();
+                    // Save to file
+                    if let Err(e) = self.settings.save_to_file(&path) {
+                        tracing::error!("Failed to auto-save composition: {}", e);
+                        self.menu_bar.set_status(format!("Failed to save: {}", e));
+                    } else {
+                        tracing::info!("Auto-saved composition to: {}", path.display());
+                        self.menu_bar.set_status("Composition saved");
+                    }
                 }
             }
         }

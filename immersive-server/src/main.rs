@@ -807,6 +807,9 @@ impl ApplicationHandler for ImmersiveApp {
                 app.restore_layers_from_settings();
             }
 
+            // Restore output manager screens from settings
+            app.sync_output_manager_from_settings();
+
             // Sync OMT broadcast state from settings
             app.sync_omt_broadcast_from_settings();
 
@@ -1007,6 +1010,21 @@ impl ApplicationHandler for ImmersiveApp {
                 app.menu_bar.pending_action = Some(immersive_server::ui::menu_bar::FileAction::Save);
             }
 
+            // Handle Cmd/Ctrl+Shift+A to toggle Advanced Output window
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(KeyCode::KeyA),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } if (self.modifiers.state().super_key() || self.modifiers.state().control_key())
+                && self.modifiers.state().shift_key() =>
+            {
+                app.advanced_output_window.toggle();
+            }
+
             // Handle keyboard input (only if egui doesn't want it)
             WindowEvent::KeyboardInput {
                 event:
@@ -1018,11 +1036,6 @@ impl ApplicationHandler for ImmersiveApp {
                 ..
             } if !app.egui_wants_keyboard() => {
                 match key_code {
-                    // Escape to exit
-                    KeyCode::Escape => {
-                        tracing::info!("Escape pressed, exiting...");
-                        event_loop.exit();
-                    }
                     // F11 to toggle fullscreen
                     KeyCode::F11 => {
                         let fullscreen = window.fullscreen();
@@ -1191,6 +1204,7 @@ impl ApplicationHandler for ImmersiveApp {
                                         app.settings = settings;
                                         app.current_file = Some(path.clone());
                                         app.restore_layers_from_settings();
+                                        app.sync_output_manager_from_settings();
                                         app.sync_omt_broadcast_from_settings();
                                         preferences.set_last_opened(&path);
                                         app.menu_bar.set_status(format!(

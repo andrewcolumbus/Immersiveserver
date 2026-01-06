@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use winit::window::WindowId;
 
 use super::{MaskShape, OutputDevice, Screen, ScreenId, Slice, SliceId, SliceInput, SliceMask, WarpMesh};
+use crate::network::NdiCapture;
 
 /// Screen-level color correction parameters (matches shader uniform)
 #[repr(C)]
@@ -985,6 +986,9 @@ pub struct ScreenRuntime {
 
     /// Texture format
     pub format: wgpu::TextureFormat,
+
+    /// NDI capture for screens with NDI output device
+    pub ndi_capture: Option<NdiCapture>,
 }
 
 impl ScreenRuntime {
@@ -1050,6 +1054,7 @@ impl ScreenRuntime {
             width,
             height,
             format,
+            ndi_capture: None,
         }
     }
 
@@ -1169,6 +1174,66 @@ impl ScreenRuntime {
     /// Get the current delay in frames
     pub fn delay_frames(&self) -> usize {
         self.delay_buffer.delay_frames()
+    }
+
+    /// Update NDI output based on device type
+    ///
+    /// Creates or destroys NDI capture based on whether the screen is configured
+    /// as an NDI output device.
+    pub fn update_ndi_output(&mut self, device: &wgpu::Device, screen: &Screen, target_fps: u32) {
+        match &screen.device {
+            OutputDevice::Ndi { name } if screen.enabled => {
+                // Create NDI capture if not already created or dimensions changed
+                let needs_create = self.ndi_capture.as_ref().map_or(true, |capture| {
+                    // Check if dimensions match
+                    !capture.dimensions_match(self.width, self.height)
+                });
+
+                if needs_create {
+                    tracing::info!(
+                        "Creating NDI output for screen '{}' ({}x{}) as '{}'",
+                        screen.name,
+                        self.width,
+                        self.height,
+                        name
+                    );
+
+                    // Create NDI sender
+                    match crate::network::NdiSender::new(name, target_fps) {
+                        Ok(sender) => {
+                            let mut capture = NdiCapture::new(device, self.width, self.height);
+                            capture.start_sender_thread(sender);
+                            self.ndi_capture = Some(capture);
+                            tracing::info!("NDI output started for screen '{}'", screen.name);
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to start NDI sender for '{}': {}", name, e);
+                        }
+                    }
+                }
+            }
+            _ => {
+                // Not an NDI device or disabled - remove capture if exists
+                if self.ndi_capture.is_some() {
+                    tracing::info!("Stopping NDI output for screen '{}'", screen.name);
+                    self.ndi_capture = None;
+                }
+            }
+        }
+    }
+
+    /// Capture frame to NDI if enabled
+    ///
+    /// Call this after rendering the screen to send the output to NDI.
+    pub fn capture_ndi_frame(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        if let Some(capture) = &mut self.ndi_capture {
+            capture.capture_frame(encoder, &self.output_texture);
+        }
+    }
+
+    /// Check if NDI output is active
+    pub fn is_ndi_active(&self) -> bool {
+        self.ndi_capture.is_some()
     }
 }
 
@@ -2014,6 +2079,32 @@ impl OutputManager {
             .collect();
         for id in orphaned {
             runtime.remove_slice(id);
+        }
+
+        // Update NDI output based on device type
+        // Re-borrow screen since we consumed it earlier
+        if let Some(screen) = self.screens.get(&screen_id) {
+            if let Some(runtime) = self.runtimes.get_mut(&screen_id) {
+                runtime.update_ndi_output(device, screen, target_fps as u32);
+            }
+        }
+    }
+
+    /// Capture NDI frame for a screen (if NDI output is enabled)
+    pub fn capture_ndi_frame(&mut self, encoder: &mut wgpu::CommandEncoder, screen_id: ScreenId) {
+        if let Some(runtime) = self.runtimes.get_mut(&screen_id) {
+            runtime.capture_ndi_frame(encoder);
+        }
+    }
+
+    /// Process NDI capture pipelines for all screens.
+    ///
+    /// Call this after queue.submit() to poll GPU and send captured frames.
+    pub fn process_ndi_captures(&mut self, device: &wgpu::Device) {
+        for runtime in self.runtimes.values_mut() {
+            if let Some(capture) = &mut runtime.ndi_capture {
+                capture.process(device);
+            }
         }
     }
 

@@ -4,7 +4,42 @@
 //! Accessible via View → Advanced Output.
 
 use crate::output::{DisplayInfo, EdgeBlendConfig, MaskShape, OutputDevice, OutputManager, Point2D as MaskPoint2D, Screen, ScreenId, Slice, SliceId, SliceInput, SliceMask, WarpMesh};
-use crate::output::slice::Point2D;
+use crate::output::slice::{Point2D, Rect};
+
+/// Tab selection for the Advanced Output window
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AdvancedOutputTab {
+    #[default]
+    Screens,
+    OutputTransformation,
+}
+
+/// Which part of a rectangle is being dragged
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RectHandle {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+    TopEdge,
+    BottomEdge,
+    LeftEdge,
+    RightEdge,
+    Body,
+}
+
+/// State for interactive input_rect editing
+#[derive(Debug, Clone, Default)]
+pub struct InputRectDragState {
+    /// Which screen is being dragged (if any)
+    pub dragging_screen: Option<ScreenId>,
+    /// Which handle of the rect is being dragged
+    pub dragging_handle: Option<RectHandle>,
+    /// Original rect when drag started (for computing delta)
+    pub original_rect: Option<Rect>,
+    /// Starting pointer position (normalized 0-1) for body drag
+    pub start_pos: Option<[f32; 2]>,
+}
 
 /// Actions returned from the Advanced Output window
 #[derive(Debug, Clone)]
@@ -28,6 +63,10 @@ pub enum AdvancedOutputAction {
     },
     /// Update screen properties
     UpdateScreen { screen_id: ScreenId, screen: Screen },
+    /// Update the input_rect for all slices of a screen (from environment view drag)
+    UpdateScreenInputRect { screen_id: ScreenId, input_rect: Rect },
+    /// Save the composition (triggered when window is closed)
+    SaveComposition,
 }
 
 /// Advanced Output window for configuring multi-screen outputs
@@ -45,7 +84,7 @@ pub struct AdvancedOutputWindow {
     /// Temporary resolution strings
     temp_width: String,
     temp_height: String,
-    /// egui texture ID for the live preview
+    /// egui texture ID for the live preview (screen output)
     pub preview_texture_id: Option<egui::TextureId>,
     /// Currently dragged warp point (col, row)
     dragging_warp_point: Option<(usize, usize)>,
@@ -55,6 +94,12 @@ pub struct AdvancedOutputWindow {
     temp_device_name: String,
     /// Temporary OMT port
     temp_omt_port: String,
+    /// Currently selected tab
+    current_tab: AdvancedOutputTab,
+    /// egui texture ID for the environment preview (Screens tab)
+    pub environment_texture_id: Option<egui::TextureId>,
+    /// State for dragging input_rect handles in environment view
+    input_rect_drag: InputRectDragState,
 }
 
 impl Default for AdvancedOutputWindow {
@@ -79,6 +124,9 @@ impl AdvancedOutputWindow {
             dragging_mask_vertex: None,
             temp_device_name: String::new(),
             temp_omt_port: "5960".to_string(),
+            current_tab: AdvancedOutputTab::default(),
+            environment_texture_id: None,
+            input_rect_drag: InputRectDragState::default(),
         }
     }
 
@@ -92,6 +140,38 @@ impl AdvancedOutputWindow {
         self.open = !self.open;
     }
 
+    /// Generate a unique NDI name that doesn't conflict with existing screens
+    fn unique_ndi_name(base_name: &str, current_screen_id: ScreenId, all_screens: &[&Screen]) -> String {
+        // Collect existing NDI names from other screens
+        let existing_names: Vec<&str> = all_screens
+            .iter()
+            .filter(|s| s.id != current_screen_id)
+            .filter_map(|s| {
+                if let OutputDevice::Ndi { name } = &s.device {
+                    Some(name.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // If base name doesn't conflict, use it
+        if !existing_names.contains(&base_name) {
+            return base_name.to_string();
+        }
+
+        // Otherwise, append a number to make it unique
+        for i in 2..100 {
+            let candidate = format!("{} ({})", base_name, i);
+            if !existing_names.contains(&candidate.as_str()) {
+                return candidate;
+            }
+        }
+
+        // Fallback (shouldn't happen in practice)
+        format!("{} (99)", base_name)
+    }
+
     /// Render the Advanced Output window
     ///
     /// Returns a list of actions to be processed by the app.
@@ -101,6 +181,7 @@ impl AdvancedOutputWindow {
         output_manager: Option<&OutputManager>,
         layer_count: usize,
         available_displays: &[DisplayInfo],
+        env_dimensions: (u32, u32),
     ) -> Vec<AdvancedOutputAction> {
         let mut actions = Vec::new();
 
@@ -118,8 +199,13 @@ impl AdvancedOutputWindow {
             .resizable(true)
             .collapsible(true)
             .show(ctx, |ui| {
-                self.render_contents(ui, output_manager, layer_count, available_displays, &mut actions);
+                self.render_contents(ui, output_manager, layer_count, available_displays, env_dimensions, &mut actions);
             });
+
+        // Detect window close and trigger save
+        if self.open && !open {
+            actions.push(AdvancedOutputAction::SaveComposition);
+        }
         self.open = open;
 
         actions
@@ -132,6 +218,7 @@ impl AdvancedOutputWindow {
         output_manager: Option<&OutputManager>,
         layer_count: usize,
         available_displays: &[DisplayInfo],
+        env_dimensions: (u32, u32),
         actions: &mut Vec<AdvancedOutputAction>,
     ) {
         // Get screens from output manager
@@ -147,6 +234,1451 @@ impl AdvancedOutputWindow {
             }
         }
 
+        // Tab bar at top
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.current_tab, AdvancedOutputTab::Screens, "Screens");
+            ui.selectable_value(&mut self.current_tab, AdvancedOutputTab::OutputTransformation, "Output Transformation");
+        });
+        ui.separator();
+        ui.add_space(4.0);
+
+        // Dispatch to appropriate tab
+        match self.current_tab {
+            AdvancedOutputTab::Screens => {
+                self.render_screens_tab(ui, &screens, available_displays, env_dimensions, actions);
+            }
+            AdvancedOutputTab::OutputTransformation => {
+                self.render_output_transformation_tab(ui, &screens, layer_count, actions);
+            }
+        }
+    }
+
+    /// Render the Screens tab with environment preview and input_rect editing
+    fn render_screens_tab(
+        &mut self,
+        ui: &mut egui::Ui,
+        screens: &[&Screen],
+        available_displays: &[DisplayInfo],
+        env_dimensions: (u32, u32),
+        actions: &mut Vec<AdvancedOutputAction>,
+    ) {
+        // Three-column layout: Screens list | Environment Preview | Screen Properties
+        let available = ui.available_size();
+        ui.allocate_ui_with_layout(
+            available,
+            egui::Layout::left_to_right(egui::Align::TOP),
+            |ui| {
+            // LEFT COLUMN: Screens list only (no slices in this tab)
+            ui.vertical(|ui| {
+                ui.set_min_width(150.0);
+                ui.set_max_width(180.0);
+
+                ui.heading("Screens");
+                ui.add_space(4.0);
+
+                egui::ScrollArea::vertical()
+                    .id_salt("screens_list_tab")
+                    .max_height(300.0)
+                    .show(ui, |ui| {
+                        for (index, screen) in screens.iter().enumerate() {
+                            let is_selected = self.selected_screen == Some(screen.id);
+                            let response = ui.selectable_label(
+                                is_selected,
+                                format!("{}. {} ({}x{})", index + 1, screen.name, screen.width, screen.height),
+                            );
+                            if response.clicked() {
+                                self.selected_screen = Some(screen.id);
+                                self.selected_slice = None;
+                                self.temp_screen_name = screen.name.clone();
+                                self.temp_width = screen.width.to_string();
+                                self.temp_height = screen.height.to_string();
+                            }
+                        }
+                    });
+
+                ui.horizontal(|ui| {
+                    if ui.small_button("+").clicked() {
+                        actions.push(AdvancedOutputAction::AddScreen);
+                    }
+                    if ui.add_enabled(self.selected_screen.is_some(), egui::Button::new("-").small()).clicked() {
+                        if let Some(screen_id) = self.selected_screen {
+                            actions.push(AdvancedOutputAction::RemoveScreen { screen_id });
+                            self.selected_screen = None;
+                            self.selected_slice = None;
+                        }
+                    }
+                });
+            });
+
+            ui.separator();
+
+            // MIDDLE COLUMN: Environment preview with input_rect overlays
+            self.render_environment_preview(ui, screens, actions);
+
+            ui.separator();
+
+            // RIGHT COLUMN: Screen properties (simplified for this tab)
+            ui.vertical(|ui| {
+                ui.set_min_width(200.0);
+                ui.heading("Screen Properties");
+                ui.add_space(4.0);
+
+                egui::ScrollArea::vertical()
+                    .id_salt("screen_props_scroll")
+                    .show(ui, |ui| {
+                        if let Some(screen_id) = self.selected_screen {
+                            if let Some(screen) = screens.iter().find(|s| s.id == screen_id) {
+                                self.render_screen_properties_simplified(ui, screen, screens, available_displays, env_dimensions, actions);
+                            }
+                        } else {
+                            ui.label(egui::RichText::new("Select a screen to edit").weak().italics());
+                        }
+                    });
+            });
+        });
+    }
+
+    /// Render the environment preview with numbered screen input_rect overlays
+    fn render_environment_preview(
+        &mut self,
+        ui: &mut egui::Ui,
+        screens: &[&Screen],
+        actions: &mut Vec<AdvancedOutputAction>,
+    ) {
+        ui.vertical(|ui| {
+            ui.set_min_width(300.0);
+            ui.heading("Environment");
+            ui.add_space(4.0);
+
+            // Calculate preview size with 16:9 aspect ratio
+            let available_height = (ui.available_height() - 50.0).max(100.0).min(500.0);
+            let preview_height = available_height;
+            let preview_width = preview_height * 16.0 / 9.0;
+            let preview_size = egui::vec2(preview_width, preview_height);
+
+            let (rect, response) = ui.allocate_exact_size(preview_size, egui::Sense::click_and_drag());
+
+            // Draw environment texture background
+            ui.painter().rect_filled(rect, 4.0, egui::Color32::from_rgb(30, 30, 30));
+
+            if let Some(tex_id) = self.environment_texture_id {
+                ui.painter().image(
+                    tex_id,
+                    rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            } else {
+                // Show placeholder text if environment texture not yet registered
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "Environment Preview",
+                    egui::FontId::proportional(14.0),
+                    egui::Color32::GRAY,
+                );
+            }
+
+            // Draw input_rect rectangles for each screen
+            self.draw_screen_input_rects(ui, rect, preview_size, screens);
+
+            // Draw blend gradient overlays where screens overlap with blending enabled
+            self.draw_screen_blend_overlaps(ui, rect, preview_size, screens);
+
+            // Handle interactions (click to select, drag to edit)
+            self.handle_environment_interactions(ui, rect, preview_size, screens, actions, &response);
+
+            // Show resolution info
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new("Click screen to select, drag handles to resize").small().weak());
+        });
+    }
+
+    /// Draw numbered rectangles for each screen's input_rect
+    fn draw_screen_input_rects(
+        &self,
+        ui: &egui::Ui,
+        preview_rect: egui::Rect,
+        preview_size: egui::Vec2,
+        screens: &[&Screen],
+    ) {
+        let outline_color = egui::Color32::from_rgb(100, 149, 237); // Cornflower blue
+
+        for (index, screen) in screens.iter().enumerate() {
+            // Get the input_rect for this screen (use first slice, or default to full)
+            let input_rect = screen.slices.first()
+                .map(|s| s.input_rect)
+                .unwrap_or_else(Rect::full);
+
+            // Convert normalized rect to screen coordinates
+            let screen_rect = egui::Rect::from_min_size(
+                preview_rect.min + egui::vec2(
+                    input_rect.x * preview_size.x,
+                    input_rect.y * preview_size.y,
+                ),
+                egui::vec2(
+                    input_rect.width * preview_size.x,
+                    input_rect.height * preview_size.y,
+                ),
+            );
+
+            let is_selected = self.selected_screen == Some(screen.id);
+            let stroke_width = if is_selected { 3.0 } else { 2.0 };
+            let alpha = if is_selected { 255 } else { 180 };
+            let stroke_color = egui::Color32::from_rgba_unmultiplied(
+                outline_color.r(), outline_color.g(), outline_color.b(), alpha
+            );
+
+            // Draw rectangle outline
+            ui.painter().rect_stroke(
+                screen_rect,
+                2.0,
+                egui::Stroke::new(stroke_width, stroke_color),
+                egui::StrokeKind::Outside,
+            );
+
+            // Draw screen number in center (circle with number)
+            let number_text = format!("{}", index + 1);
+            let font_id = egui::FontId::proportional(20.0);
+            let text_pos = screen_rect.center();
+
+            // Draw background circle
+            let circle_color = if is_selected {
+                egui::Color32::from_rgb(100, 149, 237)
+            } else {
+                egui::Color32::from_rgba_unmultiplied(100, 149, 237, 150)
+            };
+            ui.painter().circle_filled(text_pos, 14.0, circle_color);
+            ui.painter().text(
+                text_pos,
+                egui::Align2::CENTER_CENTER,
+                &number_text,
+                font_id,
+                egui::Color32::WHITE,
+            );
+
+            // Draw corner/edge handles for selected screen
+            if is_selected {
+                self.draw_rect_handles(ui, screen_rect);
+            }
+        }
+    }
+
+    /// Draw corner and edge handles for the selected screen's input_rect
+    fn draw_rect_handles(&self, ui: &egui::Ui, rect: egui::Rect) {
+        let handle_radius = 8.0; // Larger handles for easier grabbing
+        let handle_color = egui::Color32::WHITE;
+        let handle_stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(100, 149, 237));
+
+        // Corner handles
+        let corners = [
+            rect.left_top(),
+            rect.right_top(),
+            rect.left_bottom(),
+            rect.right_bottom(),
+        ];
+
+        for pos in corners {
+            ui.painter().circle_filled(pos, handle_radius, handle_color);
+            ui.painter().circle_stroke(pos, handle_radius, handle_stroke);
+        }
+
+        // Edge midpoint handles (slightly smaller)
+        let edge_handle_radius = 6.0;
+        let edges = [
+            egui::pos2(rect.center().x, rect.top()),
+            egui::pos2(rect.center().x, rect.bottom()),
+            egui::pos2(rect.left(), rect.center().y),
+            egui::pos2(rect.right(), rect.center().y),
+        ];
+
+        for pos in edges {
+            ui.painter().circle_filled(pos, edge_handle_radius, handle_color);
+            ui.painter().circle_stroke(pos, edge_handle_radius, handle_stroke);
+        }
+    }
+
+    /// Draw blend gradient overlays for overlapping screens in the environment preview
+    fn draw_screen_blend_overlaps(
+        &self,
+        ui: &egui::Ui,
+        preview_rect: egui::Rect,
+        preview_size: egui::Vec2,
+        screens: &[&Screen],
+    ) {
+        // Get input_rects and edge blend configs for all screens
+        let screen_data: Vec<_> = screens
+            .iter()
+            .filter_map(|screen| {
+                let slice = screen.slices.first()?;
+                Some((screen.id, slice.input_rect, &slice.output.edge_blend))
+            })
+            .collect();
+
+        // Check each pair of screens for overlaps
+        for i in 0..screen_data.len() {
+            for j in (i + 1)..screen_data.len() {
+                let (_id_a, rect_a, blend_a) = &screen_data[i];
+                let (_id_b, rect_b, blend_b) = &screen_data[j];
+
+                // Compute intersection of the two input_rects
+                let intersection = Self::rect_intersection(rect_a, rect_b);
+                if intersection.is_none() {
+                    continue;
+                }
+                let intersection = intersection.unwrap();
+
+                // Skip very small overlaps
+                if intersection.width < 0.01 || intersection.height < 0.01 {
+                    continue;
+                }
+
+                // Convert intersection to screen coordinates
+                let overlap_rect = egui::Rect::from_min_size(
+                    preview_rect.min + egui::vec2(
+                        intersection.x * preview_size.x,
+                        intersection.y * preview_size.y,
+                    ),
+                    egui::vec2(
+                        intersection.width * preview_size.x,
+                        intersection.height * preview_size.y,
+                    ),
+                );
+
+                // Determine which blend edges are active between these screens
+                // Horizontal overlap: A's right meets B's left, or B's right meets A's left
+                let a_right_of_b = rect_a.x > rect_b.x;
+                let (left_blend, right_blend, left_gamma, right_gamma) = if a_right_of_b {
+                    // B is to the left, A is to the right
+                    (blend_b.right.enabled, blend_a.left.enabled, blend_b.right.gamma, blend_a.left.gamma)
+                } else {
+                    // A is to the left, B is to the right
+                    (blend_a.right.enabled, blend_b.left.enabled, blend_a.right.gamma, blend_b.left.gamma)
+                };
+
+                // Vertical overlap: A's bottom meets B's top, or B's bottom meets A's top
+                let a_below_b = rect_a.y > rect_b.y;
+                let (top_blend, bottom_blend, top_gamma, bottom_gamma) = if a_below_b {
+                    // B is above, A is below
+                    (blend_b.bottom.enabled, blend_a.top.enabled, blend_b.bottom.gamma, blend_a.top.gamma)
+                } else {
+                    // A is above, B is below
+                    (blend_a.bottom.enabled, blend_b.top.enabled, blend_a.bottom.gamma, blend_b.top.gamma)
+                };
+
+                // Draw horizontal blend gradient if both edges are enabled
+                if left_blend && right_blend {
+                    let avg_gamma = (left_gamma + right_gamma) / 2.0;
+                    self.draw_blend_gradient(
+                        ui,
+                        overlap_rect,
+                        true, // horizontal
+                        16,
+                        avg_gamma,
+                    );
+                }
+
+                // Draw vertical blend gradient if both edges are enabled
+                if top_blend && bottom_blend {
+                    let avg_gamma = (top_gamma + bottom_gamma) / 2.0;
+                    self.draw_blend_gradient(
+                        ui,
+                        overlap_rect,
+                        false, // vertical
+                        16,
+                        avg_gamma,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Compute intersection of two normalized Rects, returning None if no overlap
+    fn rect_intersection(a: &Rect, b: &Rect) -> Option<Rect> {
+        let left = a.x.max(b.x);
+        let top = a.y.max(b.y);
+        let right = (a.x + a.width).min(b.x + b.width);
+        let bottom = (a.y + a.height).min(b.y + b.height);
+
+        if left < right && top < bottom {
+            Some(Rect {
+                x: left,
+                y: top,
+                width: right - left,
+                height: bottom - top,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Draw a blend gradient using strips of varying alpha
+    fn draw_blend_gradient(
+        &self,
+        ui: &egui::Ui,
+        rect: egui::Rect,
+        horizontal: bool,
+        num_strips: usize,
+        gamma: f32,
+    ) {
+        let base_color = egui::Color32::from_rgb(255, 200, 0); // Amber
+        let num_strips = num_strips.max(4);
+
+        for i in 0..num_strips {
+            let t = i as f32 / (num_strips - 1) as f32;
+
+            // Compute alpha based on blend curve
+            // Two overlapping gradients: one from left/top, one from right/bottom
+            // Left/top gradient: alpha = pow(t, gamma) (increases from 0 to 1)
+            // Right/bottom gradient: alpha = pow(1-t, gamma) (decreases from 1 to 0)
+            // Combined: multiply them together for the characteristic blend curve
+            let alpha_left = t.powf(gamma);
+            let alpha_right = (1.0 - t).powf(gamma);
+            let combined_alpha = (alpha_left * alpha_right * 4.0).min(1.0); // Scale and clamp
+
+            let alpha = (combined_alpha * 80.0) as u8; // Max alpha of 80 for visibility
+            let color = egui::Color32::from_rgba_unmultiplied(
+                base_color.r(),
+                base_color.g(),
+                base_color.b(),
+                alpha,
+            );
+
+            let strip_rect = if horizontal {
+                let strip_width = rect.width() / num_strips as f32;
+                egui::Rect::from_min_size(
+                    egui::pos2(rect.left() + i as f32 * strip_width, rect.top()),
+                    egui::vec2(strip_width + 1.0, rect.height()), // +1 to avoid gaps
+                )
+            } else {
+                let strip_height = rect.height() / num_strips as f32;
+                egui::Rect::from_min_size(
+                    egui::pos2(rect.left(), rect.top() + i as f32 * strip_height),
+                    egui::vec2(rect.width(), strip_height + 1.0), // +1 to avoid gaps
+                )
+            };
+
+            ui.painter().rect_filled(strip_rect, 0.0, color);
+        }
+    }
+
+    /// Hit test to find which handle (if any) is under the pointer
+    fn hit_test_rect_handle(
+        &self,
+        pointer_pos: egui::Pos2,
+        rect: egui::Rect,
+    ) -> Option<RectHandle> {
+        let handle_radius = 15.0; // Larger radius for easier grabbing
+
+        // Check corner handles first (priority)
+        let corners = [
+            (rect.left_top(), RectHandle::TopLeft),
+            (rect.right_top(), RectHandle::TopRight),
+            (rect.left_bottom(), RectHandle::BottomLeft),
+            (rect.right_bottom(), RectHandle::BottomRight),
+        ];
+
+        for (pos, handle) in corners {
+            if pointer_pos.distance(pos) < handle_radius {
+                return Some(handle);
+            }
+        }
+
+        // Check edge midpoints
+        let edges = [
+            (egui::pos2(rect.center().x, rect.top()), RectHandle::TopEdge),
+            (egui::pos2(rect.center().x, rect.bottom()), RectHandle::BottomEdge),
+            (egui::pos2(rect.left(), rect.center().y), RectHandle::LeftEdge),
+            (egui::pos2(rect.right(), rect.center().y), RectHandle::RightEdge),
+        ];
+
+        for (pos, handle) in edges {
+            if pointer_pos.distance(pos) < handle_radius {
+                return Some(handle);
+            }
+        }
+
+        // Check if inside the rectangle (for body drag)
+        if rect.contains(pointer_pos) {
+            return Some(RectHandle::Body);
+        }
+
+        None
+    }
+
+    /// Get the appropriate cursor for a handle
+    fn cursor_for_handle(handle: RectHandle) -> egui::CursorIcon {
+        match handle {
+            RectHandle::TopLeft | RectHandle::BottomRight => egui::CursorIcon::ResizeNwSe,
+            RectHandle::TopRight | RectHandle::BottomLeft => egui::CursorIcon::ResizeNeSw,
+            RectHandle::TopEdge | RectHandle::BottomEdge => egui::CursorIcon::ResizeVertical,
+            RectHandle::LeftEdge | RectHandle::RightEdge => egui::CursorIcon::ResizeHorizontal,
+            RectHandle::Body => egui::CursorIcon::Grab,
+        }
+    }
+
+    /// Handle click-to-select and drag-to-edit interactions in environment preview
+    fn handle_environment_interactions(
+        &mut self,
+        ui: &egui::Ui,
+        preview_rect: egui::Rect,
+        preview_size: egui::Vec2,
+        screens: &[&Screen],
+        actions: &mut Vec<AdvancedOutputAction>,
+        response: &egui::Response,
+    ) {
+        // Helper to find screen at position
+        let find_screen_at = |pos: egui::Pos2| -> Option<(ScreenId, Rect, egui::Rect)> {
+            for screen in screens.iter().rev() {
+                let input_rect = screen.slices.first()
+                    .map(|s| s.input_rect)
+                    .unwrap_or_else(Rect::full);
+
+                let screen_rect = egui::Rect::from_min_size(
+                    preview_rect.min + egui::vec2(
+                        input_rect.x * preview_size.x,
+                        input_rect.y * preview_size.y,
+                    ),
+                    egui::vec2(
+                        input_rect.width * preview_size.x,
+                        input_rect.height * preview_size.y,
+                    ),
+                );
+
+                if screen_rect.contains(pos) {
+                    return Some((screen.id, input_rect, screen_rect));
+                }
+            }
+            None
+        };
+
+        // Set cursor based on what's under the pointer
+        if let Some(pointer_pos) = response.hover_pos() {
+            let mut cursor_set = false;
+
+            // If we're dragging, show the appropriate cursor
+            if self.input_rect_drag.dragging_handle.is_some() {
+                if let Some(handle) = self.input_rect_drag.dragging_handle {
+                    let cursor = if handle == RectHandle::Body {
+                        egui::CursorIcon::Grabbing
+                    } else {
+                        Self::cursor_for_handle(handle)
+                    };
+                    ui.ctx().set_cursor_icon(cursor);
+                    cursor_set = true;
+                }
+            }
+
+            // Check hover over selected screen's handles
+            if !cursor_set {
+                if let Some(screen_id) = self.selected_screen {
+                    if let Some(screen) = screens.iter().find(|s| s.id == screen_id) {
+                        let input_rect = screen.slices.first()
+                            .map(|s| s.input_rect)
+                            .unwrap_or_else(Rect::full);
+
+                        let screen_rect = egui::Rect::from_min_size(
+                            preview_rect.min + egui::vec2(
+                                input_rect.x * preview_size.x,
+                                input_rect.y * preview_size.y,
+                            ),
+                            egui::vec2(
+                                input_rect.width * preview_size.x,
+                                input_rect.height * preview_size.y,
+                            ),
+                        );
+
+                        if let Some(handle) = self.hit_test_rect_handle(pointer_pos, screen_rect) {
+                            ui.ctx().set_cursor_icon(Self::cursor_for_handle(handle));
+                            cursor_set = true;
+                        }
+                    }
+                }
+            }
+
+            // Check hover over any screen (for potential selection)
+            if !cursor_set {
+                if find_screen_at(pointer_pos).is_some() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+            }
+        }
+
+        // Handle click to select (fires on mouse release without drag)
+        // Skip if we're in an active drag to prevent focus switch when dragging over other screens
+        if response.clicked() && self.input_rect_drag.dragging_screen.is_none() {
+            if let Some(pointer_pos) = response.interact_pointer_pos() {
+                if let Some((screen_id, _, _)) = find_screen_at(pointer_pos) {
+                    self.selected_screen = Some(screen_id);
+                    self.selected_slice = None;
+                    if let Some(screen) = screens.iter().find(|s| s.id == screen_id) {
+                        self.temp_screen_name = screen.name.clone();
+                        self.temp_width = screen.width.to_string();
+                        self.temp_height = screen.height.to_string();
+                    }
+                }
+            }
+        }
+
+        // Handle drag start - also select the screen if clicking on one
+        if response.drag_started() {
+            if let Some(pointer_pos) = response.interact_pointer_pos() {
+                // First, try to find a screen under the pointer
+                if let Some((screen_id, input_rect, screen_rect)) = find_screen_at(pointer_pos) {
+                    // Select this screen
+                    self.selected_screen = Some(screen_id);
+                    self.selected_slice = None;
+                    if let Some(screen) = screens.iter().find(|s| s.id == screen_id) {
+                        self.temp_screen_name = screen.name.clone();
+                        self.temp_width = screen.width.to_string();
+                        self.temp_height = screen.height.to_string();
+                    }
+
+                    // Check if we're on a handle of this screen
+                    if let Some(handle) = self.hit_test_rect_handle(pointer_pos, screen_rect) {
+                        // Store starting position (normalized)
+                        let start_norm_x = (pointer_pos.x - preview_rect.left()) / preview_size.x;
+                        let start_norm_y = (pointer_pos.y - preview_rect.top()) / preview_size.y;
+
+                        self.input_rect_drag = InputRectDragState {
+                            dragging_screen: Some(screen_id),
+                            dragging_handle: Some(handle),
+                            original_rect: Some(input_rect),
+                            start_pos: Some([start_norm_x, start_norm_y]),
+                        };
+                    }
+                } else if let Some(screen_id) = self.selected_screen {
+                    // No screen under pointer, but we have a selected screen
+                    // Check if we're on its handles
+                    if let Some(screen) = screens.iter().find(|s| s.id == screen_id) {
+                        let input_rect = screen.slices.first()
+                            .map(|s| s.input_rect)
+                            .unwrap_or_else(Rect::full);
+
+                        let screen_rect = egui::Rect::from_min_size(
+                            preview_rect.min + egui::vec2(
+                                input_rect.x * preview_size.x,
+                                input_rect.y * preview_size.y,
+                            ),
+                            egui::vec2(
+                                input_rect.width * preview_size.x,
+                                input_rect.height * preview_size.y,
+                            ),
+                        );
+
+                        if let Some(handle) = self.hit_test_rect_handle(pointer_pos, screen_rect) {
+                            let start_norm_x = (pointer_pos.x - preview_rect.left()) / preview_size.x;
+                            let start_norm_y = (pointer_pos.y - preview_rect.top()) / preview_size.y;
+
+                            self.input_rect_drag = InputRectDragState {
+                                dragging_screen: Some(screen_id),
+                                dragging_handle: Some(handle),
+                                original_rect: Some(input_rect),
+                                start_pos: Some([start_norm_x, start_norm_y]),
+                            };
+                        }
+                    }
+                }
+            }
+        }
+
+        // Handle drag
+        if response.dragged() {
+            if let Some(screen_id) = self.input_rect_drag.dragging_screen {
+                if let Some(handle) = self.input_rect_drag.dragging_handle {
+                    if let Some(original_rect) = self.input_rect_drag.original_rect {
+                        if let Some(start_pos) = self.input_rect_drag.start_pos {
+                            if let Some(pointer_pos) = response.interact_pointer_pos() {
+                                let new_rect = self.compute_dragged_rect(
+                                    pointer_pos,
+                                    preview_rect,
+                                    preview_size,
+                                    original_rect,
+                                    handle,
+                                    start_pos,
+                                );
+
+                                actions.push(AdvancedOutputAction::UpdateScreenInputRect {
+                                    screen_id,
+                                    input_rect: new_rect,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Handle drag end
+        if response.drag_stopped() {
+            self.input_rect_drag = InputRectDragState::default();
+        }
+    }
+
+    /// Compute the new rect based on which handle is being dragged
+    fn compute_dragged_rect(
+        &self,
+        pointer_pos: egui::Pos2,
+        preview_rect: egui::Rect,
+        preview_size: egui::Vec2,
+        original_rect: Rect,
+        handle: RectHandle,
+        start_pos: [f32; 2],
+    ) -> Rect {
+        // Convert pointer position to normalized coordinates
+        let norm_x = ((pointer_pos.x - preview_rect.left()) / preview_size.x).clamp(0.0, 1.0);
+        let norm_y = ((pointer_pos.y - preview_rect.top()) / preview_size.y).clamp(0.0, 1.0);
+
+        let mut new_rect = original_rect;
+        let min_size = 0.05; // Minimum 5% size
+
+        match handle {
+            RectHandle::TopLeft => {
+                let right = original_rect.x + original_rect.width;
+                let bottom = original_rect.y + original_rect.height;
+                new_rect.x = norm_x.min(right - min_size);
+                new_rect.y = norm_y.min(bottom - min_size);
+                new_rect.width = right - new_rect.x;
+                new_rect.height = bottom - new_rect.y;
+            }
+            RectHandle::TopRight => {
+                let bottom = original_rect.y + original_rect.height;
+                new_rect.y = norm_y.min(bottom - min_size);
+                new_rect.width = (norm_x - original_rect.x).max(min_size);
+                new_rect.height = bottom - new_rect.y;
+            }
+            RectHandle::BottomLeft => {
+                let right = original_rect.x + original_rect.width;
+                new_rect.x = norm_x.min(right - min_size);
+                new_rect.width = right - new_rect.x;
+                new_rect.height = (norm_y - original_rect.y).max(min_size);
+            }
+            RectHandle::BottomRight => {
+                new_rect.width = (norm_x - original_rect.x).max(min_size);
+                new_rect.height = (norm_y - original_rect.y).max(min_size);
+            }
+            RectHandle::TopEdge => {
+                let bottom = original_rect.y + original_rect.height;
+                new_rect.y = norm_y.min(bottom - min_size);
+                new_rect.height = bottom - new_rect.y;
+            }
+            RectHandle::BottomEdge => {
+                new_rect.height = (norm_y - original_rect.y).max(min_size);
+            }
+            RectHandle::LeftEdge => {
+                let right = original_rect.x + original_rect.width;
+                new_rect.x = norm_x.min(right - min_size);
+                new_rect.width = right - new_rect.x;
+            }
+            RectHandle::RightEdge => {
+                new_rect.width = (norm_x - original_rect.x).max(min_size);
+            }
+            RectHandle::Body => {
+                // Move the entire rect by total delta from start position
+                let delta_norm_x = norm_x - start_pos[0];
+                let delta_norm_y = norm_y - start_pos[1];
+                new_rect.x = (original_rect.x + delta_norm_x).clamp(0.0, 1.0 - original_rect.width);
+                new_rect.y = (original_rect.y + delta_norm_y).clamp(0.0, 1.0 - original_rect.height);
+            }
+        }
+
+        new_rect.clamped()
+    }
+
+    /// Render simplified screen properties for the Screens tab
+    fn render_screen_properties_simplified(
+        &mut self,
+        ui: &mut egui::Ui,
+        screen: &Screen,
+        all_screens: &[&Screen],
+        available_displays: &[DisplayInfo],
+        env_dimensions: (u32, u32),
+        actions: &mut Vec<AdvancedOutputAction>,
+    ) {
+        let mut changed = false;
+        let mut screen_copy = screen.clone();
+        let (env_width, env_height) = env_dimensions;
+
+        // Name
+        ui.horizontal(|ui| {
+            ui.label("Name:");
+            if ui.text_edit_singleline(&mut self.temp_screen_name).changed() {
+                screen_copy.name = self.temp_screen_name.clone();
+                changed = true;
+            }
+        });
+
+        ui.add_space(4.0);
+
+        // Resolution
+        ui.label("Resolution:");
+        ui.horizontal(|ui| {
+            ui.label("W:");
+            let width_response = ui.add(
+                egui::TextEdit::singleline(&mut self.temp_width).desired_width(50.0),
+            );
+            ui.label("H:");
+            let height_response = ui.add(
+                egui::TextEdit::singleline(&mut self.temp_height).desired_width(50.0),
+            );
+
+            if width_response.lost_focus() || height_response.lost_focus() {
+                if let (Ok(w), Ok(h)) = (self.temp_width.parse::<u32>(), self.temp_height.parse::<u32>()) {
+                    if w > 0 && h > 0 && (w != screen.width || h != screen.height) {
+                        screen_copy.width = w;
+                        screen_copy.height = h;
+                        changed = true;
+                    }
+                }
+            }
+        });
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(4.0);
+
+        // Output Device section
+        ui.label(egui::RichText::new("Output Device").strong());
+        ui.add_space(4.0);
+
+        // Device type selector (full options)
+        let current_device_type = screen.device.type_name();
+        egui::ComboBox::from_id_salt("device_type_screens_tab")
+            .selected_text(current_device_type)
+            .show_ui(ui, |ui| {
+                // Virtual
+                if ui.selectable_label(matches!(screen_copy.device, OutputDevice::Virtual), "Virtual").clicked() {
+                    screen_copy.device = OutputDevice::Virtual;
+                    changed = true;
+                }
+
+                // Display (only show if displays are available)
+                if !available_displays.is_empty() {
+                    if ui.selectable_label(matches!(screen_copy.device, OutputDevice::Display { .. }), "Display").clicked() {
+                        screen_copy.device = OutputDevice::Display {
+                            display_id: available_displays[0].id,
+                        };
+                        changed = true;
+                    }
+                }
+
+                // NDI
+                if ui.selectable_label(matches!(screen_copy.device, OutputDevice::Ndi { .. }), "NDI").clicked() {
+                    let base_name = if self.temp_device_name.is_empty() {
+                        format!("{} NDI", screen.name)
+                    } else {
+                        self.temp_device_name.clone()
+                    };
+                    // Ensure unique NDI name to avoid conflicts
+                    let name = Self::unique_ndi_name(&base_name, screen.id, all_screens);
+                    screen_copy.device = OutputDevice::Ndi { name };
+                    self.temp_device_name = if let OutputDevice::Ndi { name } = &screen_copy.device {
+                        name.clone()
+                    } else {
+                        String::new()
+                    };
+                    changed = true;
+                }
+
+                // OMT
+                if ui.selectable_label(matches!(screen_copy.device, OutputDevice::Omt { .. }), "OMT").clicked() {
+                    let name = if self.temp_device_name.is_empty() {
+                        format!("{} OMT", screen.name)
+                    } else {
+                        self.temp_device_name.clone()
+                    };
+                    let port = self.temp_omt_port.parse().unwrap_or(5960);
+                    screen_copy.device = OutputDevice::Omt { name, port };
+                    self.temp_device_name = if let OutputDevice::Omt { name, .. } = &screen_copy.device {
+                        name.clone()
+                    } else {
+                        String::new()
+                    };
+                    changed = true;
+                }
+
+                // Syphon (macOS only)
+                #[cfg(target_os = "macos")]
+                if ui.selectable_label(matches!(screen_copy.device, OutputDevice::Syphon { .. }), "Syphon").clicked() {
+                    let name = if self.temp_device_name.is_empty() {
+                        format!("{} Syphon", screen.name)
+                    } else {
+                        self.temp_device_name.clone()
+                    };
+                    screen_copy.device = OutputDevice::Syphon { name };
+                    self.temp_device_name = if let OutputDevice::Syphon { name } = &screen_copy.device {
+                        name.clone()
+                    } else {
+                        String::new()
+                    };
+                    changed = true;
+                }
+
+                // Spout (Windows only)
+                #[cfg(target_os = "windows")]
+                if ui.selectable_label(matches!(screen_copy.device, OutputDevice::Spout { .. }), "Spout").clicked() {
+                    let name = if self.temp_device_name.is_empty() {
+                        format!("{} Spout", screen.name)
+                    } else {
+                        self.temp_device_name.clone()
+                    };
+                    screen_copy.device = OutputDevice::Spout { name };
+                    self.temp_device_name = if let OutputDevice::Spout { name } = &screen_copy.device {
+                        name.clone()
+                    } else {
+                        String::new()
+                    };
+                    changed = true;
+                }
+            });
+
+        ui.add_space(4.0);
+
+        // Device-specific configuration
+        let (is_virtual, current_display_id, current_name, current_port) = match &screen_copy.device {
+            OutputDevice::Virtual => (true, None, None, None),
+            OutputDevice::Display { display_id } => (false, Some(*display_id), None, None),
+            OutputDevice::Ndi { name } => (false, None, Some(name.clone()), None),
+            OutputDevice::Omt { name, port } => (false, None, Some(name.clone()), Some(*port)),
+            #[cfg(target_os = "macos")]
+            OutputDevice::Syphon { name } => (false, None, Some(name.clone()), None),
+            #[cfg(target_os = "windows")]
+            OutputDevice::Spout { name } => (false, None, Some(name.clone()), None),
+        };
+
+        if is_virtual {
+            ui.label(egui::RichText::new("Preview only (no output)").weak().italics());
+        } else if let Some(display_id) = current_display_id {
+            // Display selector dropdown
+            let current_display = available_displays.iter().find(|d| d.id == display_id);
+            let is_disconnected = current_display.is_none();
+            let display_label = current_display
+                .map(|d| d.label())
+                .unwrap_or_else(|| format!("Display {} (disconnected)", display_id));
+
+            ui.horizontal(|ui| {
+                ui.label("Monitor:");
+                egui::ComboBox::from_id_salt("display_selector_screens_tab")
+                    .selected_text(&display_label)
+                    .show_ui(ui, |ui| {
+                        for display in available_displays {
+                            if ui.selectable_label(display.id == display_id, display.label()).clicked() {
+                                screen_copy.device = OutputDevice::Display { display_id: display.id };
+                                changed = true;
+                            }
+                        }
+                    });
+            });
+
+            // Show warning if display is disconnected
+            if is_disconnected {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("⚠").color(egui::Color32::YELLOW));
+                    ui.label(
+                        egui::RichText::new("Display disconnected - output paused")
+                            .color(egui::Color32::YELLOW)
+                            .italics()
+                    );
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Switch to Virtual").clicked() {
+                        screen_copy.device = OutputDevice::Virtual;
+                        changed = true;
+                    }
+                });
+            }
+        } else if matches!(screen_copy.device, OutputDevice::Ndi { .. }) {
+            // NDI name editor
+            if let Some(ref name) = current_name {
+                if self.temp_device_name.is_empty() || !self.temp_device_name.eq(name) {
+                    self.temp_device_name = name.clone();
+                }
+            }
+
+            // Check for name conflicts with other screens
+            let has_conflict = all_screens.iter()
+                .filter(|s| s.id != screen.id)
+                .any(|s| {
+                    if let OutputDevice::Ndi { name } = &s.device {
+                        name == &self.temp_device_name
+                    } else {
+                        false
+                    }
+                });
+
+            ui.horizontal(|ui| {
+                ui.label("Name:");
+                let response = ui.text_edit_singleline(&mut self.temp_device_name);
+                if response.changed() {
+                    screen_copy.device = OutputDevice::Ndi {
+                        name: self.temp_device_name.clone(),
+                    };
+                    changed = true;
+                }
+                if has_conflict {
+                    ui.colored_label(egui::Color32::from_rgb(255, 180, 0), "⚠");
+                }
+            });
+            if has_conflict {
+                ui.colored_label(
+                    egui::Color32::from_rgb(255, 180, 0),
+                    "Warning: Name conflicts with another screen's NDI output"
+                );
+            }
+        } else if matches!(screen_copy.device, OutputDevice::Omt { .. }) {
+            // OMT name and port editor
+            if let Some(ref name) = current_name {
+                if self.temp_device_name.is_empty() || !self.temp_device_name.eq(name) {
+                    self.temp_device_name = name.clone();
+                }
+            }
+            if let Some(port) = current_port {
+                if self.temp_omt_port.is_empty() {
+                    self.temp_omt_port = port.to_string();
+                }
+            }
+            ui.horizontal(|ui| {
+                ui.label("Name:");
+                if ui.text_edit_singleline(&mut self.temp_device_name).changed() {
+                    screen_copy.device = OutputDevice::Omt {
+                        name: self.temp_device_name.clone(),
+                        port: self.temp_omt_port.parse().unwrap_or(5960),
+                    };
+                    changed = true;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Port:");
+                if ui.add(egui::TextEdit::singleline(&mut self.temp_omt_port).desired_width(60.0)).changed() {
+                    if let Ok(p) = self.temp_omt_port.parse::<u16>() {
+                        screen_copy.device = OutputDevice::Omt {
+                            name: self.temp_device_name.clone(),
+                            port: p,
+                        };
+                        changed = true;
+                    }
+                }
+            });
+        }
+        #[cfg(target_os = "macos")]
+        if matches!(screen_copy.device, OutputDevice::Syphon { .. }) {
+            // Syphon name editor
+            if let Some(ref name) = current_name {
+                if self.temp_device_name.is_empty() || !self.temp_device_name.eq(name) {
+                    self.temp_device_name = name.clone();
+                }
+            }
+            ui.horizontal(|ui| {
+                ui.label("Name:");
+                if ui.text_edit_singleline(&mut self.temp_device_name).changed() {
+                    screen_copy.device = OutputDevice::Syphon {
+                        name: self.temp_device_name.clone(),
+                    };
+                    changed = true;
+                }
+            });
+        }
+        #[cfg(target_os = "windows")]
+        if matches!(screen_copy.device, OutputDevice::Spout { .. }) {
+            // Spout name editor
+            if let Some(ref name) = current_name {
+                if self.temp_device_name.is_empty() || !self.temp_device_name.eq(name) {
+                    self.temp_device_name = name.clone();
+                }
+            }
+            ui.horizontal(|ui| {
+                ui.label("Name:");
+                if ui.text_edit_singleline(&mut self.temp_device_name).changed() {
+                    screen_copy.device = OutputDevice::Spout {
+                        name: self.temp_device_name.clone(),
+                    };
+                    changed = true;
+                }
+            });
+        }
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(4.0);
+
+        // Input Rect section (displayed in pixels)
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Input Region").strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("Full").on_hover_text("Reset to full environment").clicked() {
+                    actions.push(AdvancedOutputAction::UpdateScreenInputRect {
+                        screen_id: screen.id,
+                        input_rect: Rect::full(),
+                    });
+                }
+            });
+        });
+        ui.add_space(4.0);
+
+        // Show current input_rect (from first slice), converted to pixels
+        let input_rect = screen.slices.first().map(|s| s.input_rect).unwrap_or_else(Rect::full);
+
+        // Convert normalized values to pixels for display
+        let x_px = (input_rect.x * env_width as f32).round() as i32;
+        let y_px = (input_rect.y * env_height as f32).round() as i32;
+        let w_px = (input_rect.width * env_width as f32).round() as i32;
+        let h_px = (input_rect.height * env_height as f32).round() as i32;
+
+        ui.horizontal(|ui| {
+            ui.label("X:");
+            let mut x = x_px;
+            if ui.add(egui::DragValue::new(&mut x).range(0..=env_width as i32).speed(1.0).suffix("px")).changed() {
+                let mut new_rect = input_rect;
+                new_rect.x = (x as f32 / env_width as f32).clamp(0.0, 1.0);
+                actions.push(AdvancedOutputAction::UpdateScreenInputRect {
+                    screen_id: screen.id,
+                    input_rect: new_rect,
+                });
+            }
+            ui.label("Y:");
+            let mut y = y_px;
+            if ui.add(egui::DragValue::new(&mut y).range(0..=env_height as i32).speed(1.0).suffix("px")).changed() {
+                let mut new_rect = input_rect;
+                new_rect.y = (y as f32 / env_height as f32).clamp(0.0, 1.0);
+                actions.push(AdvancedOutputAction::UpdateScreenInputRect {
+                    screen_id: screen.id,
+                    input_rect: new_rect,
+                });
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("W:");
+            let mut w = w_px;
+            if ui.add(egui::DragValue::new(&mut w).range(1..=env_width as i32).speed(1.0).suffix("px")).changed() {
+                let mut new_rect = input_rect;
+                new_rect.width = (w as f32 / env_width as f32).clamp(0.01, 1.0);
+                actions.push(AdvancedOutputAction::UpdateScreenInputRect {
+                    screen_id: screen.id,
+                    input_rect: new_rect,
+                });
+            }
+            ui.label("H:");
+            let mut h = h_px;
+            if ui.add(egui::DragValue::new(&mut h).range(1..=env_height as i32).speed(1.0).suffix("px")).changed() {
+                let mut new_rect = input_rect;
+                new_rect.height = (h as f32 / env_height as f32).clamp(0.01, 1.0);
+                actions.push(AdvancedOutputAction::UpdateScreenInputRect {
+                    screen_id: screen.id,
+                    input_rect: new_rect,
+                });
+            }
+        });
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(4.0);
+
+        // Timing section (for projector sync)
+        ui.label(egui::RichText::new("Timing").strong());
+        ui.add_space(4.0);
+
+        // Frame delay slider
+        ui.horizontal(|ui| {
+            ui.label("Delay:");
+
+            // Convert to i32 for slider, then back to u32
+            let mut delay_val = screen_copy.delay_ms as i32;
+            let slider = egui::Slider::new(&mut delay_val, 0..=500)
+                .suffix(" ms")
+                .clamping(egui::SliderClamping::Always);
+
+            if ui.add(slider).changed() {
+                screen_copy.delay_ms = delay_val.max(0) as u32;
+                changed = true;
+            }
+
+            // Show frame count at 60fps as reference
+            let frames_at_60 = (screen_copy.delay_ms as f32 * 60.0 / 1000.0).round() as u32;
+            if frames_at_60 > 0 {
+                ui.label(format!("({} frames @ 60fps)", frames_at_60))
+                    .on_hover_text("Number of frames of delay at 60 FPS");
+            }
+        });
+
+        if screen_copy.delay_ms > 0 {
+            ui.label(egui::RichText::new("Delay active - output will lag behind preview").weak().italics());
+        }
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(4.0);
+
+        // Color Correction section
+        ui.horizontal(|ui| {
+            ui.label("Color Correction");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("Reset").on_hover_text("Reset color to defaults").clicked() {
+                    screen_copy.color = crate::output::OutputColorCorrection::default();
+                    changed = true;
+                }
+            });
+        });
+        ui.add_space(4.0);
+
+        // Brightness slider
+        ui.horizontal(|ui| {
+            ui.label("Brightness:");
+            if ui.add(egui::Slider::new(&mut screen_copy.color.brightness, -1.0..=1.0).max_decimals(2)).changed() {
+                changed = true;
+            }
+        });
+
+        // Contrast slider
+        ui.horizontal(|ui| {
+            ui.label("Contrast:");
+            if ui.add(egui::Slider::new(&mut screen_copy.color.contrast, 0.0..=2.0).max_decimals(2)).changed() {
+                changed = true;
+            }
+        });
+
+        // Gamma slider
+        ui.horizontal(|ui| {
+            ui.label("Gamma:");
+            if ui.add(egui::Slider::new(&mut screen_copy.color.gamma, 0.1..=4.0).logarithmic(true).max_decimals(2)).changed() {
+                changed = true;
+            }
+        });
+
+        // Saturation slider
+        ui.horizontal(|ui| {
+            ui.label("Saturation:");
+            if ui.add(egui::Slider::new(&mut screen_copy.color.saturation, 0.0..=2.0).max_decimals(2)).changed() {
+                changed = true;
+            }
+        });
+
+        // RGB Channels (collapsing section)
+        ui.collapsing("RGB Channels", |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Red:");
+                if ui.add(egui::Slider::new(&mut screen_copy.color.red, 0.0..=2.0).max_decimals(2)).changed() {
+                    changed = true;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Green:");
+                if ui.add(egui::Slider::new(&mut screen_copy.color.green, 0.0..=2.0).max_decimals(2)).changed() {
+                    changed = true;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Blue:");
+                if ui.add(egui::Slider::new(&mut screen_copy.color.blue, 0.0..=2.0).max_decimals(2)).changed() {
+                    changed = true;
+                }
+            });
+        });
+
+        // Show indicator if any color correction is applied
+        if !screen_copy.color.is_identity() {
+            ui.add_space(2.0);
+            ui.colored_label(egui::Color32::GREEN, "(color modified)");
+        }
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(4.0);
+
+        // Edge Blend section (for first slice) - dynamic based on overlaps
+        if let Some(first_slice) = screen.slices.first() {
+            let mut slice_copy = first_slice.clone();
+            let mut blend_changed = false;
+
+            // Calculate which edges overlap with other screens and by how much
+            let my_rect = first_slice.input_rect;
+            let mut left_overlap_width: f32 = 0.0;
+            let mut right_overlap_width: f32 = 0.0;
+            let mut top_overlap_width: f32 = 0.0;
+            let mut bottom_overlap_width: f32 = 0.0;
+
+            for other_screen in all_screens.iter() {
+                if other_screen.id == screen.id {
+                    continue;
+                }
+                if let Some(other_slice) = other_screen.slices.first() {
+                    let other_rect = other_slice.input_rect;
+                    if let Some(intersection) = Self::rect_intersection(&my_rect, &other_rect) {
+                        // Determine which edge based on relative positions
+                        let my_center_x = my_rect.x + my_rect.width / 2.0;
+                        let other_center_x = other_rect.x + other_rect.width / 2.0;
+                        let my_center_y = my_rect.y + my_rect.height / 2.0;
+                        let other_center_y = other_rect.y + other_rect.height / 2.0;
+
+                        // Calculate overlap as fraction of screen dimension (clamped to 0.5 max)
+                        let h_overlap = (intersection.width / my_rect.width).min(0.5);
+                        let v_overlap = (intersection.height / my_rect.height).min(0.5);
+
+                        if other_center_x < my_center_x {
+                            left_overlap_width = left_overlap_width.max(h_overlap);
+                        }
+                        if other_center_x > my_center_x {
+                            right_overlap_width = right_overlap_width.max(h_overlap);
+                        }
+                        if other_center_y < my_center_y {
+                            top_overlap_width = top_overlap_width.max(v_overlap);
+                        }
+                        if other_center_y > my_center_y {
+                            bottom_overlap_width = bottom_overlap_width.max(v_overlap);
+                        }
+                    }
+                }
+            }
+
+            let has_left_overlap = left_overlap_width > 0.0;
+            let has_right_overlap = right_overlap_width > 0.0;
+            let has_top_overlap = top_overlap_width > 0.0;
+            let has_bottom_overlap = bottom_overlap_width > 0.0;
+            let has_any_overlap = has_left_overlap || has_right_overlap || has_top_overlap || has_bottom_overlap;
+
+            // Always show blend section
+            ui.label(egui::RichText::new("Edge Blend").strong());
+            ui.add_space(4.0);
+
+            // Show overlap info
+            if has_any_overlap {
+                let mut overlap_labels = Vec::new();
+                if has_left_overlap { overlap_labels.push(format!("Left {:.0}%", left_overlap_width * 100.0)); }
+                if has_right_overlap { overlap_labels.push(format!("Right {:.0}%", right_overlap_width * 100.0)); }
+                if has_top_overlap { overlap_labels.push(format!("Top {:.0}%", top_overlap_width * 100.0)); }
+                if has_bottom_overlap { overlap_labels.push(format!("Bottom {:.0}%", bottom_overlap_width * 100.0)); }
+                ui.label(egui::RichText::new(format!("Overlaps: {}", overlap_labels.join(", "))).small().weak());
+            } else {
+                ui.label(egui::RichText::new("No overlaps detected").small().weak());
+            }
+            ui.add_space(4.0);
+
+            // Master enable toggle - always visible and always works
+            let is_enabled = slice_copy.output.edge_blend.is_any_enabled();
+            let mut enable_blend = is_enabled;
+            if ui.checkbox(&mut enable_blend, "Enable Blending").changed() {
+                if enable_blend {
+                    // Enable overlapping edges with width based on actual overlap
+                    // If no overlaps, enable all edges with default (will have no effect until overlap happens)
+                    let edge = &mut slice_copy.output.edge_blend;
+                    if has_any_overlap {
+                        if has_left_overlap {
+                            edge.left.enabled = true;
+                            edge.left.width = left_overlap_width;
+                            edge.left.gamma = 2.2;
+                        }
+                        if has_right_overlap {
+                            edge.right.enabled = true;
+                            edge.right.width = right_overlap_width;
+                            edge.right.gamma = 2.2;
+                        }
+                        if has_top_overlap {
+                            edge.top.enabled = true;
+                            edge.top.width = top_overlap_width;
+                            edge.top.gamma = 2.2;
+                        }
+                        if has_bottom_overlap {
+                            edge.bottom.enabled = true;
+                            edge.bottom.width = bottom_overlap_width;
+                            edge.bottom.gamma = 2.2;
+                        }
+                    } else {
+                        // No overlaps yet - enable all edges so blending kicks in when overlaps happen
+                        *edge = EdgeBlendConfig::all(0.15, 2.2);
+                    }
+                } else {
+                    slice_copy.output.edge_blend.disable_all();
+                }
+                blend_changed = true;
+            }
+
+            // Show sliders when blending is enabled
+            if enable_blend {
+                ui.add_space(4.0);
+
+                // Get current values (use first enabled edge as reference)
+                let edge = &mut slice_copy.output.edge_blend;
+                let ref_edge = if edge.left.enabled { &edge.left }
+                    else if edge.right.enabled { &edge.right }
+                    else if edge.top.enabled { &edge.top }
+                    else { &edge.bottom };
+                let mut gamma = ref_edge.gamma;
+                let mut luminance = ref_edge.black_level;
+                let mut power = ref_edge.width;
+
+                // Gamma slider
+                ui.horizontal(|ui| {
+                    ui.label("Gamma:");
+                    if ui.add(egui::Slider::new(&mut gamma, 0.1..=4.0).max_decimals(1)).changed() {
+                        edge.left.gamma = gamma;
+                        edge.right.gamma = gamma;
+                        edge.top.gamma = gamma;
+                        edge.bottom.gamma = gamma;
+                        blend_changed = true;
+                    }
+                });
+
+                // Luminance slider
+                ui.horizontal(|ui| {
+                    ui.label("Luminance:");
+                    if ui.add(egui::Slider::new(&mut luminance, 0.0..=1.0).max_decimals(2)).changed() {
+                        edge.left.black_level = luminance;
+                        edge.right.black_level = luminance;
+                        edge.top.black_level = luminance;
+                        edge.bottom.black_level = luminance;
+                        blend_changed = true;
+                    }
+                });
+
+                // Power slider (blend width)
+                ui.horizontal(|ui| {
+                    ui.label("Power:");
+                    if ui.add(egui::Slider::new(&mut power, 0.0..=0.5).max_decimals(2)).changed() {
+                        edge.left.width = power;
+                        edge.right.width = power;
+                        edge.top.width = power;
+                        edge.bottom.width = power;
+                        blend_changed = true;
+                    }
+                });
+            }
+
+            if blend_changed {
+                actions.push(AdvancedOutputAction::UpdateSlice {
+                    screen_id: screen.id,
+                    slice_id: first_slice.id,
+                    slice: slice_copy,
+                });
+            }
+
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(4.0);
+        }
+
+        // Enabled toggle
+        let mut enabled = screen_copy.enabled;
+        if ui.checkbox(&mut enabled, "Enabled").changed() {
+            screen_copy.enabled = enabled;
+            changed = true;
+        }
+
+        if changed {
+            actions.push(AdvancedOutputAction::UpdateScreen {
+                screen_id: screen.id,
+                screen: screen_copy,
+            });
+        }
+    }
+
+    /// Render the Output Transformation tab (existing functionality)
+    fn render_output_transformation_tab(
+        &mut self,
+        ui: &mut egui::Ui,
+        screens: &[&Screen],
+        layer_count: usize,
+        actions: &mut Vec<AdvancedOutputAction>,
+    ) {
         // Three-column layout: Screens | Preview | Properties
         // Use allocate_ui_with_layout to fill available vertical space
         let available = ui.available_size();
@@ -167,7 +1699,7 @@ impl AdvancedOutputWindow {
                     .id_salt("screens_list")
                     .max_height(200.0)
                     .show(ui, |ui| {
-                        for screen in &screens {
+                        for screen in screens {
                             let is_selected = self.selected_screen == Some(screen.id);
                             let response = ui.selectable_label(
                                 is_selected,
@@ -765,8 +2297,18 @@ impl AdvancedOutputWindow {
                                         );
                                     }
                                 } else {
-                                    // Show screen properties
-                                    self.render_screen_properties(ui, screen, available_displays, actions);
+                                    // Prompt to select a slice (screen properties are on Screens tab)
+                                    ui.label(
+                                        egui::RichText::new("Select a slice to edit transformations")
+                                            .weak()
+                                            .italics(),
+                                    );
+                                    ui.add_space(8.0);
+                                    ui.label(
+                                        egui::RichText::new("Screen properties (Output Device, Timing, Color) are on the Screens tab.")
+                                            .small()
+                                            .weak(),
+                                    );
                                 }
                             }
                         } else {
@@ -779,433 +2321,6 @@ impl AdvancedOutputWindow {
                     });
             });
         });
-    }
-
-    /// Render screen properties panel
-    fn render_screen_properties(
-        &mut self,
-        ui: &mut egui::Ui,
-        screen: &Screen,
-        available_displays: &[DisplayInfo],
-        actions: &mut Vec<AdvancedOutputAction>,
-    ) {
-        let mut changed = false;
-        let mut screen_copy = screen.clone();
-
-        ui.label(egui::RichText::new("Screen Properties").strong());
-        ui.add_space(8.0);
-
-        // Name
-        ui.horizontal(|ui| {
-            ui.label("Name:");
-            if ui
-                .text_edit_singleline(&mut self.temp_screen_name)
-                .changed()
-            {
-                screen_copy.name = self.temp_screen_name.clone();
-                changed = true;
-            }
-        });
-
-        ui.add_space(4.0);
-
-        // Resolution
-        ui.label("Resolution:");
-        ui.horizontal(|ui| {
-            ui.label("W:");
-            let width_response = ui.add(
-                egui::TextEdit::singleline(&mut self.temp_width)
-                    .desired_width(50.0),
-            );
-            ui.label("H:");
-            let height_response = ui.add(
-                egui::TextEdit::singleline(&mut self.temp_height)
-                    .desired_width(50.0),
-            );
-
-            if width_response.lost_focus() || height_response.lost_focus() {
-                if let (Ok(w), Ok(h)) =
-                    (self.temp_width.parse::<u32>(), self.temp_height.parse::<u32>())
-                {
-                    if w > 0 && h > 0 && (w != screen.width || h != screen.height) {
-                        screen_copy.width = w;
-                        screen_copy.height = h;
-                        changed = true;
-                    }
-                }
-            }
-        });
-
-        ui.add_space(8.0);
-        ui.separator();
-        ui.add_space(4.0);
-
-        // Output Device section
-        ui.label(egui::RichText::new("Output Device").strong());
-        ui.add_space(4.0);
-
-        // Device type selector
-        let current_device_type = screen.device.type_name();
-        egui::ComboBox::from_id_salt("device_type")
-            .selected_text(current_device_type)
-            .show_ui(ui, |ui| {
-                // Virtual
-                if ui.selectable_label(matches!(screen_copy.device, OutputDevice::Virtual), "Virtual").clicked() {
-                    screen_copy.device = OutputDevice::Virtual;
-                    changed = true;
-                }
-
-                // Display (only show if displays are available)
-                if !available_displays.is_empty() {
-                    if ui.selectable_label(matches!(screen_copy.device, OutputDevice::Display { .. }), "Display").clicked() {
-                        // Default to first display
-                        screen_copy.device = OutputDevice::Display {
-                            display_id: available_displays[0].id,
-                        };
-                        changed = true;
-                    }
-                }
-
-                // NDI
-                if ui.selectable_label(matches!(screen_copy.device, OutputDevice::Ndi { .. }), "NDI").clicked() {
-                    let name = if self.temp_device_name.is_empty() {
-                        format!("{} NDI", screen.name)
-                    } else {
-                        self.temp_device_name.clone()
-                    };
-                    screen_copy.device = OutputDevice::Ndi { name };
-                    self.temp_device_name = if let OutputDevice::Ndi { name } = &screen_copy.device {
-                        name.clone()
-                    } else {
-                        String::new()
-                    };
-                    changed = true;
-                }
-
-                // OMT
-                if ui.selectable_label(matches!(screen_copy.device, OutputDevice::Omt { .. }), "OMT").clicked() {
-                    let name = if self.temp_device_name.is_empty() {
-                        format!("{} OMT", screen.name)
-                    } else {
-                        self.temp_device_name.clone()
-                    };
-                    let port = self.temp_omt_port.parse().unwrap_or(5960);
-                    screen_copy.device = OutputDevice::Omt { name, port };
-                    self.temp_device_name = if let OutputDevice::Omt { name, .. } = &screen_copy.device {
-                        name.clone()
-                    } else {
-                        String::new()
-                    };
-                    changed = true;
-                }
-
-                // Syphon (macOS only)
-                #[cfg(target_os = "macos")]
-                if ui.selectable_label(matches!(screen_copy.device, OutputDevice::Syphon { .. }), "Syphon").clicked() {
-                    let name = if self.temp_device_name.is_empty() {
-                        format!("{} Syphon", screen.name)
-                    } else {
-                        self.temp_device_name.clone()
-                    };
-                    screen_copy.device = OutputDevice::Syphon { name };
-                    self.temp_device_name = if let OutputDevice::Syphon { name } = &screen_copy.device {
-                        name.clone()
-                    } else {
-                        String::new()
-                    };
-                    changed = true;
-                }
-
-                // Spout (Windows only)
-                #[cfg(target_os = "windows")]
-                if ui.selectable_label(matches!(screen_copy.device, OutputDevice::Spout { .. }), "Spout").clicked() {
-                    let name = if self.temp_device_name.is_empty() {
-                        format!("{} Spout", screen.name)
-                    } else {
-                        self.temp_device_name.clone()
-                    };
-                    screen_copy.device = OutputDevice::Spout { name };
-                    self.temp_device_name = if let OutputDevice::Spout { name } = &screen_copy.device {
-                        name.clone()
-                    } else {
-                        String::new()
-                    };
-                    changed = true;
-                }
-            });
-
-        ui.add_space(4.0);
-
-        // Device-specific configuration
-        // Extract info before rendering to avoid borrow issues in closures
-        let (is_virtual, current_display_id, current_name, current_port) = match &screen_copy.device {
-            OutputDevice::Virtual => (true, None, None, None),
-            OutputDevice::Display { display_id } => (false, Some(*display_id), None, None),
-            OutputDevice::Ndi { name } => (false, None, Some(name.clone()), None),
-            OutputDevice::Omt { name, port } => (false, None, Some(name.clone()), Some(*port)),
-            #[cfg(target_os = "macos")]
-            OutputDevice::Syphon { name } => (false, None, Some(name.clone()), None),
-            #[cfg(target_os = "windows")]
-            OutputDevice::Spout { name } => (false, None, Some(name.clone()), None),
-        };
-
-        if is_virtual {
-            ui.label(egui::RichText::new("Preview only (no output)").weak().italics());
-        } else if let Some(display_id) = current_display_id {
-            // Display selector dropdown
-            let current_display = available_displays.iter().find(|d| d.id == display_id);
-            let is_disconnected = current_display.is_none();
-            let display_label = current_display
-                .map(|d| d.label())
-                .unwrap_or_else(|| format!("Display {} (disconnected)", display_id));
-
-            ui.horizontal(|ui| {
-                ui.label("Monitor:");
-                egui::ComboBox::from_id_salt("display_selector")
-                    .selected_text(&display_label)
-                    .show_ui(ui, |ui| {
-                        for display in available_displays {
-                            if ui.selectable_label(display.id == display_id, display.label()).clicked() {
-                                screen_copy.device = OutputDevice::Display { display_id: display.id };
-                                changed = true;
-                            }
-                        }
-                    });
-            });
-
-            // Show warning if display is disconnected
-            if is_disconnected {
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("⚠").color(egui::Color32::YELLOW));
-                    ui.label(
-                        egui::RichText::new("Display disconnected - output paused")
-                            .color(egui::Color32::YELLOW)
-                            .italics()
-                    );
-                });
-                ui.horizontal(|ui| {
-                    if ui.button("Switch to Virtual").clicked() {
-                        screen_copy.device = OutputDevice::Virtual;
-                        changed = true;
-                    }
-                });
-            }
-        } else if matches!(screen_copy.device, OutputDevice::Ndi { .. }) {
-            // NDI name editor
-            if let Some(ref name) = current_name {
-                if self.temp_device_name.is_empty() || !self.temp_device_name.eq(name) {
-                    self.temp_device_name = name.clone();
-                }
-            }
-            ui.horizontal(|ui| {
-                ui.label("Name:");
-                if ui.text_edit_singleline(&mut self.temp_device_name).changed() {
-                    screen_copy.device = OutputDevice::Ndi {
-                        name: self.temp_device_name.clone(),
-                    };
-                    changed = true;
-                }
-            });
-        } else if matches!(screen_copy.device, OutputDevice::Omt { .. }) {
-            // OMT name and port editor
-            if let Some(ref name) = current_name {
-                if self.temp_device_name.is_empty() || !self.temp_device_name.eq(name) {
-                    self.temp_device_name = name.clone();
-                }
-            }
-            if let Some(port) = current_port {
-                if self.temp_omt_port.is_empty() {
-                    self.temp_omt_port = port.to_string();
-                }
-            }
-            ui.horizontal(|ui| {
-                ui.label("Name:");
-                if ui.text_edit_singleline(&mut self.temp_device_name).changed() {
-                    screen_copy.device = OutputDevice::Omt {
-                        name: self.temp_device_name.clone(),
-                        port: self.temp_omt_port.parse().unwrap_or(5960),
-                    };
-                    changed = true;
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.label("Port:");
-                if ui.add(egui::TextEdit::singleline(&mut self.temp_omt_port).desired_width(60.0)).changed() {
-                    if let Ok(p) = self.temp_omt_port.parse::<u16>() {
-                        screen_copy.device = OutputDevice::Omt {
-                            name: self.temp_device_name.clone(),
-                            port: p,
-                        };
-                        changed = true;
-                    }
-                }
-            });
-        }
-        #[cfg(target_os = "macos")]
-        if matches!(screen_copy.device, OutputDevice::Syphon { .. }) {
-            // Syphon name editor
-            if let Some(ref name) = current_name {
-                if self.temp_device_name.is_empty() || !self.temp_device_name.eq(name) {
-                    self.temp_device_name = name.clone();
-                }
-            }
-            ui.horizontal(|ui| {
-                ui.label("Name:");
-                if ui.text_edit_singleline(&mut self.temp_device_name).changed() {
-                    screen_copy.device = OutputDevice::Syphon {
-                        name: self.temp_device_name.clone(),
-                    };
-                    changed = true;
-                }
-            });
-        }
-        #[cfg(target_os = "windows")]
-        if matches!(screen_copy.device, OutputDevice::Spout { .. }) {
-            // Spout name editor
-            if let Some(ref name) = current_name {
-                if self.temp_device_name.is_empty() || !self.temp_device_name.eq(name) {
-                    self.temp_device_name = name.clone();
-                }
-            }
-            ui.horizontal(|ui| {
-                ui.label("Name:");
-                if ui.text_edit_singleline(&mut self.temp_device_name).changed() {
-                    screen_copy.device = OutputDevice::Spout {
-                        name: self.temp_device_name.clone(),
-                    };
-                    changed = true;
-                }
-            });
-        }
-
-        ui.add_space(8.0);
-        ui.separator();
-        ui.add_space(4.0);
-
-        // Timing section (for projector sync)
-        ui.label(egui::RichText::new("Timing").strong());
-        ui.add_space(4.0);
-
-        // Frame delay slider
-        ui.horizontal(|ui| {
-            ui.label("Delay:");
-
-            // Convert to i32 for slider, then back to u32
-            let mut delay_val = screen_copy.delay_ms as i32;
-            let slider = egui::Slider::new(&mut delay_val, 0..=500)
-                .suffix(" ms")
-                .clamping(egui::SliderClamping::Always);
-
-            if ui.add(slider).changed() {
-                screen_copy.delay_ms = delay_val.max(0) as u32;
-                changed = true;
-            }
-
-            // Show frame count at 60fps as reference
-            let frames_at_60 = (screen_copy.delay_ms as f32 * 60.0 / 1000.0).round() as u32;
-            if frames_at_60 > 0 {
-                ui.label(format!("({} frames @ 60fps)", frames_at_60))
-                    .on_hover_text("Number of frames of delay at 60 FPS");
-            }
-        });
-
-        if screen_copy.delay_ms > 0 {
-            ui.label(egui::RichText::new("Delay active - output will lag behind preview").weak().italics());
-        }
-
-        ui.add_space(8.0);
-        ui.separator();
-        ui.add_space(4.0);
-
-        // Color Correction section
-        ui.horizontal(|ui| {
-            ui.label("Color Correction");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("Reset").on_hover_text("Reset color to defaults").clicked() {
-                    screen_copy.color = crate::output::OutputColorCorrection::default();
-                    changed = true;
-                }
-            });
-        });
-        ui.add_space(4.0);
-
-        // Brightness slider
-        ui.horizontal(|ui| {
-            ui.label("Brightness:");
-            if ui.add(egui::Slider::new(&mut screen_copy.color.brightness, -1.0..=1.0).max_decimals(2)).changed() {
-                changed = true;
-            }
-        });
-
-        // Contrast slider
-        ui.horizontal(|ui| {
-            ui.label("Contrast:");
-            if ui.add(egui::Slider::new(&mut screen_copy.color.contrast, 0.0..=2.0).max_decimals(2)).changed() {
-                changed = true;
-            }
-        });
-
-        // Gamma slider
-        ui.horizontal(|ui| {
-            ui.label("Gamma:");
-            if ui.add(egui::Slider::new(&mut screen_copy.color.gamma, 0.1..=4.0).logarithmic(true).max_decimals(2)).changed() {
-                changed = true;
-            }
-        });
-
-        // Saturation slider
-        ui.horizontal(|ui| {
-            ui.label("Saturation:");
-            if ui.add(egui::Slider::new(&mut screen_copy.color.saturation, 0.0..=2.0).max_decimals(2)).changed() {
-                changed = true;
-            }
-        });
-
-        // RGB Channels (collapsing section)
-        ui.collapsing("RGB Channels", |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Red:");
-                if ui.add(egui::Slider::new(&mut screen_copy.color.red, 0.0..=2.0).max_decimals(2)).changed() {
-                    changed = true;
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.label("Green:");
-                if ui.add(egui::Slider::new(&mut screen_copy.color.green, 0.0..=2.0).max_decimals(2)).changed() {
-                    changed = true;
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.label("Blue:");
-                if ui.add(egui::Slider::new(&mut screen_copy.color.blue, 0.0..=2.0).max_decimals(2)).changed() {
-                    changed = true;
-                }
-            });
-        });
-
-        // Show indicator if any color correction is applied
-        if !screen_copy.color.is_identity() {
-            ui.add_space(2.0);
-            ui.colored_label(egui::Color32::GREEN, "(color modified)");
-        }
-
-        ui.add_space(8.0);
-        ui.separator();
-        ui.add_space(4.0);
-
-        // Enabled toggle
-        let mut enabled = screen_copy.enabled;
-        if ui.checkbox(&mut enabled, "Enabled").changed() {
-            screen_copy.enabled = enabled;
-            changed = true;
-        }
-
-        if changed {
-            actions.push(AdvancedOutputAction::UpdateScreen {
-                screen_id: screen.id,
-                screen: screen_copy,
-            });
-        }
     }
 
     /// Render slice properties panel
@@ -1633,110 +2748,6 @@ impl AdvancedOutputWindow {
                     ui.colored_label(egui::Color32::GREEN, "(modified)");
                 }
             }
-        }
-
-        ui.add_space(8.0);
-        ui.separator();
-        ui.add_space(4.0);
-
-        // Edge Blend
-        ui.horizontal(|ui| {
-            ui.label("Edge Blend");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // Disable All button
-                if ui.small_button("Disable All").on_hover_text("Disable all edge blending").clicked() {
-                    slice_copy.output.edge_blend.disable_all();
-                    changed = true;
-                }
-            });
-        });
-        ui.add_space(4.0);
-
-        // Check if any blending is enabled
-        let has_blend = slice_copy.output.edge_blend.is_any_enabled();
-
-        // Helper function to show edge controls
-        fn edge_row(
-            ui: &mut egui::Ui,
-            label: &str,
-            enabled: &mut bool,
-            width: &mut f32,
-            gamma: &mut f32,
-            changed: &mut bool,
-        ) {
-            ui.horizontal(|ui| {
-                if ui.checkbox(enabled, label).changed() {
-                    *changed = true;
-                }
-                if *enabled {
-                    ui.add(egui::DragValue::new(width)
-                        .range(0.0..=0.5)
-                        .speed(0.005)
-                        .suffix(" W")
-                        .max_decimals(2));
-                    ui.add(egui::DragValue::new(gamma)
-                        .range(0.1..=4.0)
-                        .speed(0.05)
-                        .suffix(" γ")
-                        .max_decimals(1));
-                }
-            });
-        }
-
-        // Edge blend controls
-        {
-            let edge = &mut slice_copy.output.edge_blend;
-
-            edge_row(ui, "Left", &mut edge.left.enabled, &mut edge.left.width, &mut edge.left.gamma, &mut changed);
-            edge_row(ui, "Right", &mut edge.right.enabled, &mut edge.right.width, &mut edge.right.gamma, &mut changed);
-            edge_row(ui, "Top", &mut edge.top.enabled, &mut edge.top.width, &mut edge.top.gamma, &mut changed);
-            edge_row(ui, "Bottom", &mut edge.bottom.enabled, &mut edge.bottom.width, &mut edge.bottom.gamma, &mut changed);
-        }
-
-        // Preset buttons
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            if ui.small_button("Horizontal 15%").on_hover_text("Enable left/right edges at 15%").clicked() {
-                slice_copy.output.edge_blend = EdgeBlendConfig::horizontal(0.15, 2.2);
-                changed = true;
-            }
-            if ui.small_button("All 15%").on_hover_text("Enable all edges at 15%").clicked() {
-                slice_copy.output.edge_blend = EdgeBlendConfig::all(0.15, 2.2);
-                changed = true;
-            }
-        });
-
-        // Black level compensation (show only if any blending enabled)
-        if has_blend {
-            ui.add_space(4.0);
-            ui.collapsing("Black Level Compensation", |ui| {
-                let edge = &mut slice_copy.output.edge_blend;
-
-                ui.horizontal(|ui| {
-                    ui.label("Left:");
-                    if ui.add(egui::Slider::new(&mut edge.left.black_level, 0.0..=0.5).max_decimals(2)).changed() {
-                        changed = true;
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Right:");
-                    if ui.add(egui::Slider::new(&mut edge.right.black_level, 0.0..=0.5).max_decimals(2)).changed() {
-                        changed = true;
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Top:");
-                    if ui.add(egui::Slider::new(&mut edge.top.black_level, 0.0..=0.5).max_decimals(2)).changed() {
-                        changed = true;
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Bottom:");
-                    if ui.add(egui::Slider::new(&mut edge.bottom.black_level, 0.0..=0.5).max_decimals(2)).changed() {
-                        changed = true;
-                    }
-                });
-            });
         }
 
         ui.add_space(8.0);

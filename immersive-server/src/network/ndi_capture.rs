@@ -123,6 +123,11 @@ impl NdiCapture {
         }
     }
 
+    /// Check if capture dimensions match the given dimensions
+    pub fn dimensions_match(&self, width: u32, height: u32) -> bool {
+        self.width == width && self.height == height
+    }
+
     /// Create staging buffers for GPU readback.
     fn create_staging_buffers(
         device: &wgpu::Device,

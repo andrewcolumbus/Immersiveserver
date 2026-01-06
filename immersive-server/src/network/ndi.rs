@@ -26,9 +26,27 @@ use super::ndi_ffi::*;
 use bytes::Bytes;
 use std::ffi::{CStr, CString};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+/// Ensure NDI is initialized exactly once
+static NDI_INIT: Once = Once::new();
+static mut NDI_INITIALIZED: bool = false;
+
+/// Initialize NDI library if not already done
+fn ensure_ndi_initialized() -> bool {
+    NDI_INIT.call_once(|| {
+        let result = super::ndi_ffi::initialize();
+        unsafe { NDI_INITIALIZED = result; }
+        if result {
+            tracing::info!("NDI: Library initialized successfully (version: {})", super::ndi_ffi::version());
+        } else {
+            tracing::error!("NDI: Failed to initialize library - is NDI SDK installed?");
+        }
+    });
+    unsafe { NDI_INITIALIZED }
+}
 
 // =============================================================================
 // NdiFrame
@@ -402,6 +420,20 @@ impl NdiSender {
     /// automatically - if you submit frames faster than the target rate,
     /// the SDK will block until the correct time.
     pub fn new(name: &str, frame_rate: u32) -> Result<Self, NdiError> {
+        // Ensure NDI library is initialized
+        if !ensure_ndi_initialized() {
+            return Err(NdiError::NotInitialized);
+        }
+
+        // Check if CPU supports NDI
+        if !super::ndi_ffi::is_supported_cpu() {
+            tracing::error!("NDI: CPU is not supported");
+            return Err(NdiError::Creation("CPU not supported by NDI".into()));
+        }
+
+        tracing::info!("NDI: Creating sender '{}' at {}fps (lib version: {})",
+            name, frame_rate, super::ndi_ffi::version());
+
         let c_name = CString::new(name).map_err(|_| NdiError::InvalidName)?;
 
         let create_settings = NDIlib_send_create_t {
@@ -413,7 +445,8 @@ impl NdiSender {
 
         let sender = unsafe { NDIlib_send_create(&create_settings) };
         if sender.is_null() {
-            return Err(NdiError::Creation("Failed to create NDI sender".into()));
+            tracing::error!("NDI: NDIlib_send_create returned null for '{}'", name);
+            return Err(NdiError::Creation(format!("Failed to create NDI sender '{}' - check NDI SDK installation", name)));
         }
 
         tracing::info!(
