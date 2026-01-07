@@ -99,32 +99,71 @@ impl Rect {
         self.y + self.height
     }
 
-    /// Clamp values to valid range (0.0-1.0)
+    /// Clamp values to valid range (allows negative for overscan)
     pub fn clamped(&self) -> Self {
         Self {
-            x: self.x.clamp(0.0, 1.0),
-            y: self.y.clamp(0.0, 1.0),
-            width: self.width.clamp(0.0, 1.0 - self.x.clamp(0.0, 1.0)),
-            height: self.height.clamp(0.0, 1.0 - self.y.clamp(0.0, 1.0)),
+            x: self.x.clamp(-1.0, 2.0),
+            y: self.y.clamp(-1.0, 2.0),
+            width: self.width.clamp(0.01, 3.0),
+            height: self.height.clamp(0.01, 3.0),
         }
     }
 }
 
 /// Input source for a slice
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type")]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SliceInput {
     /// Sample from the full composited environment
-    #[serde(rename = "Composition")]
     Composition,
 
     /// Sample from a specific layer (pre-composition)
-    #[serde(rename = "Layer")]
     Layer {
         /// ID of the layer to sample
-        #[serde(rename = "layerId")]
         layer_id: u32,
     },
+}
+
+/// Helper struct for SliceInput serialization (quick-xml compatible)
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SliceInputHelper {
+    #[serde(rename = "type")]
+    input_type: String,
+    #[serde(rename = "layerId", default, skip_serializing_if = "Option::is_none")]
+    layer_id: Option<u32>,
+}
+
+impl serde::Serialize for SliceInput {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let helper = match self {
+            SliceInput::Composition => SliceInputHelper {
+                input_type: "Composition".to_string(),
+                layer_id: None,
+            },
+            SliceInput::Layer { layer_id } => SliceInputHelper {
+                input_type: "Layer".to_string(),
+                layer_id: Some(*layer_id),
+            },
+        };
+        helper.serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for SliceInput {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let helper = SliceInputHelper::deserialize(deserializer)?;
+        match helper.input_type.as_str() {
+            "Layer" => Ok(SliceInput::Layer {
+                layer_id: helper.layer_id.unwrap_or(0),
+            }),
+            _ => Ok(SliceInput::Composition),
+        }
+    }
 }
 
 impl Default for SliceInput {

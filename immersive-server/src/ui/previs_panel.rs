@@ -240,20 +240,28 @@ impl PrevisPanel {
         ui.add_space(4.0);
 
         let mut radius = settings.circle_radius;
-        if ui
-            .add(egui::Slider::new(&mut radius, 1.0..=20.0).text("Radius"))
-            .changed()
-        {
+        let response = ui.add(egui::Slider::new(&mut radius, 1.0..=20.0).text("Radius"));
+        if response.changed() {
             actions.push(PrevisAction::SetCircleRadius(radius));
         }
+        response.context_menu(|ui| {
+            if ui.button("Reset to 5.0").clicked() {
+                actions.push(PrevisAction::SetCircleRadius(5.0));
+                ui.close_menu();
+            }
+        });
 
         let mut segments = settings.circle_segments;
-        if ui
-            .add(egui::Slider::new(&mut segments, 8..=64).text("Segments"))
-            .changed()
-        {
+        let response = ui.add(egui::Slider::new(&mut segments, 8..=64).text("Segments"));
+        if response.changed() {
             actions.push(PrevisAction::SetCircleSegments(segments));
         }
+        response.context_menu(|ui| {
+            if ui.button("Reset to 32").clicked() {
+                actions.push(PrevisAction::SetCircleSegments(32));
+                ui.close_menu();
+            }
+        });
     }
 
     fn render_walls_params(
@@ -284,20 +292,28 @@ impl PrevisPanel {
 
                     ui.add_enabled_ui(wall_enabled, |ui| {
                         let mut w = width;
-                        if ui
-                            .add(egui::Slider::new(&mut w, 1.0..=10.0).text("Width"))
-                            .changed()
-                        {
+                        let response = ui.add(egui::Slider::new(&mut w, 1.0..=10.0).text("Width"));
+                        if response.changed() {
                             actions.push(PrevisAction::SetWallWidth(wall_id, w));
                         }
+                        response.context_menu(|ui| {
+                            if ui.button("Reset to 4.0").clicked() {
+                                actions.push(PrevisAction::SetWallWidth(wall_id, 4.0));
+                                ui.close_menu();
+                            }
+                        });
 
                         let mut h = height;
-                        if ui
-                            .add(egui::Slider::new(&mut h, 1.0..=10.0).text("Height"))
-                            .changed()
-                        {
+                        let response = ui.add(egui::Slider::new(&mut h, 1.0..=10.0).text("Height"));
+                        if response.changed() {
                             actions.push(PrevisAction::SetWallHeight(wall_id, h));
                         }
+                        response.context_menu(|ui| {
+                            if ui.button("Reset to 3.0").clicked() {
+                                actions.push(PrevisAction::SetWallHeight(wall_id, 3.0));
+                                ui.close_menu();
+                            }
+                        });
                     });
                 });
         };
@@ -375,28 +391,40 @@ impl PrevisPanel {
         ui.add_space(4.0);
 
         let mut radius = settings.dome_radius;
-        if ui
-            .add(egui::Slider::new(&mut radius, 1.0..=20.0).text("Radius"))
-            .changed()
-        {
+        let response = ui.add(egui::Slider::new(&mut radius, 1.0..=20.0).text("Radius"));
+        if response.changed() {
             actions.push(PrevisAction::SetDomeRadius(radius));
         }
+        response.context_menu(|ui| {
+            if ui.button("Reset to 5.0").clicked() {
+                actions.push(PrevisAction::SetDomeRadius(5.0));
+                ui.close_menu();
+            }
+        });
 
         let mut h_seg = settings.dome_segments_horizontal;
-        if ui
-            .add(egui::Slider::new(&mut h_seg, 8..=64).text("H Segments"))
-            .changed()
-        {
+        let response = ui.add(egui::Slider::new(&mut h_seg, 8..=64).text("H Segments"));
+        if response.changed() {
             actions.push(PrevisAction::SetDomeSegmentsH(h_seg));
         }
+        response.context_menu(|ui| {
+            if ui.button("Reset to 32").clicked() {
+                actions.push(PrevisAction::SetDomeSegmentsH(32));
+                ui.close_menu();
+            }
+        });
 
         let mut v_seg = settings.dome_segments_vertical;
-        if ui
-            .add(egui::Slider::new(&mut v_seg, 4..=32).text("V Segments"))
-            .changed()
-        {
+        let response = ui.add(egui::Slider::new(&mut v_seg, 4..=32).text("V Segments"));
+        if response.changed() {
             actions.push(PrevisAction::SetDomeSegmentsV(v_seg));
         }
+        response.context_menu(|ui| {
+            if ui.button("Reset to 16").clicked() {
+                actions.push(PrevisAction::SetDomeSegmentsV(16));
+                ui.close_menu();
+            }
+        });
     }
 
     /// Get the desired viewport size for render target sizing

@@ -934,8 +934,30 @@ impl ApplicationHandler for ImmersiveApp {
                         // Render the screen content
                         Self::render_monitor_window(window_id, window_registry, app);
                     }
+                    WindowEvent::KeyboardInput { event, .. } => {
+                        // Handle Escape to close monitor window
+                        if event.state == ElementState::Pressed {
+                            if let PhysicalKey::Code(KeyCode::Escape) = event.physical_key {
+                                use immersive_server::output::ScreenId;
+                                // Same logic as CloseRequested - close window and fall back to Virtual
+                                if let Some(entry) = window_registry.get(window_id) {
+                                    if let Some(output_id) = entry.output_id() {
+                                        let screen_id = ScreenId(output_id);
+                                        tracing::info!("Monitor window closed via Escape for screen {:?}", screen_id);
+                                        if let Some(output_manager) = app.output_manager_mut() {
+                                            output_manager.remove_window_for_screen(screen_id);
+                                            if let Some(screen) = output_manager.get_screen_mut(screen_id) {
+                                                screen.device = immersive_server::output::OutputDevice::Virtual;
+                                            }
+                                        }
+                                    }
+                                }
+                                window_registry.mark_closed(window_id);
+                            }
+                        }
+                    }
                     _ => {
-                        // Monitor windows don't need egui event forwarding
+                        // Monitor windows don't need other event handling
                     }
                 }
             } else {
@@ -1023,6 +1045,21 @@ impl ApplicationHandler for ImmersiveApp {
                 && self.modifiers.state().shift_key() =>
             {
                 app.advanced_output_window.toggle();
+            }
+
+            // Handle Cmd/Ctrl+Shift+L to toggle test pattern
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(KeyCode::KeyL),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } if (self.modifiers.state().super_key() || self.modifiers.state().control_key())
+                && self.modifiers.state().shift_key() =>
+            {
+                app.toggle_test_pattern();
             }
 
             // Handle keyboard input (only if egui doesn't want it)

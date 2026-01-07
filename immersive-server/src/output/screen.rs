@@ -3,7 +3,7 @@
 //! A Screen represents a single output destination (display, projector, NDI stream, etc.)
 //! Each screen contains one or more slices that define what content is shown and where.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::color::OutputColorCorrection;
 use super::slice::Slice;
@@ -19,56 +19,137 @@ impl std::fmt::Display for ScreenId {
 }
 
 /// Output destination type
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type")]
+#[derive(Debug, Clone, PartialEq)]
 pub enum OutputDevice {
     /// Internal preview only (no external output)
     Virtual,
 
     /// Physical display/monitor/projector
-    #[serde(rename = "Display")]
     Display {
         /// Display identifier from OS
-        #[serde(rename = "displayId")]
         display_id: u32,
     },
 
     /// NDI network output
-    #[serde(rename = "Ndi")]
     Ndi {
         /// NDI source name
-        #[serde(rename = "name")]
         name: String,
     },
 
     /// OMT (Open Media Transport) network output
-    #[serde(rename = "Omt")]
     Omt {
         /// OMT source name
-        #[serde(rename = "name")]
         name: String,
         /// OMT port
-        #[serde(rename = "port")]
         port: u16,
     },
 
     /// Syphon texture sharing (macOS only)
     #[cfg(target_os = "macos")]
-    #[serde(rename = "Syphon")]
     Syphon {
         /// Syphon server name
-        #[serde(rename = "name")]
         name: String,
     },
 
     /// Spout texture sharing (Windows only)
     #[cfg(target_os = "windows")]
-    #[serde(rename = "Spout")]
     Spout {
         /// Spout sender name
-        #[serde(rename = "name")]
         name: String,
     },
+}
+
+/// Helper struct for OutputDevice serialization (quick-xml compatible)
+#[derive(Serialize, Deserialize)]
+struct OutputDeviceHelper {
+    #[serde(rename = "type")]
+    device_type: String,
+    #[serde(rename = "displayId", default, skip_serializing_if = "Option::is_none")]
+    display_id: Option<u32>,
+    #[serde(rename = "name", default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(rename = "port", default, skip_serializing_if = "Option::is_none")]
+    port: Option<u16>,
+}
+
+impl Serialize for OutputDevice {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let helper = match self {
+            OutputDevice::Virtual => OutputDeviceHelper {
+                device_type: "Virtual".to_string(),
+                display_id: None,
+                name: None,
+                port: None,
+            },
+            OutputDevice::Display { display_id } => OutputDeviceHelper {
+                device_type: "Display".to_string(),
+                display_id: Some(*display_id),
+                name: None,
+                port: None,
+            },
+            OutputDevice::Ndi { name } => OutputDeviceHelper {
+                device_type: "Ndi".to_string(),
+                display_id: None,
+                name: Some(name.clone()),
+                port: None,
+            },
+            OutputDevice::Omt { name, port } => OutputDeviceHelper {
+                device_type: "Omt".to_string(),
+                display_id: None,
+                name: Some(name.clone()),
+                port: Some(*port),
+            },
+            #[cfg(target_os = "macos")]
+            OutputDevice::Syphon { name } => OutputDeviceHelper {
+                device_type: "Syphon".to_string(),
+                display_id: None,
+                name: Some(name.clone()),
+                port: None,
+            },
+            #[cfg(target_os = "windows")]
+            OutputDevice::Spout { name } => OutputDeviceHelper {
+                device_type: "Spout".to_string(),
+                display_id: None,
+                name: Some(name.clone()),
+                port: None,
+            },
+        };
+        helper.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for OutputDevice {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let helper = OutputDeviceHelper::deserialize(deserializer)?;
+        match helper.device_type.as_str() {
+            "Virtual" => Ok(OutputDevice::Virtual),
+            "Display" => Ok(OutputDevice::Display {
+                display_id: helper.display_id.unwrap_or(0),
+            }),
+            "Ndi" => Ok(OutputDevice::Ndi {
+                name: helper.name.unwrap_or_default(),
+            }),
+            "Omt" => Ok(OutputDevice::Omt {
+                name: helper.name.unwrap_or_default(),
+                port: helper.port.unwrap_or(5000),
+            }),
+            #[cfg(target_os = "macos")]
+            "Syphon" => Ok(OutputDevice::Syphon {
+                name: helper.name.unwrap_or_default(),
+            }),
+            #[cfg(target_os = "windows")]
+            "Spout" => Ok(OutputDevice::Spout {
+                name: helper.name.unwrap_or_default(),
+            }),
+            _ => Ok(OutputDevice::Virtual),
+        }
+    }
 }
 
 impl Default for OutputDevice {

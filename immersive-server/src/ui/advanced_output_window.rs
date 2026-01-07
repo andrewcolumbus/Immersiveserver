@@ -42,6 +42,29 @@ pub struct InputRectDragState {
     pub start_pos: Option<[f32; 2]>,
 }
 
+/// State for interactive output_rect editing in Output Transformation tab
+#[derive(Debug, Clone, Default)]
+pub struct OutputRectDragState {
+    /// Which slice is being dragged (if any)
+    pub dragging_slice: Option<SliceId>,
+    /// Which handle of the rect is being dragged
+    pub dragging_handle: Option<RectHandle>,
+    /// Original rect when drag started (for computing delta)
+    pub original_rect: Option<Rect>,
+    /// Starting pointer position (normalized 0-1) for body drag
+    pub start_pos: Option<[f32; 2]>,
+}
+
+/// Editing mode for Output Transformation tab
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutputEditMode {
+    /// Resize mode: drag handles to resize slice output_rect
+    #[default]
+    Resize,
+    /// Mesh Warp mode: drag points to adjust warp mesh
+    MeshWarp,
+}
+
 /// Actions returned from the Advanced Output window
 #[derive(Debug, Clone)]
 pub enum AdvancedOutputAction {
@@ -101,6 +124,10 @@ pub struct AdvancedOutputWindow {
     pub environment_texture_id: Option<egui::TextureId>,
     /// State for dragging input_rect handles in environment view
     input_rect_drag: InputRectDragState,
+    /// State for dragging output_rect handles in Output Transformation tab
+    output_rect_drag: OutputRectDragState,
+    /// Current editing mode for Output Transformation tab
+    output_edit_mode: OutputEditMode,
     /// Viewport for environment preview (Screens tab) pan/zoom
     env_viewport: Viewport,
     /// Viewport for screen output preview (Output Transformation tab) pan/zoom
@@ -134,6 +161,8 @@ impl AdvancedOutputWindow {
             current_tab: AdvancedOutputTab::default(),
             environment_texture_id: None,
             input_rect_drag: InputRectDragState::default(),
+            output_rect_drag: OutputRectDragState::default(),
+            output_edit_mode: OutputEditMode::default(),
             env_viewport: Viewport::new(),
             output_viewport: Viewport::new(),
             last_viewport_update: std::time::Instant::now(),
@@ -479,15 +508,20 @@ impl AdvancedOutputWindow {
         let zoom = self.env_viewport.zoom();
 
         for (index, screen) in screens.iter().enumerate() {
-            // Get the input_rect for this screen (use first slice, or default to full)
-            let input_rect = screen.slices.first()
-                .map(|s| s.input_rect)
+            // Get the transform rect for this screen (use first slice's output.rect, or default to full)
+            let transform_rect = screen.slices.first()
+                .map(|s| Rect {
+                    x: s.output.rect.x,
+                    y: s.output.rect.y,
+                    width: s.output.rect.width,
+                    height: s.output.rect.height,
+                })
                 .unwrap_or_else(Rect::full);
 
             // Convert normalized rect to screen coordinates using viewport transform
             let screen_rect = self.transform_rect_to_screen(
                 &self.env_viewport,
-                &input_rect,
+                &transform_rect,
                 preview_rect,
                 preview_size,
                 content_size,
@@ -541,18 +575,18 @@ impl AdvancedOutputWindow {
 
             // Draw corner/edge handles for selected screen (clipped)
             if is_selected {
-                self.draw_rect_handles(&painter, screen_rect, preview_rect, zoom);
+                self.draw_rect_handles(&painter, screen_rect, zoom);
             }
         }
     }
 
     /// Draw corner and edge handles for the selected screen's input_rect
-    fn draw_rect_handles(&self, ui: &egui::Ui, rect: egui::Rect, clip_rect: egui::Rect, zoom: f32) {
+    fn draw_rect_handles(&self, painter: &egui::Painter, rect: egui::Rect, zoom: f32) {
         let handle_radius = (8.0 * zoom).clamp(4.0, 16.0);
         let handle_color = egui::Color32::WHITE;
         let handle_stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(100, 149, 237));
 
-        // Corner handles
+        // Corner handles (painter is already clipped, so just draw)
         let corners = [
             rect.left_top(),
             rect.right_top(),
@@ -561,10 +595,8 @@ impl AdvancedOutputWindow {
         ];
 
         for pos in corners {
-            if clip_rect.contains(pos) {
-                ui.painter().circle_filled(pos, handle_radius, handle_color);
-                ui.painter().circle_stroke(pos, handle_radius, handle_stroke);
-            }
+            painter.circle_filled(pos, handle_radius, handle_color);
+            painter.circle_stroke(pos, handle_radius, handle_stroke);
         }
 
         // Edge midpoint handles (scale with zoom)
@@ -577,10 +609,8 @@ impl AdvancedOutputWindow {
         ];
 
         for pos in edges {
-            if clip_rect.contains(pos) {
-                ui.painter().circle_filled(pos, edge_handle_radius, handle_color);
-                ui.painter().circle_stroke(pos, edge_handle_radius, handle_stroke);
-            }
+            painter.circle_filled(pos, edge_handle_radius, handle_color);
+            painter.circle_stroke(pos, edge_handle_radius, handle_stroke);
         }
     }
 
@@ -593,12 +623,21 @@ impl AdvancedOutputWindow {
         screens: &[&Screen],
         content_size: (f32, f32),
     ) {
-        // Get input_rects and edge blend configs for all screens
+        // Create a clipped painter that only draws within preview_rect
+        let painter = ui.painter().with_clip_rect(preview_rect);
+
+        // Get transform rects and edge blend configs for all screens
         let screen_data: Vec<_> = screens
             .iter()
             .filter_map(|screen| {
                 let slice = screen.slices.first()?;
-                Some((screen.id, slice.input_rect, &slice.output.edge_blend))
+                let transform_rect = Rect {
+                    x: slice.output.rect.x,
+                    y: slice.output.rect.y,
+                    width: slice.output.rect.width,
+                    height: slice.output.rect.height,
+                };
+                Some((screen.id, transform_rect, &slice.output.edge_blend))
             })
             .collect();
 
@@ -659,7 +698,7 @@ impl AdvancedOutputWindow {
                 if left_blend && right_blend {
                     let avg_gamma = (left_gamma + right_gamma) / 2.0;
                     self.draw_blend_gradient(
-                        ui,
+                        &painter,
                         overlap_rect,
                         true, // horizontal
                         16,
@@ -671,7 +710,7 @@ impl AdvancedOutputWindow {
                 if top_blend && bottom_blend {
                     let avg_gamma = (top_gamma + bottom_gamma) / 2.0;
                     self.draw_blend_gradient(
-                        ui,
+                        &painter,
                         overlap_rect,
                         false, // vertical
                         16,
@@ -704,7 +743,7 @@ impl AdvancedOutputWindow {
     /// Draw a blend gradient using strips of varying alpha
     fn draw_blend_gradient(
         &self,
-        ui: &egui::Ui,
+        painter: &egui::Painter,
         rect: egui::Rect,
         horizontal: bool,
         num_strips: usize,
@@ -747,7 +786,7 @@ impl AdvancedOutputWindow {
                 )
             };
 
-            ui.painter().rect_filled(strip_rect, 0.0, color);
+            painter.rect_filled(strip_rect, 0.0, color);
         }
     }
 
@@ -825,20 +864,25 @@ impl AdvancedOutputWindow {
         // Helper to find screen at position (using viewport transform)
         let find_screen_at = |this: &Self, pos: egui::Pos2| -> Option<(ScreenId, Rect, egui::Rect)> {
             for screen in screens.iter().rev() {
-                let input_rect = screen.slices.first()
-                    .map(|s| s.input_rect)
+                let transform_rect = screen.slices.first()
+                    .map(|s| Rect {
+                        x: s.output.rect.x,
+                        y: s.output.rect.y,
+                        width: s.output.rect.width,
+                        height: s.output.rect.height,
+                    })
                     .unwrap_or_else(Rect::full);
 
                 let screen_rect = this.transform_rect_to_screen(
                     &this.env_viewport,
-                    &input_rect,
+                    &transform_rect,
                     preview_rect,
                     preview_size,
                     content_size,
                 );
 
                 if screen_rect.contains(pos) {
-                    return Some((screen.id, input_rect, screen_rect));
+                    return Some((screen.id, transform_rect, screen_rect));
                 }
             }
             None
@@ -865,13 +909,18 @@ impl AdvancedOutputWindow {
             if !cursor_set {
                 if let Some(screen_id) = self.selected_screen {
                     if let Some(screen) = screens.iter().find(|s| s.id == screen_id) {
-                        let input_rect = screen.slices.first()
-                            .map(|s| s.input_rect)
+                        let transform_rect = screen.slices.first()
+                            .map(|s| Rect {
+                                x: s.output.rect.x,
+                                y: s.output.rect.y,
+                                width: s.output.rect.width,
+                                height: s.output.rect.height,
+                            })
                             .unwrap_or_else(Rect::full);
 
                         let screen_rect = self.transform_rect_to_screen(
                             &self.env_viewport,
-                            &input_rect,
+                            &transform_rect,
                             preview_rect,
                             preview_size,
                             content_size,
@@ -914,7 +963,7 @@ impl AdvancedOutputWindow {
         if response.drag_started_by(egui::PointerButton::Primary) {
             if let Some(pointer_pos) = response.interact_pointer_pos() {
                 // First, try to find a screen under the pointer
-                if let Some((screen_id, input_rect, screen_rect)) = find_screen_at(self, pointer_pos) {
+                if let Some((screen_id, transform_rect, screen_rect)) = find_screen_at(self, pointer_pos) {
                     // Select this screen
                     self.selected_screen = Some(screen_id);
                     self.selected_slice = None;
@@ -938,7 +987,7 @@ impl AdvancedOutputWindow {
                         self.input_rect_drag = InputRectDragState {
                             dragging_screen: Some(screen_id),
                             dragging_handle: Some(handle),
-                            original_rect: Some(input_rect),
+                            original_rect: Some(transform_rect),
                             start_pos: Some([start_norm_x, start_norm_y]),
                         };
                     }
@@ -946,13 +995,18 @@ impl AdvancedOutputWindow {
                     // No screen under pointer, but we have a selected screen
                     // Check if we're on its handles
                     if let Some(screen) = screens.iter().find(|s| s.id == screen_id) {
-                        let input_rect = screen.slices.first()
-                            .map(|s| s.input_rect)
+                        let transform_rect = screen.slices.first()
+                            .map(|s| Rect {
+                                x: s.output.rect.x,
+                                y: s.output.rect.y,
+                                width: s.output.rect.width,
+                                height: s.output.rect.height,
+                            })
                             .unwrap_or_else(Rect::full);
 
                         let screen_rect = self.transform_rect_to_screen(
                             &self.env_viewport,
-                            &input_rect,
+                            &transform_rect,
                             preview_rect,
                             preview_size,
                             content_size,
@@ -970,7 +1024,7 @@ impl AdvancedOutputWindow {
                             self.input_rect_drag = InputRectDragState {
                                 dragging_screen: Some(screen_id),
                                 dragging_handle: Some(handle),
-                                original_rect: Some(input_rect),
+                                original_rect: Some(transform_rect),
                                 start_pos: Some([start_norm_x, start_norm_y]),
                             };
                         }
@@ -994,6 +1048,7 @@ impl AdvancedOutputWindow {
                                     handle,
                                     start_pos,
                                     content_size,
+                                    false, // use env_viewport
                                 );
 
                                 actions.push(AdvancedOutputAction::UpdateScreenInputRect {
@@ -1011,9 +1066,43 @@ impl AdvancedOutputWindow {
         if response.drag_stopped_by(egui::PointerButton::Primary) {
             self.input_rect_drag = InputRectDragState::default();
         }
+
+        // Handle right-click to reset screen input_rect to full
+        if response.clicked_by(egui::PointerButton::Secondary) {
+            if let Some(pointer_pos) = response.interact_pointer_pos() {
+                // Check each screen's handles
+                for screen in screens.iter() {
+                    let transform_rect = screen.slices.first()
+                        .map(|s| Rect {
+                            x: s.output.rect.x,
+                            y: s.output.rect.y,
+                            width: s.output.rect.width,
+                            height: s.output.rect.height,
+                        })
+                        .unwrap_or_else(Rect::full);
+
+                    let screen_rect = self.transform_rect_to_screen(
+                        &self.env_viewport,
+                        &transform_rect,
+                        preview_rect,
+                        preview_size,
+                        content_size,
+                    );
+
+                    if self.hit_test_rect_handle(pointer_pos, screen_rect).is_some() {
+                        actions.push(AdvancedOutputAction::UpdateScreenInputRect {
+                            screen_id: screen.id,
+                            input_rect: Rect::full(),
+                        });
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     /// Compute the new rect based on which handle is being dragged (viewport-aware)
+    /// If use_output_viewport is true, uses output_viewport; otherwise uses env_viewport
     fn compute_dragged_rect_with_viewport(
         &self,
         pointer_pos: egui::Pos2,
@@ -1023,10 +1112,12 @@ impl AdvancedOutputWindow {
         handle: RectHandle,
         start_pos: [f32; 2],
         content_size: (f32, f32),
+        use_output_viewport: bool,
     ) -> Rect {
         // Convert pointer position to normalized coordinates using viewport inverse transform
+        let viewport = if use_output_viewport { &self.output_viewport } else { &self.env_viewport };
         let (norm_x, norm_y) = self.transform_point_from_screen(
-            &self.env_viewport,
+            viewport,
             pointer_pos,
             preview_rect,
             preview_size,
@@ -1081,8 +1172,8 @@ impl AdvancedOutputWindow {
                 // Move the entire rect by total delta from start position
                 let delta_norm_x = norm_x - start_pos[0];
                 let delta_norm_y = norm_y - start_pos[1];
-                new_rect.x = (original_rect.x + delta_norm_x).clamp(0.0, 1.0 - original_rect.width);
-                new_rect.y = (original_rect.y + delta_norm_y).clamp(0.0, 1.0 - original_rect.height);
+                new_rect.x = original_rect.x + delta_norm_x;
+                new_rect.y = original_rect.y + delta_norm_y;
             }
         }
 
@@ -1159,8 +1250,14 @@ impl AdvancedOutputWindow {
                 // Display (only show if displays are available)
                 if !available_displays.is_empty() {
                     if ui.selectable_label(matches!(screen_copy.device, OutputDevice::Display { .. }), "Display").clicked() {
+                        // Prefer non-primary display to avoid covering the main UI
+                        let default_display = available_displays
+                            .iter()
+                            .find(|d| !d.is_primary)
+                            .or_else(|| available_displays.first())
+                            .unwrap();
                         screen_copy.device = OutputDevice::Display {
-                            display_id: available_displays[0].id,
+                            display_id: default_display.id,
                         };
                         changed = true;
                     }
@@ -1291,6 +1388,20 @@ impl AdvancedOutputWindow {
                     }
                 });
             }
+
+            // Show warning if primary display is selected (UI may be covered)
+            if let Some(display) = current_display {
+                if display.is_primary {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("⚠").color(egui::Color32::YELLOW));
+                        ui.label(
+                            egui::RichText::new("Primary display - UI may be covered (press Escape to close)")
+                                .color(egui::Color32::YELLOW)
+                                .italics()
+                        );
+                    });
+                }
+            }
         } else if matches!(screen_copy.device, OutputDevice::Ndi { .. }) {
             // NDI name editor
             if let Some(ref name) = current_name {
@@ -1405,9 +1516,9 @@ impl AdvancedOutputWindow {
         ui.separator();
         ui.add_space(4.0);
 
-        // Input Rect section (displayed in pixels)
+        // Transform section (displayed in pixels)
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Input Region").strong());
+            ui.label(egui::RichText::new("Transform").strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.small_button("Full").on_hover_text("Reset to full environment").clicked() {
                     actions.push(AdvancedOutputAction::UpdateScreenInputRect {
@@ -1419,21 +1530,28 @@ impl AdvancedOutputWindow {
         });
         ui.add_space(4.0);
 
-        // Show current input_rect (from first slice), converted to pixels
-        let input_rect = screen.slices.first().map(|s| s.input_rect).unwrap_or_else(Rect::full);
+        // Show current transform rect (from first slice's output.rect), converted to pixels
+        let transform_rect = screen.slices.first()
+            .map(|s| Rect {
+                x: s.output.rect.x,
+                y: s.output.rect.y,
+                width: s.output.rect.width,
+                height: s.output.rect.height,
+            })
+            .unwrap_or_else(Rect::full);
 
-        // Convert normalized values to pixels for display
-        let x_px = (input_rect.x * env_width as f32).round() as i32;
-        let y_px = (input_rect.y * env_height as f32).round() as i32;
-        let w_px = (input_rect.width * env_width as f32).round() as i32;
-        let h_px = (input_rect.height * env_height as f32).round() as i32;
+        // Convert normalized values to pixels for display (allow negative for overscan)
+        let x_px = (transform_rect.x * env_width as f32).round() as i32;
+        let y_px = (transform_rect.y * env_height as f32).round() as i32;
+        let w_px = (transform_rect.width * env_width as f32).round() as i32;
+        let h_px = (transform_rect.height * env_height as f32).round() as i32;
 
         ui.horizontal(|ui| {
             ui.label("X:");
             let mut x = x_px;
-            if ui.add(egui::DragValue::new(&mut x).range(0..=env_width as i32).speed(1.0).suffix("px")).changed() {
-                let mut new_rect = input_rect;
-                new_rect.x = (x as f32 / env_width as f32).clamp(0.0, 1.0);
+            if ui.add(egui::DragValue::new(&mut x).range(-(env_width as i32)..=(env_width as i32 * 2)).speed(1.0).suffix("px")).changed() {
+                let mut new_rect = transform_rect;
+                new_rect.x = x as f32 / env_width as f32;
                 actions.push(AdvancedOutputAction::UpdateScreenInputRect {
                     screen_id: screen.id,
                     input_rect: new_rect,
@@ -1441,9 +1559,9 @@ impl AdvancedOutputWindow {
             }
             ui.label("Y:");
             let mut y = y_px;
-            if ui.add(egui::DragValue::new(&mut y).range(0..=env_height as i32).speed(1.0).suffix("px")).changed() {
-                let mut new_rect = input_rect;
-                new_rect.y = (y as f32 / env_height as f32).clamp(0.0, 1.0);
+            if ui.add(egui::DragValue::new(&mut y).range(-(env_height as i32)..=(env_height as i32 * 2)).speed(1.0).suffix("px")).changed() {
+                let mut new_rect = transform_rect;
+                new_rect.y = y as f32 / env_height as f32;
                 actions.push(AdvancedOutputAction::UpdateScreenInputRect {
                     screen_id: screen.id,
                     input_rect: new_rect,
@@ -1454,9 +1572,9 @@ impl AdvancedOutputWindow {
         ui.horizontal(|ui| {
             ui.label("W:");
             let mut w = w_px;
-            if ui.add(egui::DragValue::new(&mut w).range(1..=env_width as i32).speed(1.0).suffix("px")).changed() {
-                let mut new_rect = input_rect;
-                new_rect.width = (w as f32 / env_width as f32).clamp(0.01, 1.0);
+            if ui.add(egui::DragValue::new(&mut w).range(1..=(env_width as i32 * 3)).speed(1.0).suffix("px")).changed() {
+                let mut new_rect = transform_rect;
+                new_rect.width = (w as f32 / env_width as f32).max(0.01);
                 actions.push(AdvancedOutputAction::UpdateScreenInputRect {
                     screen_id: screen.id,
                     input_rect: new_rect,
@@ -1464,9 +1582,9 @@ impl AdvancedOutputWindow {
             }
             ui.label("H:");
             let mut h = h_px;
-            if ui.add(egui::DragValue::new(&mut h).range(1..=env_height as i32).speed(1.0).suffix("px")).changed() {
-                let mut new_rect = input_rect;
-                new_rect.height = (h as f32 / env_height as f32).clamp(0.01, 1.0);
+            if ui.add(egui::DragValue::new(&mut h).range(1..=(env_height as i32 * 3)).speed(1.0).suffix("px")).changed() {
+                let mut new_rect = transform_rect;
+                new_rect.height = (h as f32 / env_height as f32).max(0.01);
                 actions.push(AdvancedOutputAction::UpdateScreenInputRect {
                     screen_id: screen.id,
                     input_rect: new_rect,
@@ -1492,10 +1610,18 @@ impl AdvancedOutputWindow {
                 .suffix(" ms")
                 .clamping(egui::SliderClamping::Always);
 
-            if ui.add(slider).changed() {
+            let response = ui.add(slider);
+            if response.changed() {
                 screen_copy.delay_ms = delay_val.max(0) as u32;
                 changed = true;
             }
+            response.context_menu(|ui| {
+                if ui.button("Reset to 0").clicked() {
+                    screen_copy.delay_ms = 0;
+                    changed = true;
+                    ui.close_menu();
+                }
+            });
 
             // Show frame count at 60fps as reference
             let frames_at_60 = (screen_copy.delay_ms as f32 * 60.0 / 1000.0).round() as u32;
@@ -1528,54 +1654,110 @@ impl AdvancedOutputWindow {
         // Brightness slider
         ui.horizontal(|ui| {
             ui.label("Brightness:");
-            if ui.add(egui::Slider::new(&mut screen_copy.color.brightness, -1.0..=1.0).max_decimals(2)).changed() {
+            let response = ui.add(egui::Slider::new(&mut screen_copy.color.brightness, -1.0..=1.0).max_decimals(2));
+            if response.changed() {
                 changed = true;
             }
+            response.context_menu(|ui| {
+                if ui.button("Reset to 0").clicked() {
+                    screen_copy.color.brightness = 0.0;
+                    changed = true;
+                    ui.close_menu();
+                }
+            });
         });
 
         // Contrast slider
         ui.horizontal(|ui| {
             ui.label("Contrast:");
-            if ui.add(egui::Slider::new(&mut screen_copy.color.contrast, 0.0..=2.0).max_decimals(2)).changed() {
+            let response = ui.add(egui::Slider::new(&mut screen_copy.color.contrast, 0.0..=2.0).max_decimals(2));
+            if response.changed() {
                 changed = true;
             }
+            response.context_menu(|ui| {
+                if ui.button("Reset to 1").clicked() {
+                    screen_copy.color.contrast = 1.0;
+                    changed = true;
+                    ui.close_menu();
+                }
+            });
         });
 
         // Gamma slider
         ui.horizontal(|ui| {
             ui.label("Gamma:");
-            if ui.add(egui::Slider::new(&mut screen_copy.color.gamma, 0.1..=4.0).logarithmic(true).max_decimals(2)).changed() {
+            let response = ui.add(egui::Slider::new(&mut screen_copy.color.gamma, 0.1..=4.0).logarithmic(true).max_decimals(2));
+            if response.changed() {
                 changed = true;
             }
+            response.context_menu(|ui| {
+                if ui.button("Reset to 1").clicked() {
+                    screen_copy.color.gamma = 1.0;
+                    changed = true;
+                    ui.close_menu();
+                }
+            });
         });
 
         // Saturation slider
         ui.horizontal(|ui| {
             ui.label("Saturation:");
-            if ui.add(egui::Slider::new(&mut screen_copy.color.saturation, 0.0..=2.0).max_decimals(2)).changed() {
+            let response = ui.add(egui::Slider::new(&mut screen_copy.color.saturation, 0.0..=2.0).max_decimals(2));
+            if response.changed() {
                 changed = true;
             }
+            response.context_menu(|ui| {
+                if ui.button("Reset to 1").clicked() {
+                    screen_copy.color.saturation = 1.0;
+                    changed = true;
+                    ui.close_menu();
+                }
+            });
         });
 
         // RGB Channels (collapsing section)
         ui.collapsing("RGB Channels", |ui| {
             ui.horizontal(|ui| {
                 ui.label("Red:");
-                if ui.add(egui::Slider::new(&mut screen_copy.color.red, 0.0..=2.0).max_decimals(2)).changed() {
+                let response = ui.add(egui::Slider::new(&mut screen_copy.color.red, 0.0..=2.0).max_decimals(2));
+                if response.changed() {
                     changed = true;
                 }
+                response.context_menu(|ui| {
+                    if ui.button("Reset to 1").clicked() {
+                        screen_copy.color.red = 1.0;
+                        changed = true;
+                        ui.close_menu();
+                    }
+                });
             });
             ui.horizontal(|ui| {
                 ui.label("Green:");
-                if ui.add(egui::Slider::new(&mut screen_copy.color.green, 0.0..=2.0).max_decimals(2)).changed() {
+                let response = ui.add(egui::Slider::new(&mut screen_copy.color.green, 0.0..=2.0).max_decimals(2));
+                if response.changed() {
                     changed = true;
                 }
+                response.context_menu(|ui| {
+                    if ui.button("Reset to 1").clicked() {
+                        screen_copy.color.green = 1.0;
+                        changed = true;
+                        ui.close_menu();
+                    }
+                });
             });
             ui.horizontal(|ui| {
                 ui.label("Blue:");
-                if ui.add(egui::Slider::new(&mut screen_copy.color.blue, 0.0..=2.0).max_decimals(2)).changed() {
+                let response = ui.add(egui::Slider::new(&mut screen_copy.color.blue, 0.0..=2.0).max_decimals(2));
+                if response.changed() {
                     changed = true;
                 }
+                response.context_menu(|ui| {
+                    if ui.button("Reset to 1").clicked() {
+                        screen_copy.color.blue = 1.0;
+                        changed = true;
+                        ui.close_menu();
+                    }
+                });
             });
         });
 
@@ -1713,37 +1895,70 @@ impl AdvancedOutputWindow {
                 // Gamma slider
                 ui.horizontal(|ui| {
                     ui.label("Gamma:");
-                    if ui.add(egui::Slider::new(&mut gamma, 0.1..=4.0).max_decimals(1)).changed() {
+                    let response = ui.add(egui::Slider::new(&mut gamma, 0.1..=4.0).max_decimals(1));
+                    if response.changed() {
                         edge.left.gamma = gamma;
                         edge.right.gamma = gamma;
                         edge.top.gamma = gamma;
                         edge.bottom.gamma = gamma;
                         blend_changed = true;
                     }
+                    response.context_menu(|ui| {
+                        if ui.button("Reset to 2.2").clicked() {
+                            edge.left.gamma = 2.2;
+                            edge.right.gamma = 2.2;
+                            edge.top.gamma = 2.2;
+                            edge.bottom.gamma = 2.2;
+                            blend_changed = true;
+                            ui.close_menu();
+                        }
+                    });
                 });
 
                 // Luminance slider
                 ui.horizontal(|ui| {
                     ui.label("Luminance:");
-                    if ui.add(egui::Slider::new(&mut luminance, 0.0..=1.0).max_decimals(2)).changed() {
+                    let response = ui.add(egui::Slider::new(&mut luminance, 0.0..=1.0).max_decimals(2));
+                    if response.changed() {
                         edge.left.black_level = luminance;
                         edge.right.black_level = luminance;
                         edge.top.black_level = luminance;
                         edge.bottom.black_level = luminance;
                         blend_changed = true;
                     }
+                    response.context_menu(|ui| {
+                        if ui.button("Reset to 0").clicked() {
+                            edge.left.black_level = 0.0;
+                            edge.right.black_level = 0.0;
+                            edge.top.black_level = 0.0;
+                            edge.bottom.black_level = 0.0;
+                            blend_changed = true;
+                            ui.close_menu();
+                        }
+                    });
                 });
 
                 // Power slider (blend width)
                 ui.horizontal(|ui| {
                     ui.label("Power:");
-                    if ui.add(egui::Slider::new(&mut power, 0.0..=0.5).max_decimals(2)).changed() {
+                    let response = ui.add(egui::Slider::new(&mut power, 0.0..=0.5).max_decimals(2));
+                    if response.changed() {
                         edge.left.width = power;
                         edge.right.width = power;
                         edge.top.width = power;
                         edge.bottom.width = power;
                         blend_changed = true;
                     }
+                    response.context_menu(|ui| {
+                        if ui.button("Reset to 0.15").clicked() {
+                            edge.left.width = 0.15;
+                            edge.right.width = 0.15;
+                            edge.top.width = 0.15;
+                            edge.bottom.width = 0.15;
+                            blend_changed = true;
+                            ui.close_menu();
+                        }
+                    });
                 });
             }
 
@@ -1910,6 +2125,35 @@ impl AdvancedOutputWindow {
             ui.vertical(|ui| {
                 ui.set_min_width(200.0);
                 ui.heading("Preview");
+
+                // Edit mode toggle
+                ui.horizontal(|ui| {
+                    ui.label("Edit:");
+                    ui.selectable_value(&mut self.output_edit_mode, OutputEditMode::Resize, "Resize");
+                    ui.selectable_value(&mut self.output_edit_mode, OutputEditMode::MeshWarp, "Mesh Warp");
+                });
+
+                // Auto-create mesh when switching to MeshWarp mode if none exists
+                if self.output_edit_mode == OutputEditMode::MeshWarp {
+                    if let Some(screen_id) = self.selected_screen {
+                        if let Some(slice_id) = self.selected_slice {
+                            if let Some(screen) = screens.iter().find(|s| s.id == screen_id) {
+                                if let Some(slice) = screen.slices.iter().find(|s| s.id == slice_id) {
+                                    if slice.output.mesh.is_none() {
+                                        // Create a default 4x4 mesh
+                                        let mut updated_slice = slice.clone();
+                                        updated_slice.output.mesh = Some(WarpMesh::new(4, 4));
+                                        actions.push(AdvancedOutputAction::UpdateSlice {
+                                            screen_id,
+                                            slice_id,
+                                            slice: updated_slice,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 ui.add_space(4.0);
 
                 // Preview area - use live texture if available
@@ -1936,6 +2180,9 @@ impl AdvancedOutputWindow {
                     4.0,
                     egui::Color32::from_rgb(30, 30, 30),
                 );
+
+                // Create a clipped painter that only draws within preview rect
+                let painter = ui.painter().with_clip_rect(rect);
 
                 if let Some(screen_id) = self.selected_screen {
                     if let Some(screen) = screens.iter().find(|s| s.id == screen_id) {
@@ -1966,11 +2213,11 @@ impl AdvancedOutputWindow {
                                     );
 
                                     // Draw live preview texture
-                                    ui.painter().image(tex_id, visible_rect, uv_rect, egui::Color32::WHITE);
+                                    painter.image(tex_id, visible_rect, uv_rect, egui::Color32::WHITE);
                                 }
                             } else {
                                 // Texture not yet registered
-                                ui.painter().text(
+                                painter.text(
                                     rect.center(),
                                     egui::Align2::CENTER_CENTER,
                                     format!("{}x{}\n(loading...)", screen.width, screen.height),
@@ -1980,7 +2227,7 @@ impl AdvancedOutputWindow {
                             }
                         } else {
                             // Screen disabled
-                            ui.painter().text(
+                            painter.text(
                                 rect.center(),
                                 egui::Align2::CENTER_CENTER,
                                 format!("{}x{}\n(disabled)", screen.width, screen.height),
@@ -2015,7 +2262,7 @@ impl AdvancedOutputWindow {
                                     egui::Color32::from_rgba_unmultiplied(120, 120, 120, 100)
                                 };
 
-                                ui.painter().rect_stroke(
+                                painter.rect_stroke(
                                     slice_rect,
                                     0.0,
                                     egui::Stroke::new(
@@ -2024,6 +2271,12 @@ impl AdvancedOutputWindow {
                                     ),
                                     egui::StrokeKind::Inside,
                                 );
+
+                                // Draw corner/edge handles for selected slice's output rect (only in Resize mode)
+                                if is_selected && self.output_edit_mode == OutputEditMode::Resize {
+                                    let zoom = self.output_viewport.zoom();
+                                    self.draw_rect_handles(&painter, slice_rect, zoom);
+                                }
 
                                 // Draw edge blend regions for selected slice
                                 if is_selected && slice.output.edge_blend.is_any_enabled() {
@@ -2039,7 +2292,7 @@ impl AdvancedOutputWindow {
                                                 slice_rect.bottom(),
                                             ),
                                         );
-                                        ui.painter().rect_filled(blend_rect, 0.0, blend_color);
+                                        painter.rect_filled(blend_rect, 0.0, blend_color);
                                     }
 
                                     // Right edge blend region
@@ -2051,7 +2304,7 @@ impl AdvancedOutputWindow {
                                             ),
                                             slice_rect.right_bottom(),
                                         );
-                                        ui.painter().rect_filled(blend_rect, 0.0, blend_color);
+                                        painter.rect_filled(blend_rect, 0.0, blend_color);
                                     }
 
                                     // Top edge blend region
@@ -2063,7 +2316,7 @@ impl AdvancedOutputWindow {
                                                 slice_rect.top() + slice_rect.height() * edge.top.width,
                                             ),
                                         );
-                                        ui.painter().rect_filled(blend_rect, 0.0, blend_color);
+                                        painter.rect_filled(blend_rect, 0.0, blend_color);
                                     }
 
                                     // Bottom edge blend region
@@ -2075,7 +2328,7 @@ impl AdvancedOutputWindow {
                                             ),
                                             slice_rect.right_bottom(),
                                         );
-                                        ui.painter().rect_filled(blend_rect, 0.0, blend_color);
+                                        painter.rect_filled(blend_rect, 0.0, blend_color);
                                     }
                                 }
 
@@ -2097,7 +2350,7 @@ impl AdvancedOutputWindow {
                                                         p2.position[0] * slice_rect.width(),
                                                         p2.position[1] * slice_rect.height(),
                                                     );
-                                                    ui.painter().line_segment(
+                                                    painter.line_segment(
                                                         [pos1, pos2],
                                                         egui::Stroke::new(1.0, grid_color),
                                                     );
@@ -2117,7 +2370,7 @@ impl AdvancedOutputWindow {
                                                         p2.position[0] * slice_rect.width(),
                                                         p2.position[1] * slice_rect.height(),
                                                     );
-                                                    ui.painter().line_segment(
+                                                    painter.line_segment(
                                                         [pos1, pos2],
                                                         egui::Stroke::new(1.0, grid_color),
                                                     );
@@ -2131,7 +2384,7 @@ impl AdvancedOutputWindow {
                                                 point.position[0] * slice_rect.width(),
                                                 point.position[1] * slice_rect.height(),
                                             );
-                                            ui.painter().circle_filled(pos, 3.0, point_color);
+                                            painter.circle_filled(pos, 3.0, point_color);
                                         }
                                     }
                                 }
@@ -2154,7 +2407,7 @@ impl AdvancedOutputWindow {
                                                         height * slice_rect.height(),
                                                     ),
                                                 );
-                                                ui.painter().rect_stroke(
+                                                painter.rect_stroke(
                                                     mask_rect,
                                                     0.0,
                                                     egui::Stroke::new(2.0, mask_color),
@@ -2175,10 +2428,10 @@ impl AdvancedOutputWindow {
                                                     let a2 = ((i + 1) as f32 / segments as f32) * std::f32::consts::TAU;
                                                     let p1 = center_pos + egui::vec2(a1.cos() * rx, a1.sin() * ry);
                                                     let p2 = center_pos + egui::vec2(a2.cos() * rx, a2.sin() * ry);
-                                                    ui.painter().line_segment([p1, p2], egui::Stroke::new(2.0, mask_color));
+                                                    painter.line_segment([p1, p2], egui::Stroke::new(2.0, mask_color));
                                                 }
                                                 // Draw center point
-                                                ui.painter().circle_filled(center_pos, 4.0, point_color);
+                                                painter.circle_filled(center_pos, 4.0, point_color);
                                             }
                                             MaskShape::Polygon { points } => {
                                                 // Draw polygon edges
@@ -2193,7 +2446,7 @@ impl AdvancedOutputWindow {
                                                         p2.x * slice_rect.width(),
                                                         p2.y * slice_rect.height(),
                                                     );
-                                                    ui.painter().line_segment([pos1, pos2], egui::Stroke::new(2.0, mask_color));
+                                                    painter.line_segment([pos1, pos2], egui::Stroke::new(2.0, mask_color));
                                                 }
                                                 // Draw vertices as draggable points
                                                 for (i, p) in points.iter().enumerate() {
@@ -2203,7 +2456,7 @@ impl AdvancedOutputWindow {
                                                     );
                                                     let is_dragging = self.dragging_mask_vertex == Some(i);
                                                     let radius = if is_dragging { 6.0 } else { 4.0 };
-                                                    ui.painter().circle_filled(pos, radius, point_color);
+                                                    painter.circle_filled(pos, radius, point_color);
                                                 }
                                             }
                                             MaskShape::Bezier { segments } => {
@@ -2225,7 +2478,7 @@ impl AdvancedOutputWindow {
                                                             p2.x * slice_rect.width(),
                                                             p2.y * slice_rect.height(),
                                                         );
-                                                        ui.painter().line_segment([pos1, pos2], egui::Stroke::new(2.0, bezier_color));
+                                                        painter.line_segment([pos1, pos2], egui::Stroke::new(2.0, bezier_color));
                                                     }
                                                 }
                                             }
@@ -2236,7 +2489,7 @@ impl AdvancedOutputWindow {
                         }
                     }
                 } else {
-                    ui.painter().text(
+                    painter.text(
                         rect.center(),
                         egui::Align2::CENTER_CENTER,
                         "No screen selected",
@@ -2245,26 +2498,160 @@ impl AdvancedOutputWindow {
                     );
                 }
 
-                // Handle warp point dragging
+                // Handle output rect dragging for selected slice (only in Resize mode)
+                // Skip left-click handling if right-click dragging (viewport pan takes priority)
+                if self.output_edit_mode == OutputEditMode::Resize && !response.dragged_by(egui::PointerButton::Secondary) {
+                    if let Some(screen_id) = self.selected_screen {
+                        if let Some(slice_id) = self.selected_slice {
+                            if let Some(screen) = screens.iter().find(|s| s.id == screen_id) {
+                                if let Some(slice) = screen.slices.iter().find(|s| s.id == slice_id) {
+                                    // Calculate slice rect in preview coordinates (with viewport transform)
+                                    let slice_output_rect = Rect {
+                                        x: slice.output.rect.x,
+                                        y: slice.output.rect.y,
+                                        width: slice.output.rect.width,
+                                        height: slice.output.rect.height,
+                                    };
+                                    let slice_rect = self.transform_rect_to_screen(
+                                        &self.output_viewport,
+                                        &slice_output_rect,
+                                        rect,
+                                        preview_size,
+                                        output_content_size,
+                                    );
+
+                                    // Set cursor based on what's under the pointer
+                                    if let Some(pointer_pos) = response.hover_pos() {
+                                        // If actively dragging, show appropriate cursor
+                                        if self.output_rect_drag.dragging_handle.is_some() {
+                                            if let Some(handle) = self.output_rect_drag.dragging_handle {
+                                                let cursor = if handle == RectHandle::Body {
+                                                    egui::CursorIcon::Grabbing
+                                                } else {
+                                                    Self::cursor_for_handle(handle)
+                                                };
+                                                ui.ctx().set_cursor_icon(cursor);
+                                            }
+                                        } else if let Some(handle) = self.hit_test_rect_handle(pointer_pos, slice_rect) {
+                                            // Hovering over a handle
+                                            ui.ctx().set_cursor_icon(Self::cursor_for_handle(handle));
+                                        }
+                                    }
+
+                                    // Handle drag start
+                                    if response.drag_started_by(egui::PointerButton::Primary) {
+                                        // Only start output rect drag if not dragging warp points or mask vertices
+                                        if self.dragging_warp_point.is_none() && self.dragging_mask_vertex.is_none() {
+                                            if let Some(pointer_pos) = response.interact_pointer_pos() {
+                                                if let Some(handle) = self.hit_test_rect_handle(pointer_pos, slice_rect) {
+                                                    // Store starting position (normalized, using viewport inverse transform)
+                                                    let (start_norm_x, start_norm_y) = self.transform_point_from_screen(
+                                                        &self.output_viewport,
+                                                        pointer_pos,
+                                                        rect,
+                                                        preview_size,
+                                                        output_content_size,
+                                                    );
+
+                                                    self.output_rect_drag = OutputRectDragState {
+                                                        dragging_slice: Some(slice_id),
+                                                        dragging_handle: Some(handle),
+                                                        original_rect: Some(slice_output_rect),
+                                                        start_pos: Some([start_norm_x, start_norm_y]),
+                                                    };
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Handle drag
+                                    if response.dragged_by(egui::PointerButton::Primary) {
+                                        if let Some(dragging_slice_id) = self.output_rect_drag.dragging_slice {
+                                            if dragging_slice_id == slice_id {
+                                                if let Some(handle) = self.output_rect_drag.dragging_handle {
+                                                    if let Some(original_rect) = self.output_rect_drag.original_rect {
+                                                        if let Some(start_pos) = self.output_rect_drag.start_pos {
+                                                            if let Some(pointer_pos) = response.interact_pointer_pos() {
+                                                                let new_rect = self.compute_dragged_rect_with_viewport(
+                                                                    pointer_pos,
+                                                                    rect,
+                                                                    preview_size,
+                                                                    original_rect,
+                                                                    handle,
+                                                                    start_pos,
+                                                                    output_content_size,
+                                                                    true, // use output_viewport
+                                                                );
+
+                                                                // Update the slice with new output rect
+                                                                let mut updated_slice = slice.clone();
+                                                                updated_slice.output.rect.x = new_rect.x;
+                                                                updated_slice.output.rect.y = new_rect.y;
+                                                                updated_slice.output.rect.width = new_rect.width;
+                                                                updated_slice.output.rect.height = new_rect.height;
+
+                                                                actions.push(AdvancedOutputAction::UpdateSlice {
+                                                                    screen_id,
+                                                                    slice_id,
+                                                                    slice: updated_slice,
+                                                                });
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Handle drag end
+                                    if response.drag_stopped_by(egui::PointerButton::Primary) {
+                                        self.output_rect_drag = OutputRectDragState::default();
+                                    }
+
+                                    // Handle right-click to reset slice output_rect to full (only in Resize mode)
+                                    if self.output_edit_mode == OutputEditMode::Resize && response.clicked_by(egui::PointerButton::Secondary) {
+                                        if let Some(pointer_pos) = response.interact_pointer_pos() {
+                                            if self.hit_test_rect_handle(pointer_pos, slice_rect).is_some() {
+                                                let mut updated_slice = slice.clone();
+                                                updated_slice.output.rect = Rect::full();
+                                                actions.push(AdvancedOutputAction::UpdateSlice {
+                                                    screen_id,
+                                                    slice_id,
+                                                    slice: updated_slice,
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Handle warp point dragging (only in MeshWarp mode)
+                if self.output_edit_mode == OutputEditMode::MeshWarp {
                 if let Some(screen_id) = self.selected_screen {
                     if let Some(slice_id) = self.selected_slice {
                         if let Some(screen) = screens.iter().find(|s| s.id == screen_id) {
                             if let Some(slice) = screen.slices.iter().find(|s| s.id == slice_id) {
                                 if let Some(mesh) = &slice.output.mesh {
-                                    // Calculate slice rect in preview coordinates
-                                    let slice_rect = egui::Rect::from_min_size(
-                                        rect.min + egui::vec2(
-                                            slice.output.rect.x * preview_size.x,
-                                            slice.output.rect.y * preview_size.y,
-                                        ),
-                                        egui::vec2(
-                                            slice.output.rect.width * preview_size.x,
-                                            slice.output.rect.height * preview_size.y,
-                                        ),
+                                    // Calculate slice rect in preview coordinates (with viewport transform)
+                                    let slice_input_rect = Rect {
+                                        x: slice.output.rect.x,
+                                        y: slice.output.rect.y,
+                                        width: slice.output.rect.width,
+                                        height: slice.output.rect.height,
+                                    };
+                                    let slice_rect = self.transform_rect_to_screen(
+                                        &self.output_viewport,
+                                        &slice_input_rect,
+                                        rect,
+                                        preview_size,
+                                        output_content_size,
                                     );
 
-                                    // On click start, find nearest warp point
-                                    if response.drag_started() {
+                                    // On click start, find nearest warp point (only if not dragging output rect)
+                                    if response.drag_started() && self.output_rect_drag.dragging_slice.is_none() {
                                         if let Some(pointer_pos) = response.interact_pointer_pos() {
                                             let mut best_dist = 15.0_f32; // Click radius threshold
                                             let mut best_point: Option<(usize, usize)> = None;
@@ -2316,6 +2703,45 @@ impl AdvancedOutputWindow {
                                     if response.drag_stopped() {
                                         self.dragging_warp_point = None;
                                     }
+
+                                    // Handle right-click to reset warp point to original UV position
+                                    if response.clicked_by(egui::PointerButton::Secondary) {
+                                        if let Some(pointer_pos) = response.interact_pointer_pos() {
+                                            let click_radius = 15.0_f32;
+                                            let mut clicked_point: Option<(usize, usize)> = None;
+
+                                            for col in 0..mesh.columns {
+                                                for row in 0..mesh.rows {
+                                                    if let Some(point) = mesh.get_point(col, row) {
+                                                        let pos = slice_rect.min + egui::vec2(
+                                                            point.position[0] * slice_rect.width(),
+                                                            point.position[1] * slice_rect.height(),
+                                                        );
+                                                        if pointer_pos.distance(pos) < click_radius {
+                                                            clicked_point = Some((col, row));
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                                if clicked_point.is_some() { break; }
+                                            }
+
+                                            // Reset the clicked point to its original UV position
+                                            if let Some((col, row)) = clicked_point {
+                                                let mut updated_slice = slice.clone();
+                                                if let Some(mesh) = &mut updated_slice.output.mesh {
+                                                    if let Some(point) = mesh.get_point(col, row) {
+                                                        mesh.set_point_position(col, row, point.uv[0], point.uv[1]);
+                                                        actions.push(AdvancedOutputAction::UpdateSlice {
+                                                            screen_id,
+                                                            slice_id,
+                                                            slice: updated_slice,
+                                                        });
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
 
                                 // Handle mask vertex dragging for polygon masks
@@ -2334,8 +2760,8 @@ impl AdvancedOutputWindow {
                                                 ),
                                             );
 
-                                            // On click start, find nearest mask vertex
-                                            if response.drag_started() && self.dragging_warp_point.is_none() {
+                                            // On click start, find nearest mask vertex (only if not dragging output rect or warp point)
+                                            if response.drag_started() && self.dragging_warp_point.is_none() && self.output_rect_drag.dragging_slice.is_none() {
                                                 if let Some(pointer_pos) = response.interact_pointer_pos() {
                                                     let mut best_dist = 15.0_f32; // Click radius threshold
                                                     let mut best_vertex: Option<usize> = None;
@@ -2394,6 +2820,7 @@ impl AdvancedOutputWindow {
                         }
                     }
                 }
+                } // End of MeshWarp mode check
 
                 ui.add_space(4.0);
                 // Show resolution info and zoom level
@@ -2536,92 +2963,16 @@ impl AdvancedOutputWindow {
         ui.separator();
         ui.add_space(4.0);
 
-        // Input rect (crop from source)
+        // Transform rect (position and size on screen)
         ui.horizontal(|ui| {
-            ui.label("Input Rect (crop)");
+            ui.label("Transform");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // Preset buttons
-                if ui.small_button("Full").on_hover_text("Reset to full input (0,0,1,1)").clicked() {
-                    slice_copy.input_rect.x = 0.0;
-                    slice_copy.input_rect.y = 0.0;
-                    slice_copy.input_rect.width = 1.0;
-                    slice_copy.input_rect.height = 1.0;
-                    changed = true;
-                }
-                if ui.small_button("Match Output").on_hover_text("Copy output rect to input rect").clicked() {
-                    slice_copy.input_rect.x = slice_copy.output.rect.x;
-                    slice_copy.input_rect.y = slice_copy.output.rect.y;
-                    slice_copy.input_rect.width = slice_copy.output.rect.width;
-                    slice_copy.input_rect.height = slice_copy.output.rect.height;
-                    changed = true;
-                }
-            });
-        });
-        ui.add_space(4.0);
-
-        ui.horizontal(|ui| {
-            ui.label("X:");
-            let mut x = slice_copy.input_rect.x;
-            if ui
-                .add(egui::DragValue::new(&mut x).range(0.0..=1.0).speed(0.01))
-                .changed()
-            {
-                slice_copy.input_rect.x = x;
-                changed = true;
-            }
-            ui.label("Y:");
-            let mut y = slice_copy.input_rect.y;
-            if ui
-                .add(egui::DragValue::new(&mut y).range(0.0..=1.0).speed(0.01))
-                .changed()
-            {
-                slice_copy.input_rect.y = y;
-                changed = true;
-            }
-        });
-
-        ui.horizontal(|ui| {
-            ui.label("W:");
-            let mut w = slice_copy.input_rect.width;
-            if ui
-                .add(egui::DragValue::new(&mut w).range(0.0..=1.0).speed(0.01))
-                .changed()
-            {
-                slice_copy.input_rect.width = w;
-                changed = true;
-            }
-            ui.label("H:");
-            let mut h = slice_copy.input_rect.height;
-            if ui
-                .add(egui::DragValue::new(&mut h).range(0.0..=1.0).speed(0.01))
-                .changed()
-            {
-                slice_copy.input_rect.height = h;
-                changed = true;
-            }
-        });
-
-        ui.add_space(8.0);
-        ui.separator();
-        ui.add_space(4.0);
-
-        // Output rect (position on screen)
-        ui.horizontal(|ui| {
-            ui.label("Output Rect (position)");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // Preset buttons
+                // Preset button
                 if ui.small_button("Full").on_hover_text("Fill entire screen (0,0,1,1)").clicked() {
                     slice_copy.output.rect.x = 0.0;
                     slice_copy.output.rect.y = 0.0;
                     slice_copy.output.rect.width = 1.0;
                     slice_copy.output.rect.height = 1.0;
-                    changed = true;
-                }
-                if ui.small_button("Match Input").on_hover_text("Copy input rect to output rect").clicked() {
-                    slice_copy.output.rect.x = slice_copy.input_rect.x;
-                    slice_copy.output.rect.y = slice_copy.input_rect.y;
-                    slice_copy.output.rect.width = slice_copy.input_rect.width;
-                    slice_copy.output.rect.height = slice_copy.input_rect.height;
                     changed = true;
                 }
             });
@@ -2632,7 +2983,7 @@ impl AdvancedOutputWindow {
             ui.label("X:");
             let mut x = slice_copy.output.rect.x;
             if ui
-                .add(egui::DragValue::new(&mut x).range(0.0..=1.0).speed(0.01))
+                .add(egui::DragValue::new(&mut x).range(-1.0..=2.0).speed(0.01))
                 .changed()
             {
                 slice_copy.output.rect.x = x;
@@ -2641,7 +2992,7 @@ impl AdvancedOutputWindow {
             ui.label("Y:");
             let mut y = slice_copy.output.rect.y;
             if ui
-                .add(egui::DragValue::new(&mut y).range(0.0..=1.0).speed(0.01))
+                .add(egui::DragValue::new(&mut y).range(-1.0..=2.0).speed(0.01))
                 .changed()
             {
                 slice_copy.output.rect.y = y;
@@ -2653,7 +3004,7 @@ impl AdvancedOutputWindow {
             ui.label("W:");
             let mut w = slice_copy.output.rect.width;
             if ui
-                .add(egui::DragValue::new(&mut w).range(0.0..=1.0).speed(0.01))
+                .add(egui::DragValue::new(&mut w).range(0.01..=3.0).speed(0.01))
                 .changed()
             {
                 slice_copy.output.rect.width = w;
@@ -2662,7 +3013,7 @@ impl AdvancedOutputWindow {
             ui.label("H:");
             let mut h = slice_copy.output.rect.height;
             if ui
-                .add(egui::DragValue::new(&mut h).range(0.0..=1.0).speed(0.01))
+                .add(egui::DragValue::new(&mut h).range(0.01..=3.0).speed(0.01))
                 .changed()
             {
                 slice_copy.output.rect.height = h;
@@ -2823,7 +3174,8 @@ impl AdvancedOutputWindow {
         ui.separator();
         ui.add_space(4.0);
 
-        // Mesh Warp
+        // Mesh Warp (only show controls when in MeshWarp mode)
+        if self.output_edit_mode == OutputEditMode::MeshWarp {
         ui.horizontal(|ui| {
             ui.label("Mesh Warp");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2838,23 +3190,8 @@ impl AdvancedOutputWindow {
         });
         ui.add_space(4.0);
 
-        // Get current mesh state
-        let has_mesh = slice_copy.output.mesh.is_some();
-
-        // Enable checkbox
-        let mut mesh_enabled = has_mesh;
-        if ui.checkbox(&mut mesh_enabled, "Enable").changed() {
-            if mesh_enabled {
-                // Enable with default 4×4 grid
-                slice_copy.output.mesh = Some(WarpMesh::new(4, 4));
-            } else {
-                slice_copy.output.mesh = None;
-            }
-            changed = true;
-        }
-
-        // Mesh controls (only show if enabled)
-        if has_mesh {
+        // Mesh controls
+        if slice_copy.output.mesh.is_some() {
             ui.add_space(4.0);
 
             // Grid size selector
@@ -2894,6 +3231,7 @@ impl AdvancedOutputWindow {
                 }
             }
         }
+        } // End MeshWarp mode section
 
         ui.add_space(8.0);
         ui.separator();
@@ -2974,9 +3312,17 @@ impl AdvancedOutputWindow {
             // Feather slider
             ui.horizontal(|ui| {
                 ui.label("Feather:");
-                if ui.add(egui::Slider::new(&mut mask.feather, 0.0..=0.1).max_decimals(3)).changed() {
+                let response = ui.add(egui::Slider::new(&mut mask.feather, 0.0..=0.1).max_decimals(3));
+                if response.changed() {
                     changed = true;
                 }
+                response.context_menu(|ui| {
+                    if ui.button("Reset to 0").clicked() {
+                        mask.feather = 0.0;
+                        changed = true;
+                        ui.close_menu();
+                    }
+                });
             });
 
             ui.add_space(4.0);
@@ -2987,46 +3333,110 @@ impl AdvancedOutputWindow {
                     ui.label(egui::RichText::new("Rectangle").weak());
                     ui.horizontal(|ui| {
                         ui.label("X:");
-                        if ui.add(egui::DragValue::new(x).range(0.0..=1.0).speed(0.01)).changed() {
+                        let response = ui.add(egui::DragValue::new(x).range(0.0..=1.0).speed(0.01));
+                        if response.changed() {
                             changed = true;
                         }
+                        response.context_menu(|ui| {
+                            if ui.button("Reset to 0.25").clicked() {
+                                *x = 0.25;
+                                changed = true;
+                                ui.close_menu();
+                            }
+                        });
                         ui.label("Y:");
-                        if ui.add(egui::DragValue::new(y).range(0.0..=1.0).speed(0.01)).changed() {
+                        let response = ui.add(egui::DragValue::new(y).range(0.0..=1.0).speed(0.01));
+                        if response.changed() {
                             changed = true;
                         }
+                        response.context_menu(|ui| {
+                            if ui.button("Reset to 0.25").clicked() {
+                                *y = 0.25;
+                                changed = true;
+                                ui.close_menu();
+                            }
+                        });
                     });
                     ui.horizontal(|ui| {
                         ui.label("W:");
-                        if ui.add(egui::DragValue::new(width).range(0.0..=1.0).speed(0.01)).changed() {
+                        let response = ui.add(egui::DragValue::new(width).range(0.0..=1.0).speed(0.01));
+                        if response.changed() {
                             changed = true;
                         }
+                        response.context_menu(|ui| {
+                            if ui.button("Reset to 0.5").clicked() {
+                                *width = 0.5;
+                                changed = true;
+                                ui.close_menu();
+                            }
+                        });
                         ui.label("H:");
-                        if ui.add(egui::DragValue::new(height).range(0.0..=1.0).speed(0.01)).changed() {
+                        let response = ui.add(egui::DragValue::new(height).range(0.0..=1.0).speed(0.01));
+                        if response.changed() {
                             changed = true;
                         }
+                        response.context_menu(|ui| {
+                            if ui.button("Reset to 0.5").clicked() {
+                                *height = 0.5;
+                                changed = true;
+                                ui.close_menu();
+                            }
+                        });
                     });
                 }
                 MaskShape::Ellipse { center, radius_x, radius_y } => {
                     ui.label(egui::RichText::new("Ellipse").weak());
                     ui.horizontal(|ui| {
                         ui.label("Center X:");
-                        if ui.add(egui::DragValue::new(&mut center.x).range(0.0..=1.0).speed(0.01)).changed() {
+                        let response = ui.add(egui::DragValue::new(&mut center.x).range(0.0..=1.0).speed(0.01));
+                        if response.changed() {
                             changed = true;
                         }
+                        response.context_menu(|ui| {
+                            if ui.button("Reset to 0.5").clicked() {
+                                center.x = 0.5;
+                                changed = true;
+                                ui.close_menu();
+                            }
+                        });
                         ui.label("Y:");
-                        if ui.add(egui::DragValue::new(&mut center.y).range(0.0..=1.0).speed(0.01)).changed() {
+                        let response = ui.add(egui::DragValue::new(&mut center.y).range(0.0..=1.0).speed(0.01));
+                        if response.changed() {
                             changed = true;
                         }
+                        response.context_menu(|ui| {
+                            if ui.button("Reset to 0.5").clicked() {
+                                center.y = 0.5;
+                                changed = true;
+                                ui.close_menu();
+                            }
+                        });
                     });
                     ui.horizontal(|ui| {
                         ui.label("Radius X:");
-                        if ui.add(egui::DragValue::new(radius_x).range(0.0..=1.0).speed(0.01)).changed() {
+                        let response = ui.add(egui::DragValue::new(radius_x).range(0.0..=1.0).speed(0.01));
+                        if response.changed() {
                             changed = true;
                         }
+                        response.context_menu(|ui| {
+                            if ui.button("Reset to 0.25").clicked() {
+                                *radius_x = 0.25;
+                                changed = true;
+                                ui.close_menu();
+                            }
+                        });
                         ui.label("Y:");
-                        if ui.add(egui::DragValue::new(radius_y).range(0.0..=1.0).speed(0.01)).changed() {
+                        let response = ui.add(egui::DragValue::new(radius_y).range(0.0..=1.0).speed(0.01));
+                        if response.changed() {
                             changed = true;
                         }
+                        response.context_menu(|ui| {
+                            if ui.button("Reset to 0.25").clicked() {
+                                *radius_y = 0.25;
+                                changed = true;
+                                ui.close_menu();
+                            }
+                        });
                     });
                 }
                 MaskShape::Polygon { points } => {
@@ -3070,54 +3480,110 @@ impl AdvancedOutputWindow {
         // Opacity slider (most commonly used)
         ui.horizontal(|ui| {
             ui.label("Opacity:");
-            if ui.add(egui::Slider::new(&mut slice_copy.color.opacity, 0.0..=1.0).max_decimals(2)).changed() {
+            let response = ui.add(egui::Slider::new(&mut slice_copy.color.opacity, 0.0..=1.0).max_decimals(2));
+            if response.changed() {
                 changed = true;
             }
+            response.context_menu(|ui| {
+                if ui.button("Reset to 1").clicked() {
+                    slice_copy.color.opacity = 1.0;
+                    changed = true;
+                    ui.close_menu();
+                }
+            });
         });
 
         // Brightness slider
         ui.horizontal(|ui| {
             ui.label("Brightness:");
-            if ui.add(egui::Slider::new(&mut slice_copy.color.brightness, -1.0..=1.0).max_decimals(2)).changed() {
+            let response = ui.add(egui::Slider::new(&mut slice_copy.color.brightness, -1.0..=1.0).max_decimals(2));
+            if response.changed() {
                 changed = true;
             }
+            response.context_menu(|ui| {
+                if ui.button("Reset to 0").clicked() {
+                    slice_copy.color.brightness = 0.0;
+                    changed = true;
+                    ui.close_menu();
+                }
+            });
         });
 
         // Contrast slider
         ui.horizontal(|ui| {
             ui.label("Contrast:");
-            if ui.add(egui::Slider::new(&mut slice_copy.color.contrast, 0.0..=2.0).max_decimals(2)).changed() {
+            let response = ui.add(egui::Slider::new(&mut slice_copy.color.contrast, 0.0..=2.0).max_decimals(2));
+            if response.changed() {
                 changed = true;
             }
+            response.context_menu(|ui| {
+                if ui.button("Reset to 1").clicked() {
+                    slice_copy.color.contrast = 1.0;
+                    changed = true;
+                    ui.close_menu();
+                }
+            });
         });
 
         // Gamma slider
         ui.horizontal(|ui| {
             ui.label("Gamma:");
-            if ui.add(egui::Slider::new(&mut slice_copy.color.gamma, 0.1..=4.0).logarithmic(true).max_decimals(2)).changed() {
+            let response = ui.add(egui::Slider::new(&mut slice_copy.color.gamma, 0.1..=4.0).logarithmic(true).max_decimals(2));
+            if response.changed() {
                 changed = true;
             }
+            response.context_menu(|ui| {
+                if ui.button("Reset to 1").clicked() {
+                    slice_copy.color.gamma = 1.0;
+                    changed = true;
+                    ui.close_menu();
+                }
+            });
         });
 
         // RGB Channels (collapsing section for less common adjustments)
         ui.collapsing("RGB Channels", |ui| {
             ui.horizontal(|ui| {
                 ui.label("Red:");
-                if ui.add(egui::Slider::new(&mut slice_copy.color.red, 0.0..=2.0).max_decimals(2)).changed() {
+                let response = ui.add(egui::Slider::new(&mut slice_copy.color.red, 0.0..=2.0).max_decimals(2));
+                if response.changed() {
                     changed = true;
                 }
+                response.context_menu(|ui| {
+                    if ui.button("Reset to 1").clicked() {
+                        slice_copy.color.red = 1.0;
+                        changed = true;
+                        ui.close_menu();
+                    }
+                });
             });
             ui.horizontal(|ui| {
                 ui.label("Green:");
-                if ui.add(egui::Slider::new(&mut slice_copy.color.green, 0.0..=2.0).max_decimals(2)).changed() {
+                let response = ui.add(egui::Slider::new(&mut slice_copy.color.green, 0.0..=2.0).max_decimals(2));
+                if response.changed() {
                     changed = true;
                 }
+                response.context_menu(|ui| {
+                    if ui.button("Reset to 1").clicked() {
+                        slice_copy.color.green = 1.0;
+                        changed = true;
+                        ui.close_menu();
+                    }
+                });
             });
             ui.horizontal(|ui| {
                 ui.label("Blue:");
-                if ui.add(egui::Slider::new(&mut slice_copy.color.blue, 0.0..=2.0).max_decimals(2)).changed() {
+                let response = ui.add(egui::Slider::new(&mut slice_copy.color.blue, 0.0..=2.0).max_decimals(2));
+                if response.changed() {
                     changed = true;
                 }
+                response.context_menu(|ui| {
+                    if ui.button("Reset to 1").clicked() {
+                        slice_copy.color.blue = 1.0;
+                        changed = true;
+                        ui.close_menu();
+                    }
+                });
             });
         });
 
@@ -3206,8 +3672,8 @@ impl AdvancedOutputWindow {
         let centered_x = (viewport_x - 0.5 - offset_x) / scale_x;
         let centered_y = (viewport_y - 0.5 - offset_y) / scale_y;
 
-        let norm_x = (centered_x + 0.5).clamp(0.0, 1.0);
-        let norm_y = (centered_y + 0.5).clamp(0.0, 1.0);
+        let norm_x = centered_x + 0.5;
+        let norm_y = centered_y + 0.5;
 
         (norm_x, norm_y)
     }

@@ -182,6 +182,10 @@ pub struct PerformanceMetrics {
     pub effect_count: usize,
     /// GPU memory statistics
     pub gpu_memory: GpuMemoryStats,
+    /// Time spent uploading video textures to GPU (milliseconds)
+    pub video_frame_time_ms: f64,
+    /// Time spent on UI rendering (milliseconds)
+    pub ui_frame_time_ms: f64,
 }
 
 #[cfg(test)]

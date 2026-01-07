@@ -482,6 +482,14 @@ impl ClipGridPanel {
                 actions.push(ClipGridAction::SetLayerOpacity { layer_id, opacity });
             }
 
+            // Right-click to reset opacity
+            slider_result.inner.clone().context_menu(|ui| {
+                if ui.button("Reset to 100%").clicked() {
+                    actions.push(ClipGridAction::SetLayerOpacity { layer_id, opacity: 1.0 });
+                    ui.close_menu();
+                }
+            });
+
             // Tooltip for the slider
             slider_result.inner.on_hover_text("Layer opacity (0% = invisible, 100% = opaque)");
 

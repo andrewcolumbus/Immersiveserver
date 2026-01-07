@@ -16,9 +16,9 @@ const SPRING_DAMPING: f32 = 0.85;
 /// Threshold for stopping rubber-band animation
 const VELOCITY_THRESHOLD: f32 = 0.5;
 /// Maximum overshoot allowed (as fraction of visible area)
-const MAX_OVERSHOOT: f32 = 0.3;
+const MAX_OVERSHOOT: f32 = 0.5;
 /// Resistance factor when dragging past bounds
-const OVERSHOOT_RESISTANCE: f32 = 0.3;
+const OVERSHOOT_RESISTANCE: f32 = 0.5;
 
 /// Viewport state for navigating the environment preview
 #[derive(Debug, Clone)]

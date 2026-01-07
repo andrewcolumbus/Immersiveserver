@@ -214,6 +214,48 @@ impl PerformancePanel {
         ui.add_space(4.0);
         ui.separator();
 
+        // CPU Timings section
+        ui.label(egui::RichText::new("CPU Timings").strong());
+        egui::Grid::new("cpu_timings_grid")
+            .num_columns(2)
+            .spacing([20.0, 4.0])
+            .show(ui, |ui| {
+                // Video upload time
+                ui.label("Video Upload:");
+                let video_color = if metrics.video_frame_time_ms > 5.0 {
+                    egui::Color32::from_rgb(255, 150, 100)
+                } else if metrics.video_frame_time_ms > 2.0 {
+                    egui::Color32::from_rgb(255, 230, 100)
+                } else {
+                    egui::Color32::WHITE
+                };
+                ui.label(
+                    egui::RichText::new(format!("{:.2} ms", metrics.video_frame_time_ms))
+                        .monospace()
+                        .color(video_color),
+                );
+                ui.end_row();
+
+                // UI render time
+                ui.label("UI Render:");
+                let ui_color = if metrics.ui_frame_time_ms > 8.0 {
+                    egui::Color32::from_rgb(255, 150, 100)
+                } else if metrics.ui_frame_time_ms > 4.0 {
+                    egui::Color32::from_rgb(255, 230, 100)
+                } else {
+                    egui::Color32::WHITE
+                };
+                ui.label(
+                    egui::RichText::new(format!("{:.2} ms", metrics.ui_frame_time_ms))
+                        .monospace()
+                        .color(ui_color),
+                );
+                ui.end_row();
+            });
+
+        ui.add_space(4.0);
+        ui.separator();
+
         // Resource Counts
         ui.label(egui::RichText::new("Resources").strong());
         egui::Grid::new("resources_grid")

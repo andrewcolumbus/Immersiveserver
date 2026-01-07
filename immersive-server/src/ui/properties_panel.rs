@@ -174,6 +174,8 @@ pub enum PropertiesAction {
     SetFloorLayerIndex { index: usize },
     /// Low latency mode changed (trades stability for reduced input lag)
     SetLowLatencyMode { enabled: bool },
+    /// Test pattern mode changed (replaces composition with calibration pattern)
+    SetTestPattern { enabled: bool },
 }
 
 /// Context for rendering effect stacks (determines which PropertiesAction variants to emit)

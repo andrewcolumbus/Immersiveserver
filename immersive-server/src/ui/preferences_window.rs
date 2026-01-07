@@ -230,6 +230,13 @@ impl PreferencesWindow {
             if response.changed() {
                 actions.push(PropertiesAction::SetTargetFPS { fps: self.temp_fps });
             }
+            response.context_menu(|ui| {
+                if ui.button("Reset to 60 fps").clicked() {
+                    self.temp_fps = 60;
+                    actions.push(PropertiesAction::SetTargetFPS { fps: 60 });
+                    ui.close_menu();
+                }
+            });
         });
 
         // FPS presets
@@ -259,6 +266,18 @@ impl PreferencesWindow {
             .changed()
         {
             actions.push(PropertiesAction::SetShowFPS { show: show_fps });
+        }
+
+        ui.add_space(8.0);
+
+        // Test pattern checkbox
+        let mut test_pattern = settings.test_pattern_enabled;
+        if ui
+            .checkbox(&mut test_pattern, "Show Test Pattern")
+            .on_hover_text("Replace composition with calibration test pattern")
+            .changed()
+        {
+            actions.push(PropertiesAction::SetTestPattern { enabled: test_pattern });
         }
 
         ui.add_space(16.0);

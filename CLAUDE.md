@@ -233,6 +233,28 @@ Implemented via `pending_runtimes` map that holds the new clip until first frame
 
 Environment resolution is independent of window size. The `Viewport` handles pan/zoom navigation with spring physics for smooth right-click panning with rubber-band snap-back.
 
+### UI Conventions
+
+#### Slider/DragValue Reset on Right-Click
+
+All `egui::Slider` and `egui::DragValue` widgets should include a right-click context menu with a "Reset to [default]" option:
+
+```rust
+let response = ui.add(egui::Slider::new(&mut value, min..=max));
+if response.changed() {
+    // handle change
+}
+response.context_menu(|ui| {
+    if ui.button("Reset to [default value]").clicked() {
+        value = DEFAULT;
+        // emit action or set changed flag
+        ui.close_menu();
+    }
+});
+```
+
+This provides a consistent UX where users can quickly reset any numeric parameter by right-clicking.
+
 ## External Libraries
 
 Located in `external_libraries/`:

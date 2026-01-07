@@ -92,6 +92,14 @@ pub struct App {
     /// Bind group for checker params
     checker_bind_group: wgpu::BindGroup,
 
+    // Test pattern pipeline
+    /// Render pipeline for test pattern
+    test_pattern_pipeline: wgpu::RenderPipeline,
+    /// Uniform buffer for test pattern params (environment size, time)
+    test_pattern_params_buffer: wgpu::Buffer,
+    /// Bind group for test pattern params
+    test_pattern_bind_group: wgpu::BindGroup,
+
     // Present pass (Environment -> WindowSurface)
     /// Bind group layout for presenting the environment to the window
     copy_bind_group_layout: wgpu::BindGroupLayout,
@@ -248,6 +256,10 @@ pub struct App {
     frame_profiler: crate::telemetry::FrameProfiler,
     /// GPU profiler for render pass timing
     gpu_profiler: crate::telemetry::GpuProfiler,
+    /// Video texture upload time last frame (milliseconds)
+    video_frame_time_ms: f64,
+    /// UI rendering time last frame (milliseconds)
+    ui_frame_time_ms: f64,
 
     // Frame pacing (GPU double-buffering)
     /// Tracks submission indices of frames currently in flight to the GPU.
@@ -368,6 +380,10 @@ impl App {
         // Create checkerboard background pipeline
         let (checker_pipeline, checker_params_buffer, checker_bind_group) =
             Self::create_checker_pipeline(&device, &queue, surface_format, env_width, env_height);
+
+        // Create test pattern pipeline
+        let (test_pattern_pipeline, test_pattern_params_buffer, test_pattern_bind_group) =
+            Self::create_test_pattern_pipeline(&device, &queue, surface_format, env_width, env_height);
 
         // Create present pipeline (Environment -> WindowSurface)
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -509,6 +525,9 @@ impl App {
             checker_pipeline,
             checker_params_buffer,
             checker_bind_group,
+            test_pattern_pipeline,
+            test_pattern_params_buffer,
+            test_pattern_bind_group,
             copy_bind_group_layout,
             copy_bind_group,
             copy_pipeline,
@@ -642,6 +661,8 @@ impl App {
             // Performance profiling
             frame_profiler: crate::telemetry::FrameProfiler::new(),
             gpu_profiler,
+            video_frame_time_ms: 0.0,
+            ui_frame_time_ms: 0.0,
 
             // Frame pacing (GPU double-buffering)
             frames_in_flight: VecDeque::with_capacity(3),
@@ -1045,6 +1066,126 @@ impl App {
         });
 
         (pipeline, params_buffer, bind_group)
+    }
+
+    /// Create test pattern pipeline for calibration/alignment
+    fn create_test_pattern_pipeline(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        format: wgpu::TextureFormat,
+        env_width: u32,
+        env_height: u32,
+    ) -> (wgpu::RenderPipeline, wgpu::Buffer, wgpu::BindGroup) {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Test Pattern Shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("shaders/test_pattern.wgsl").into(),
+            ),
+        });
+
+        // Test pattern params: env_size (vec2), time (f32), padding (f32)
+        #[repr(C)]
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+        struct TestPatternParams {
+            env_size: [f32; 2],
+            time: f32,
+            _pad: f32,
+        }
+
+        let params = TestPatternParams {
+            env_size: [env_width as f32, env_height as f32],
+            time: 0.0,
+            _pad: 0.0,
+        };
+
+        let params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Test Pattern Params Buffer"),
+            size: std::mem::size_of::<TestPatternParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        queue.write_buffer(&params_buffer, 0, bytemuck::bytes_of(&params));
+
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Test Pattern Bind Group Layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Test Pattern Bind Group"),
+            layout: &bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: params_buffer.as_entire_binding(),
+            }],
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Test Pattern Pipeline Layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Test Pattern Pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        (pipeline, params_buffer, bind_group)
+    }
+
+    /// Update test pattern params (called each frame when test pattern is active)
+    fn update_test_pattern_params(&self, time: f32) {
+        #[repr(C)]
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+        struct TestPatternParams {
+            env_size: [f32; 2],
+            time: f32,
+            _pad: f32,
+        }
+
+        let params = TestPatternParams {
+            env_size: [self.environment.width() as f32, self.environment.height() as f32],
+            time,
+            _pad: 0.0,
+        };
+
+        self.queue
+            .write_buffer(&self.test_pattern_params_buffer, 0, bytemuck::bytes_of(&params));
     }
 
     /// Update checkerboard params when environment size changes
@@ -1614,6 +1755,7 @@ impl App {
         }
 
         // Begin egui frame
+        let ui_start = std::time::Instant::now();
         let raw_input = self.egui_state.take_egui_input(&self.window);
         self.egui_ctx.begin_pass(raw_input);
 
@@ -2390,10 +2532,32 @@ impl App {
         let paint_jobs = self
             .egui_ctx
             .tessellate(full_output.shapes, full_output.pixels_per_point);
+        self.ui_frame_time_ms = ui_start.elapsed().as_secs_f64() * 1000.0;
 
         // Render to Environment texture (fixed-resolution canvas)
-        // 1. Always render checkerboard background first
-        {
+        if self.settings.test_pattern_enabled {
+            // TEST PATTERN MODE: Render test pattern instead of composition
+            self.update_test_pattern_params(self.effect_manager.time());
+
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Test Pattern Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: self.environment.texture_view(),
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            render_pass.set_pipeline(&self.test_pattern_pipeline);
+            render_pass.set_bind_group(0, &self.test_pattern_bind_group, &[]);
+            render_pass.draw(0..3, 0..1);
+        } else {
+            // NORMAL MODE: Render checkerboard background first
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Checker Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -2413,7 +2577,8 @@ impl App {
             render_pass.draw(0..3, 0..1);
         }
 
-        // 2. Render layers back-to-front (index 0 = back, last = front)
+        // 2. Render layers back-to-front (index 0 = back, last = front) - skip in test pattern mode
+        if !self.settings.test_pattern_enabled {
         for layer in self.environment.layers() {
             // Skip invisible layers or fully transparent layers
             if !layer.visible || layer.opacity <= 0.0 {
@@ -2714,9 +2879,11 @@ impl App {
                 }
             }
         }
+        } // End of if !self.settings.test_pattern_enabled (layer rendering)
 
         // ========== ENVIRONMENT EFFECTS (Master Post-Processing) ==========
         // Process environment effects AFTER all layers composited, BEFORE capture/output
+        // Note: Environment effects still apply even in test pattern mode
         {
             let env_effects = self.environment.effects();
             let env_active_effect_count = env_effects.active_effects().count();
@@ -3313,6 +3480,8 @@ impl App {
             active_clip_count,
             effect_count,
             gpu_memory,
+            video_frame_time_ms: self.video_frame_time_ms,
+            ui_frame_time_ms: self.ui_frame_time_ms,
         }
     }
 
@@ -3605,6 +3774,8 @@ impl App {
     /// Rate-limits texture uploads to MAX_UPLOADS_PER_FRAME to prevent GPU bandwidth spikes.
     /// Uses round-robin ordering to ensure fair distribution across layers.
     pub fn update_videos(&mut self) {
+        let video_start = std::time::Instant::now();
+
         // Limit texture uploads per frame to prevent bandwidth spikes.
         // With 16 layers triggering simultaneously, uploads complete over multiple frames
         // instead of causing a single-frame spike.
@@ -3714,6 +3885,8 @@ impl App {
                 self.layer_runtimes.insert(layer_id, new_runtime);
             }
         }
+
+        self.video_frame_time_ms = video_start.elapsed().as_secs_f64() * 1000.0;
     }
 
     /// Poll for shader changes and hot-reload if needed
@@ -5843,6 +6016,15 @@ impl App {
                 self.settings.low_latency_mode = enabled;
                 // Note: sync_low_latency_mode() will reconfigure the surface on next render
             }
+            PropertiesAction::SetTestPattern { enabled } => {
+                self.settings.test_pattern_enabled = enabled;
+                self.environment.set_test_pattern_enabled(enabled);
+                self.menu_bar.set_status(if enabled {
+                    "Test pattern enabled"
+                } else {
+                    "Test pattern disabled"
+                });
+            }
             PropertiesAction::StartScrub { layer_id } => {
                 // Store whether the video was playing before scrubbing
                 if let Some(runtime) = self.layer_runtimes.get(&layer_id) {
@@ -5947,11 +6129,14 @@ impl App {
                 }
             }
             AdvancedOutputAction::UpdateScreenInputRect { screen_id, input_rect } => {
-                // Update input_rect on all slices of this screen
+                // Update transform rect (output.rect) on all slices of this screen
                 if let Some(manager) = self.output_manager.as_mut() {
                     if let Some(screen) = manager.get_screen_mut(screen_id) {
                         for slice in &mut screen.slices {
-                            slice.input_rect = input_rect;
+                            slice.output.rect.x = input_rect.x;
+                            slice.output.rect.y = input_rect.y;
+                            slice.output.rect.width = input_rect.width;
+                            slice.output.rect.height = input_rect.height;
                         }
                     }
                     // Sync runtime to pick up changes
@@ -6175,6 +6360,18 @@ impl App {
     /// Check if video is paused (any layer)
     pub fn is_video_paused(&self) -> bool {
         self.is_any_video_paused()
+    }
+
+    /// Toggle test pattern mode on/off
+    pub fn toggle_test_pattern(&mut self) {
+        let enabled = !self.settings.test_pattern_enabled;
+        self.settings.test_pattern_enabled = enabled;
+        self.environment.set_test_pattern_enabled(enabled);
+        self.menu_bar.set_status(if enabled {
+            "Test pattern enabled"
+        } else {
+            "Test pattern disabled"
+        });
     }
 
     /// Get the current video path if loaded (first layer)
