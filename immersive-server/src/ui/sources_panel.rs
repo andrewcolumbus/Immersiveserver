@@ -84,6 +84,8 @@ pub enum SourcesAction {
     StartNdiDiscovery,
     /// Stop NDI discovery
     StopNdiDiscovery,
+    /// Select a source for preview in the Preview Monitor (click, not drag)
+    SelectSourceForPreview { source: DraggableSource },
 }
 
 /// State for the sources panel
@@ -167,7 +169,9 @@ impl SourcesPanel {
                 }
             } else {
                 for source in &omt_sources {
-                    self.render_draggable_source(ui, source.clone());
+                    if let Some(action) = Self::render_draggable_source(ui, source.clone()) {
+                        actions.push(action);
+                    }
                 }
             }
         });
@@ -200,7 +204,9 @@ impl SourcesPanel {
                     }
                 } else {
                     for source in &ndi_sources {
-                        self.render_draggable_source(ui, source.clone());
+                        if let Some(action) = Self::render_draggable_source(ui, source.clone()) {
+                            actions.push(action);
+                        }
                     }
                 }
             } else {
@@ -213,16 +219,17 @@ impl SourcesPanel {
         // Instructions
         ui.separator();
         ui.vertical_centered(|ui| {
-            ui.label(egui::RichText::new("Drag sources to clip grid").size(11.0).color(egui::Color32::GRAY));
+            ui.label(egui::RichText::new("Click to preview • Drag to clip grid").size(11.0).color(egui::Color32::GRAY));
         });
 
         actions
     }
 
     /// Render a single draggable source item
-    fn render_draggable_source(&self, ui: &mut egui::Ui, source: DraggableSource) {
+    /// Returns Some(action) if the source was clicked for preview
+    fn render_draggable_source(ui: &mut egui::Ui, source: DraggableSource) -> Option<SourcesAction> {
         let id = egui::Id::new(format!("source_{}", source.display_name()));
-        
+
         // Create a frame for the source item
         let frame = egui::Frame::new()
             .fill(egui::Color32::from_rgb(45, 45, 55))
@@ -236,8 +243,8 @@ impl SourcesPanel {
             });
         }).response;
 
-        // Make it draggable
-        let response = ui.interact(response.rect, id, egui::Sense::drag());
+        // Make it clickable and draggable
+        let response = ui.interact(response.rect, id, egui::Sense::click_and_drag());
 
         // Show tooltip
         let response = response.on_hover_text(source.tooltip());
@@ -267,6 +274,13 @@ impl SourcesPanel {
                     });
             }
         }
+
+        // Handle click to select for preview
+        if response.clicked() {
+            return Some(SourcesAction::SelectSourceForPreview { source });
+        }
+
+        None
     }
 
     /// Render as a floating window

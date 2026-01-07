@@ -989,6 +989,9 @@ pub struct ScreenRuntime {
 
     /// NDI capture for screens with NDI output device
     pub ndi_capture: Option<NdiCapture>,
+
+    /// OMT capture for screens with OMT output device
+    pub omt_capture: Option<crate::network::OmtCapture>,
 }
 
 impl ScreenRuntime {
@@ -1055,6 +1058,7 @@ impl ScreenRuntime {
             height,
             format,
             ndi_capture: None,
+            omt_capture: None,
         }
     }
 
@@ -1234,6 +1238,65 @@ impl ScreenRuntime {
     /// Check if NDI output is active
     pub fn is_ndi_active(&self) -> bool {
         self.ndi_capture.is_some()
+    }
+
+    /// Update OMT output based on device type
+    ///
+    /// Creates or destroys OMT capture based on whether the screen is configured
+    /// as an OMT output device.
+    pub fn update_omt_output(
+        &mut self,
+        device: &wgpu::Device,
+        screen: &Screen,
+        target_fps: u32,
+        tokio_handle: &tokio::runtime::Handle,
+    ) {
+        match &screen.device {
+            OutputDevice::Omt { name, port } if screen.enabled => {
+                // Create OMT capture if not already created or dimensions changed
+                let needs_create = self.omt_capture.as_ref().map_or(true, |capture| {
+                    !capture.dimensions_match(self.width, self.height)
+                });
+
+                if needs_create {
+                    tracing::info!(
+                        "Creating OMT output for screen '{}' ({}x{}) as '{}'",
+                        screen.name,
+                        self.width,
+                        self.height,
+                        name
+                    );
+
+                    let sender = crate::network::OmtSender::new(name.clone(), *port);
+                    let mut capture = crate::network::OmtCapture::new(device, self.width, self.height);
+                    capture.set_target_fps(target_fps);
+                    capture.start_sender_thread(sender, tokio_handle.clone());
+                    self.omt_capture = Some(capture);
+                    tracing::info!("OMT output started for screen '{}'", screen.name);
+                }
+            }
+            _ => {
+                // Not an OMT device or disabled - remove capture if exists
+                if self.omt_capture.is_some() {
+                    tracing::info!("Stopping OMT output for screen '{}'", screen.name);
+                    self.omt_capture = None;
+                }
+            }
+        }
+    }
+
+    /// Capture frame to OMT if enabled
+    ///
+    /// Call this after rendering the screen to send the output to OMT.
+    pub fn capture_omt_frame(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        if let Some(capture) = &mut self.omt_capture {
+            capture.capture_frame(encoder, &self.output_texture);
+        }
+    }
+
+    /// Check if OMT output is active
+    pub fn is_omt_active(&self) -> bool {
+        self.omt_capture.is_some()
     }
 }
 
@@ -1794,6 +1857,34 @@ impl OutputManager {
         screen_id
     }
 
+    /// Add a screen from existing Screen data (for loading presets)
+    pub fn add_screen_from_data(&mut self, device: &wgpu::Device, mut screen: Screen) -> ScreenId {
+        // Assign new IDs to avoid conflicts
+        let screen_id = ScreenId(self.next_screen_id);
+        self.next_screen_id += 1;
+        screen.id = screen_id;
+
+        // Reassign slice IDs
+        for slice in &mut screen.slices {
+            slice.id = SliceId(self.next_slice_id);
+            self.next_slice_id += 1;
+        }
+
+        let width = screen.width;
+        let height = screen.height;
+
+        // Create runtime
+        let mut runtime = ScreenRuntime::new(device, screen_id, width, height, self.format);
+        for slice in &screen.slices {
+            runtime.ensure_slice(device, slice);
+        }
+
+        self.runtimes.insert(screen_id, runtime);
+        self.screens.insert(screen_id, screen);
+
+        screen_id
+    }
+
     /// Remove a screen
     pub fn remove_screen(&mut self, screen_id: ScreenId) {
         self.screens.remove(&screen_id);
@@ -2042,7 +2133,14 @@ impl OutputManager {
     /// Sync screen data to runtime (after screen properties change)
     ///
     /// `target_fps` is used to calculate the number of delay frames from delay_ms.
-    pub fn sync_runtime(&mut self, device: &wgpu::Device, screen_id: ScreenId, target_fps: f32) {
+    /// `tokio_handle` is needed for OMT output devices.
+    pub fn sync_runtime(
+        &mut self,
+        device: &wgpu::Device,
+        screen_id: ScreenId,
+        target_fps: f32,
+        tokio_handle: Option<&tokio::runtime::Handle>,
+    ) {
         let Some(screen) = self.screens.get(&screen_id) else {
             return;
         };
@@ -2088,6 +2186,15 @@ impl OutputManager {
                 runtime.update_ndi_output(device, screen, target_fps as u32);
             }
         }
+
+        // Update OMT output based on device type
+        if let Some(handle) = tokio_handle {
+            if let Some(screen) = self.screens.get(&screen_id) {
+                if let Some(runtime) = self.runtimes.get_mut(&screen_id) {
+                    runtime.update_omt_output(device, screen, target_fps as u32, handle);
+                }
+            }
+        }
     }
 
     /// Capture NDI frame for a screen (if NDI output is enabled)
@@ -2103,6 +2210,24 @@ impl OutputManager {
     pub fn process_ndi_captures(&mut self, device: &wgpu::Device) {
         for runtime in self.runtimes.values_mut() {
             if let Some(capture) = &mut runtime.ndi_capture {
+                capture.process(device);
+            }
+        }
+    }
+
+    /// Capture OMT frame for a screen (if OMT output is enabled)
+    pub fn capture_omt_frame(&mut self, encoder: &mut wgpu::CommandEncoder, screen_id: ScreenId) {
+        if let Some(runtime) = self.runtimes.get_mut(&screen_id) {
+            runtime.capture_omt_frame(encoder);
+        }
+    }
+
+    /// Process OMT capture pipelines for all screens.
+    ///
+    /// Call this after queue.submit() to poll GPU and send captured frames.
+    pub fn process_omt_captures(&mut self, device: &wgpu::Device) {
+        for runtime in self.runtimes.values_mut() {
+            if let Some(capture) = &mut runtime.omt_capture {
                 capture.process(device);
             }
         }

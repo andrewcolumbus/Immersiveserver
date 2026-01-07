@@ -37,6 +37,23 @@ pub struct GpuMemoryStats {
     pub total: u64,
 }
 
+/// NDI receiver statistics
+#[derive(Debug, Clone, Default)]
+pub struct NdiStats {
+    /// NDI source name
+    pub source_name: String,
+    /// Last frame pickup latency in milliseconds
+    pub pickup_latency_ms: f64,
+    /// Current number of frames in buffer
+    pub queue_depth: usize,
+    /// Buffer capacity
+    pub buffer_capacity: usize,
+    /// Total frames received
+    pub frames_received: u64,
+    /// Frames dropped due to full buffer
+    pub frames_dropped: u64,
+}
+
 impl GpuMemoryStats {
     /// Get total memory in megabytes
     pub fn total_mb(&self) -> f64 {
@@ -186,6 +203,8 @@ pub struct PerformanceMetrics {
     pub video_frame_time_ms: f64,
     /// Time spent on UI rendering (milliseconds)
     pub ui_frame_time_ms: f64,
+    /// NDI receiver statistics
+    pub ndi_stats: Vec<NdiStats>,
 }
 
 #[cfg(test)]

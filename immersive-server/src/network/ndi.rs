@@ -25,7 +25,8 @@
 use super::ndi_ffi::*;
 use bytes::Bytes;
 use std::ffi::{CStr, CString};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Once};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -33,6 +34,23 @@ use std::time::{Duration, Instant};
 /// Ensure NDI is initialized exactly once
 static NDI_INIT: Once = Once::new();
 static mut NDI_INITIALIZED: bool = false;
+
+/// Ring buffer capacity for NDI frames (absorbs timing jitter).
+/// Can be changed at runtime via `set_ndi_buffer_capacity()`.
+static NDI_BUFFER_CAPACITY: AtomicUsize = AtomicUsize::new(3);
+
+/// Set the NDI receive buffer capacity (1-10 frames).
+/// Takes effect immediately for all active receivers.
+pub fn set_ndi_buffer_capacity(capacity: usize) {
+    let clamped = capacity.clamp(1, 10);
+    NDI_BUFFER_CAPACITY.store(clamped, Ordering::Release);
+    tracing::info!("NDI buffer capacity set to {} frames", clamped);
+}
+
+/// Get the current NDI receive buffer capacity.
+pub fn get_ndi_buffer_capacity() -> usize {
+    NDI_BUFFER_CAPACITY.load(Ordering::Acquire)
+}
 
 /// Initialize NDI library if not already done
 fn ensure_ndi_initialized() -> bool {
@@ -59,12 +77,17 @@ pub struct NdiFrame {
     pub width: u32,
     /// Frame height in pixels.
     pub height: u32,
-    /// Raw pixel data (BGRA format).
+    /// Raw pixel data (BGRA or RGBA format, check `is_bgra` field).
     pub data: Bytes,
     /// Timestamp from stream start.
     pub timestamp: Duration,
     /// Frame rate (frames per second).
     pub frame_rate: f64,
+    /// When this frame was received (for latency tracking).
+    pub received_at: Instant,
+    /// Whether pixel data is in BGRA format (true) or RGBA format (false).
+    /// BGRA requires R↔B channel swap in the shader.
+    pub is_bgra: bool,
 }
 
 // =============================================================================
@@ -109,26 +132,32 @@ impl std::error::Error for NdiError {}
 
 /// Shared state between receive thread and main thread.
 struct NdiReceiverState {
-    /// The latest received frame (if any).
-    current_frame: Mutex<Option<NdiFrame>>,
-    /// Whether a new frame is available for pickup.
-    new_frame_available: AtomicBool,
+    /// Ring buffer of received frames (FIFO, up to RING_BUFFER_CAPACITY).
+    frame_buffer: Mutex<VecDeque<NdiFrame>>,
     /// Whether the receiver is running.
     running: AtomicBool,
     /// Whether connected to a source.
     connected: AtomicBool,
     /// Frame count for statistics.
     frame_count: AtomicU64,
+    /// Count of frames dropped when buffer was full.
+    frames_overwritten: AtomicU64,
+    /// Last pickup latency in microseconds (for UI display).
+    last_pickup_latency_us: AtomicU64,
+    /// Last queue depth when frame was picked up.
+    last_queue_depth: AtomicUsize,
 }
 
 impl NdiReceiverState {
     fn new() -> Self {
         Self {
-            current_frame: Mutex::new(None),
-            new_frame_available: AtomicBool::new(false),
+            frame_buffer: Mutex::new(VecDeque::with_capacity(get_ndi_buffer_capacity())),
             running: AtomicBool::new(true),
             connected: AtomicBool::new(false),
             frame_count: AtomicU64::new(0),
+            frames_overwritten: AtomicU64::new(0),
+            last_pickup_latency_us: AtomicU64::new(0),
+            last_queue_depth: AtomicUsize::new(0),
         }
     }
 }
@@ -279,19 +308,48 @@ impl NdiReceiver {
                         60.0
                     };
 
+                    // Check actual pixel format from FourCC
+                    // We request BGRA, but the SDK may deliver RGBA for some sources
+                    let is_bgra = matches!(
+                        video_frame.FourCC,
+                        NDIlib_FourCC_video_type_e::BGRA | NDIlib_FourCC_video_type_e::BGRX
+                    );
+
                     let ndi_frame = NdiFrame {
                         width: video_frame.xres as u32,
                         height: video_frame.yres as u32,
                         data,
                         timestamp: start_time.elapsed(),
                         frame_rate,
+                        received_at: Instant::now(),
+                        is_bgra,
                     };
 
-                    // Store for main thread pickup
-                    if let Ok(mut current) = state.current_frame.lock() {
-                        *current = Some(ndi_frame);
-                        state.new_frame_available.store(true, Ordering::Release);
-                        state.frame_count.fetch_add(1, Ordering::Relaxed);
+                    // Store in ring buffer for main thread pickup
+                    if let Ok(mut buffer) = state.frame_buffer.lock() {
+                        let capacity = get_ndi_buffer_capacity();
+                        // If buffer is full, drop oldest frame
+                        if buffer.len() >= capacity {
+                            buffer.pop_front();
+                            state.frames_overwritten.fetch_add(1, Ordering::Relaxed);
+                        }
+                        buffer.push_back(ndi_frame);
+                        let frame_count = state.frame_count.fetch_add(1, Ordering::Relaxed) + 1;
+
+                        // Log stats every 60 frames
+                        if frame_count % 60 == 0 {
+                            let overwritten = state.frames_overwritten.load(Ordering::Relaxed);
+                            let queue_depth = buffer.len();
+                            tracing::info!(
+                                "NDI '{}': {} frames received, {} dropped ({:.1}%), buffer: {}/{}",
+                                ndi_name,
+                                frame_count,
+                                overwritten,
+                                if frame_count > 0 { overwritten as f64 / frame_count as f64 * 100.0 } else { 0.0 },
+                                queue_depth,
+                                capacity
+                            );
+                        }
                     }
 
                     // Free NDI's buffer
@@ -319,18 +377,27 @@ impl NdiReceiver {
         tracing::info!("NDI Receiver: Stopped receiving from '{}'", ndi_name);
     }
 
-    /// Take the latest frame (non-blocking).
+    /// Take the oldest frame from buffer (FIFO, non-blocking).
     ///
-    /// Returns None if no new frame is available.
+    /// Returns None if buffer is empty.
     pub fn take_frame(&mut self) -> Option<NdiFrame> {
-        if self.state.new_frame_available.swap(false, Ordering::AcqRel) {
-            if let Ok(mut current) = self.state.current_frame.lock() {
-                if let Some(frame) = current.take() {
-                    // Update cached dimensions
-                    self.width = frame.width;
-                    self.height = frame.height;
-                    return Some(frame);
-                }
+        if let Ok(mut buffer) = self.state.frame_buffer.lock() {
+            if let Some(frame) = buffer.pop_front() {
+                // Update cached dimensions
+                self.width = frame.width;
+                self.height = frame.height;
+
+                // Store pickup latency for UI display (instead of logging)
+                let pickup_latency_us = frame.received_at.elapsed().as_micros() as u64;
+                let remaining = buffer.len();
+                self.state
+                    .last_pickup_latency_us
+                    .store(pickup_latency_us, Ordering::Release);
+                self.state
+                    .last_queue_depth
+                    .store(remaining, Ordering::Release);
+
+                return Some(frame);
             }
         }
         None
@@ -369,6 +436,26 @@ impl NdiReceiver {
         } else {
             0.0
         }
+    }
+
+    /// Get the last pickup latency in milliseconds.
+    pub fn pickup_latency_ms(&self) -> f64 {
+        self.state.last_pickup_latency_us.load(Ordering::Acquire) as f64 / 1000.0
+    }
+
+    /// Get the current queue depth (frames waiting in buffer).
+    pub fn queue_depth(&self) -> usize {
+        self.state.last_queue_depth.load(Ordering::Acquire)
+    }
+
+    /// Get the number of frames dropped due to full buffer.
+    pub fn frames_dropped(&self) -> u64 {
+        self.state.frames_overwritten.load(Ordering::Acquire)
+    }
+
+    /// Get the buffer capacity.
+    pub fn buffer_capacity(&self) -> usize {
+        get_ndi_buffer_capacity()
     }
 }
 
@@ -606,6 +693,8 @@ mod tests {
             data: Bytes::from_static(&[0, 1, 2, 3]),
             timestamp: Duration::from_secs(1),
             frame_rate: 60.0,
+            received_at: Instant::now(),
+            is_bgra: true,
         };
 
         let cloned = frame.clone();

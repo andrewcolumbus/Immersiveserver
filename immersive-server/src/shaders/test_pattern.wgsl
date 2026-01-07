@@ -19,9 +19,13 @@ struct TestPatternParams {
     env_size: vec2<f32>,    // Environment dimensions in pixels
     time: f32,              // Elapsed time in seconds
     _pad: f32,
+    logo_size: vec2<f32>,   // Logo texture dimensions in pixels
+    _pad2: vec2<f32>,
 }
 
 @group(0) @binding(0) var<uniform> params: TestPatternParams;
+@group(0) @binding(1) var logo_texture: texture_2d<f32>;
+@group(0) @binding(2) var logo_sampler: sampler;
 
 // ============================================================================
 // VERTEX SHADER - Fullscreen triangle
@@ -86,11 +90,12 @@ fn draw_checkerboard(pixel: vec2<f32>) -> vec3<f32> {
 
 // Draw rainbow gradient bar on left side
 fn draw_rainbow_bar(pixel: vec2<f32>, env_size: vec2<f32>) -> vec4<f32> {
-    let bar_width = env_size.x * 0.15; // 15% of width
-    let bar_start_y = env_size.y * 0.05;
-    let bar_end_y = env_size.y * 0.85;
+    let bar_width = env_size.x * 0.10; // 10% of width
+    let bar_start_x = env_size.x * 0.05; // 5% margin from left edge
+    let bar_start_y = env_size.y * 0.10;
+    let bar_end_y = env_size.y * 0.90;
 
-    if (pixel.x < bar_width && pixel.y > bar_start_y && pixel.y < bar_end_y) {
+    if (pixel.x > bar_start_x && pixel.x < bar_start_x + bar_width && pixel.y > bar_start_y && pixel.y < bar_end_y) {
         // Calculate hue based on vertical position
         let t = (pixel.y - bar_start_y) / (bar_end_y - bar_start_y);
         let hue = t; // 0 (red) to 1 (red again, full spectrum)
@@ -114,10 +119,10 @@ fn draw_rainbow_bar(pixel: vec2<f32>, env_size: vec2<f32>) -> vec4<f32> {
 
 // Draw grayscale gradient bar on right side
 fn draw_grayscale_bar(pixel: vec2<f32>, env_size: vec2<f32>) -> vec4<f32> {
-    let bar_width = env_size.x * 0.08;
-    let bar_start_x = env_size.x - bar_width;
-    let bar_start_y = env_size.y * 0.15;
-    let bar_end_y = env_size.y * 0.75;
+    let bar_width = env_size.x * 0.10; // 10% of width
+    let bar_start_x = env_size.x * 0.85; // 5% margin from right edge
+    let bar_start_y = env_size.y * 0.10;
+    let bar_end_y = env_size.y * 0.90;
 
     if (pixel.x > bar_start_x && pixel.y > bar_start_y && pixel.y < bar_end_y) {
         // Gradient from black (top) to white (bottom)
@@ -512,96 +517,34 @@ fn draw_time_text(pixel: vec2<f32>, env_size: vec2<f32>, time: f32) -> f32 {
     return alpha;
 }
 
-// Draw simple block text "IMMERSIVEGROUP"
-fn draw_branding(pixel: vec2<f32>, env_size: vec2<f32>) -> f32 {
-    // Position above center
+// Draw logo from texture (centered above middle)
+fn draw_branding(pixel: vec2<f32>, env_size: vec2<f32>) -> vec4<f32> {
+    // Position above center - scale logo to fit nicely
     let center_x = env_size.x * 0.5;
     let center_y = env_size.y * 0.5 - 80.0;
 
-    // Simple "I M M E R S I V E" text using block letters
-    // Each letter is roughly 20x30 pixels
-    let letter_w = 18.0;
-    let letter_h = 28.0;
-    let letter_spacing = 22.0;
+    // Target logo width (30% of environment width, capped at 400px)
+    let target_width = min(env_size.x * 0.30, 400.0);
+    let aspect_ratio = params.logo_size.x / params.logo_size.y;
+    let logo_width = target_width;
+    let logo_height = target_width / aspect_ratio;
 
-    // "IMMERSIVE" = 9 letters
-    let text_width = letter_spacing * 9.0;
-    let start_x = center_x - text_width * 0.5;
+    // Logo bounds
+    let start_x = center_x - logo_width * 0.5;
+    let start_y = center_y - logo_height * 0.5;
 
-    // Define which pixels are "on" for each letter using simple block patterns
-    // This is a simplified approach - just draw rectangles for letters
-
-    var alpha = 0.0;
-
-    // Check if we're in the text region
-    if (pixel.y >= center_y && pixel.y < center_y + letter_h &&
-        pixel.x >= start_x && pixel.x < start_x + text_width) {
-
-        let letter_idx = u32((pixel.x - start_x) / letter_spacing);
-        let local_x = fract((pixel.x - start_x) / letter_spacing) * letter_spacing;
-        let local_y = pixel.y - center_y;
-
-        // Normalize to 0-1 within letter bounds
-        let lx = local_x / letter_w;
-        let ly = local_y / letter_h;
-
-        // Simple block letter patterns
-        // "IMMERSIVE"
-        // I M M E R S I V E
-        // 0 1 2 3 4 5 6 7 8
-
-        var on = false;
-
-        switch (letter_idx) {
-            case 0u: { // I
-                on = lx > 0.35 && lx < 0.65;
-            }
-            case 1u: { // M
-                on = (lx < 0.25) || (lx > 0.75) ||
-                     (ly < 0.4 && lx > 0.25 && lx < 0.5) ||
-                     (ly < 0.4 && lx > 0.5 && lx < 0.75);
-            }
-            case 2u: { // M (repeat)
-                on = (lx < 0.25) || (lx > 0.75) ||
-                     (ly < 0.4 && lx > 0.25 && lx < 0.5) ||
-                     (ly < 0.4 && lx > 0.5 && lx < 0.75);
-            }
-            case 3u: { // E
-                on = (lx < 0.25) || (ly < 0.2) || (ly > 0.8) ||
-                     (ly > 0.4 && ly < 0.6 && lx < 0.7);
-            }
-            case 4u: { // R
-                on = (lx < 0.25) || (ly < 0.2 && lx < 0.8) ||
-                     (ly > 0.4 && ly < 0.6 && lx < 0.7) ||
-                     (lx > 0.7 && ly < 0.5) ||
-                     (ly > 0.5 && lx > 0.3 && lx < ly * 0.8);
-            }
-            case 5u: { // S
-                on = (ly < 0.2) || (ly > 0.8) ||
-                     (ly > 0.4 && ly < 0.6) ||
-                     (ly < 0.5 && lx < 0.25) || (ly > 0.5 && lx > 0.75);
-            }
-            case 6u: { // I
-                on = lx > 0.35 && lx < 0.65;
-            }
-            case 7u: { // V
-                let center = 0.5;
-                let slope = (1.0 - ly) * 0.4;
-                on = abs(lx - center) < slope + 0.15 && abs(lx - center) > slope - 0.05;
-            }
-            case 8u: { // E
-                on = (lx < 0.25) || (ly < 0.2) || (ly > 0.8) ||
-                     (ly > 0.4 && ly < 0.6 && lx < 0.7);
-            }
-            default: {}
-        }
-
-        if (on && local_x < letter_w) {
-            alpha = 1.0;
-        }
+    // Check if we're in the logo region
+    if (pixel.x >= start_x && pixel.x < start_x + logo_width &&
+        pixel.y >= start_y && pixel.y < start_y + logo_height) {
+        // Calculate UV coordinates for texture sampling
+        let uv = vec2<f32>(
+            (pixel.x - start_x) / logo_width,
+            (pixel.y - start_y) / logo_height
+        );
+        // Sample the logo texture
+        return textureSample(logo_texture, logo_sampler, uv);
     }
-
-    return alpha;
+    return vec4<f32>(0.0);
 }
 
 // ============================================================================
@@ -651,9 +594,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let circle = draw_center_circle(pixel, params.env_size);
     color = mix(color, vec3<f32>(1.0), circle * 0.8);
 
-    // Draw branding text
+    // Draw logo branding (alpha-blended)
     let branding = draw_branding(pixel, params.env_size);
-    color = mix(color, vec3<f32>(1.0), branding);
+    color = mix(color, branding.rgb, branding.a);
 
     // Draw resolution text
     let resolution = draw_resolution_text(pixel, params.env_size);

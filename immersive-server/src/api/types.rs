@@ -128,8 +128,6 @@ pub struct LayerResponse {
     pub opacity: f32,
     pub blend_mode: String,
     pub transform: TransformResponse,
-    pub tile_x: u32,
-    pub tile_y: u32,
     pub clip_count: usize,
     pub active_clip: Option<usize>,
     pub transition: TransitionResponse,

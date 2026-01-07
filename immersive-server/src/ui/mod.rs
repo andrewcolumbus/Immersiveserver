@@ -31,7 +31,7 @@ pub use native_menu::{activate_macos_app, focus_window_on_click, is_native_menu_
 pub use performance_panel::PerformancePanel;
 pub use preferences_window::PreferencesWindow;
 pub use previs_panel::{PrevisAction, PrevisPanel, WallId};
-pub use preview_monitor_panel::{PreviewClipInfo, PreviewLayerInfo, PreviewMode, PreviewMonitorAction, PreviewMonitorPanel};
+pub use preview_monitor_panel::{PreviewClipInfo, PreviewLayerInfo, PreviewMode, PreviewMonitorAction, PreviewMonitorPanel, PreviewSourceInfo};
 pub use properties_panel::{PropertiesPanel, PropertiesAction, PropertiesTab};
 pub use sources_panel::{DraggableSource, SourcesAction, SourcesPanel};
 pub use thumbnail_cache::ThumbnailCache;

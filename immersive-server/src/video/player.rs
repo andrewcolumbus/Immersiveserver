@@ -63,6 +63,8 @@ pub struct VideoInfo {
     pub is_bc3: bool,
     /// Whether this is specifically a HAP codec (not DXV)
     pub is_hap: bool,
+    /// Whether the player outputs BGRA format (true) or RGBA (false)
+    pub is_bgra_output: bool,
 }
 
 /// Background-threaded video player
@@ -78,20 +80,36 @@ pub struct VideoPlayer {
     info: VideoInfo,
     /// Path to the video file
     path: std::path::PathBuf,
+    /// Whether to use BGRA output format
+    use_bgra: bool,
 }
 
 impl VideoPlayer {
-    /// Open a video file and start background decoding
+    /// Open a video file and start background decoding (RGBA output)
     pub fn open(path: &Path) -> Result<Self, VideoDecoderError> {
+        Self::open_with_format(path, false)
+    }
+
+    /// Open a video file with BGRA output format
+    pub fn open_bgra(path: &Path) -> Result<Self, VideoDecoderError> {
+        Self::open_with_format(path, true)
+    }
+
+    /// Open a video file with explicit pixel format control
+    fn open_with_format(path: &Path, use_bgra: bool) -> Result<Self, VideoDecoderError> {
         // Open decoder to get video info
-        let decoder = VideoDecoder::open(path)?;
-        
+        let decoder = if use_bgra {
+            VideoDecoder::open_bgra(path)?
+        } else {
+            VideoDecoder::open(path)?
+        };
+
         // Determine BC3 vs BC1 for GPU-native codecs
         let is_gpu_native = decoder.is_gpu_native();
         let is_hap = decoder.is_hap();
         let codec_name = decoder.codec_name();
         let is_bc3 = codec_name.contains("alpha") || codec_name.contains("_q") || codec_name.contains("hapq");
-        
+
         let info = VideoInfo {
             width: decoder.width(),
             height: decoder.height(),
@@ -100,34 +118,40 @@ impl VideoPlayer {
             is_gpu_native,
             is_bc3,
             is_hap,
+            is_bgra_output: use_bgra,
         };
-        
+
         tracing::info!(
-            "VideoPlayer: {}x{} @ {:.2}fps, duration: {:.2}s, gpu_native: {}, codec: {}",
-            info.width, info.height, info.frame_rate, info.duration, is_gpu_native, codec_name
+            "VideoPlayer: {}x{} @ {:.2}fps, duration: {:.2}s, gpu_native: {}, bgra: {}, codec: {}",
+            info.width, info.height, info.frame_rate, info.duration, is_gpu_native, use_bgra, codec_name
         );
-        
+
         let state = Arc::new(SharedState::new());
         let state_clone = Arc::clone(&state);
         let path_clone = path.to_path_buf();
-        
+
         // Start decode thread
         let thread_handle = thread::spawn(move || {
-            Self::decode_loop(state_clone, path_clone);
+            Self::decode_loop(state_clone, path_clone, use_bgra);
         });
-        
+
         Ok(Self {
             state,
             thread_handle: Some(thread_handle),
             info,
             path: path.to_path_buf(),
+            use_bgra,
         })
     }
-    
+
     /// Background decode loop
-    fn decode_loop(state: Arc<SharedState>, path: std::path::PathBuf) {
-        // Open decoder in this thread
-        let mut decoder = match VideoDecoder::open(&path) {
+    fn decode_loop(state: Arc<SharedState>, path: std::path::PathBuf, use_bgra: bool) {
+        // Open decoder in this thread with appropriate format
+        let mut decoder = match if use_bgra {
+            VideoDecoder::open_bgra(&path)
+        } else {
+            VideoDecoder::open(&path)
+        } {
             Ok(d) => d,
             Err(e) => {
                 tracing::error!("Failed to open video in decode thread: {}", e);
@@ -344,6 +368,11 @@ impl VideoPlayer {
     /// Check if this is specifically a HAP codec (not DXV)
     pub fn is_hap(&self) -> bool {
         self.info.is_hap
+    }
+
+    /// Check if this player outputs BGRA format (instead of RGBA)
+    pub fn is_bgra_output(&self) -> bool {
+        self.info.is_bgra_output
     }
 
     /// Set the loop mode (0=Loop, 1=PlayOnce)

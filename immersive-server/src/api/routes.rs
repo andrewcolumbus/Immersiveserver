@@ -53,7 +53,6 @@ pub fn create_router(state: SharedStateHandle) -> Router {
         .route("/api/layers/:id/opacity", put(update_layer_opacity))
         .route("/api/layers/:id/blend", put(update_layer_blend))
         .route("/api/layers/:id/visibility", put(update_layer_visibility))
-        .route("/api/layers/:id/tiling", put(update_layer_tiling))
         .route("/api/layers/:id/transition", put(update_layer_transition))
         // Layer effects
         .route("/api/layers/:id/effects", get(list_layer_effects))
@@ -162,24 +161,27 @@ async fn fps_handler(State(state): State<SharedStateHandle>) -> Json<FpsResponse
 async fn performance_handler(State(state): State<SharedStateHandle>) -> Json<PerformanceResponse> {
     let snapshot = state.get_snapshot();
     let active_clips = snapshot.layers.iter().filter(|l| l.active_clip.is_some()).count();
-    // Only count environment effects for now; layer effects would need to be added to LayerSnapshot
-    let effect_count = snapshot.environment_effects.len();
+    // Count all effects: environment + layer + clip
+    let effect_count = snapshot.environment_effects.len()
+        + snapshot.layers.iter().map(|l| {
+            l.effects.len() + l.clips.iter().map(|c| c.effects.len()).sum::<usize>()
+        }).sum::<usize>();
 
     Json(PerformanceResponse {
         fps: snapshot.current_fps,
         frame_time_ms: snapshot.frame_time_ms,
         target_fps: snapshot.target_fps,
-        frame_time_avg_ms: snapshot.frame_time_ms, // Same as current for now
-        frame_time_min_ms: 0.0,  // TODO: Add to snapshot
-        frame_time_max_ms: 0.0,  // TODO: Add to snapshot
-        frame_time_p95_ms: 0.0,  // TODO: Add to snapshot
-        frame_time_p99_ms: 0.0,  // TODO: Add to snapshot
-        gpu_timings: std::collections::HashMap::new(), // TODO: Add GPU profiling to snapshot
-        gpu_total_ms: 0.0,       // TODO: Add to snapshot
+        frame_time_avg_ms: snapshot.performance.frame_time_avg_ms,
+        frame_time_min_ms: snapshot.performance.frame_time_min_ms,
+        frame_time_max_ms: snapshot.performance.frame_time_max_ms,
+        frame_time_p95_ms: snapshot.performance.frame_time_p95_ms,
+        frame_time_p99_ms: snapshot.performance.frame_time_p99_ms,
+        gpu_timings: snapshot.performance.gpu_timings.clone(),
+        gpu_total_ms: snapshot.performance.gpu_total_ms,
         layer_count: snapshot.layers.len(),
         active_clips,
         effect_count,
-        gpu_memory_mb: 0.0,      // TODO: Add to snapshot
+        gpu_memory_mb: snapshot.performance.gpu_memory_mb,
     })
 }
 
@@ -459,18 +461,6 @@ async fn update_layer_visibility(
     Json(serde_json::json!({ "message": "Visibility update requested" }))
 }
 
-#[derive(serde::Deserialize)]
-struct TilingRequest { tile_x: u32, tile_y: u32 }
-
-async fn update_layer_tiling(
-    State(state): State<SharedStateHandle>,
-    Path(id): Path<u32>,
-    Json(req): Json<TilingRequest>,
-) -> Json<serde_json::Value> {
-    let _ = state.send_command(ApiCommand::SetLayerTiling { id, tile_x: req.tile_x, tile_y: req.tile_y });
-    Json(serde_json::json!({ "message": "Tiling update requested" }))
-}
-
 async fn update_layer_transition(
     State(state): State<SharedStateHandle>,
     Path(id): Path<u32>,
@@ -491,11 +481,24 @@ async fn update_layer_transition(
 // ============================================================================
 
 async fn list_layer_effects(
-    State(_state): State<SharedStateHandle>,
-    Path(_id): Path<u32>,
+    State(state): State<SharedStateHandle>,
+    Path(id): Path<u32>,
 ) -> Json<EffectsResponse> {
-    // TODO: Get actual layer effects from snapshot
-    Json(EffectsResponse { effects: vec![] })
+    let snapshot = state.get_snapshot();
+    let effects = snapshot.layers.iter()
+        .find(|l| l.id == id)
+        .map(|layer| {
+            layer.effects.iter().map(|e| EffectInstance {
+                id: e.id.clone(),
+                effect_type: e.effect_type.clone(),
+                enabled: e.enabled,
+                bypassed: e.bypassed,
+                solo: e.solo,
+                parameters: serde_json::json!({}),
+            }).collect()
+        })
+        .unwrap_or_default();
+    Json(EffectsResponse { effects })
 }
 
 async fn add_layer_effect(
@@ -645,11 +648,25 @@ async fn stop_clip_fade(
 // ============================================================================
 
 async fn list_clip_effects(
-    State(_state): State<SharedStateHandle>,
-    Path((_id, _slot)): Path<(u32, usize)>,
+    State(state): State<SharedStateHandle>,
+    Path((id, slot)): Path<(u32, usize)>,
 ) -> Json<EffectsResponse> {
-    // TODO: Get actual clip effects from snapshot
-    Json(EffectsResponse { effects: vec![] })
+    let snapshot = state.get_snapshot();
+    let effects = snapshot.layers.iter()
+        .find(|l| l.id == id)
+        .and_then(|layer| layer.clips.get(slot))
+        .map(|clip| {
+            clip.effects.iter().map(|e| EffectInstance {
+                id: e.id.clone(),
+                effect_type: e.effect_type.clone(),
+                enabled: e.enabled,
+                bypassed: e.bypassed,
+                solo: e.solo,
+                parameters: serde_json::json!({}),
+            }).collect()
+        })
+        .unwrap_or_default();
+    Json(EffectsResponse { effects })
 }
 
 async fn add_clip_effect(
@@ -765,48 +782,44 @@ async fn restart_layer(
 // Effects Registry Handlers
 // ============================================================================
 
-async fn list_effect_types(State(_state): State<SharedStateHandle>) -> Json<EffectTypesResponse> {
-    // Return built-in effect types
+async fn list_effect_types(State(state): State<SharedStateHandle>) -> Json<EffectTypesResponse> {
+    let snapshot = state.get_snapshot();
     Json(EffectTypesResponse {
-        effects: vec![
-            EffectTypeSummary { effect_type: "color_correction".into(), name: "Color Correction".into(), category: "Color".into() },
-            EffectTypeSummary { effect_type: "invert".into(), name: "Invert".into(), category: "Color".into() },
-            EffectTypeSummary { effect_type: "blur".into(), name: "Blur".into(), category: "Blur".into() },
-            EffectTypeSummary { effect_type: "edge_detect".into(), name: "Edge Detect".into(), category: "Stylize".into() },
-        ],
+        effects: snapshot.effect_types.iter().map(|e| EffectTypeSummary {
+            effect_type: e.effect_type.clone(),
+            name: e.display_name.clone(),
+            category: e.category.clone(),
+        }).collect(),
     })
 }
 
-async fn list_effect_categories(State(_state): State<SharedStateHandle>) -> Json<EffectCategoriesResponse> {
+async fn list_effect_categories(State(state): State<SharedStateHandle>) -> Json<EffectCategoriesResponse> {
+    let snapshot = state.get_snapshot();
     Json(EffectCategoriesResponse {
-        categories: vec!["Color".into(), "Blur".into(), "Distort".into(), "Stylize".into()],
+        categories: snapshot.effect_categories.clone(),
     })
 }
 
 async fn get_effect_definition(
-    State(_state): State<SharedStateHandle>,
+    State(state): State<SharedStateHandle>,
     Path(effect_type): Path<String>,
 ) -> Result<Json<EffectDefinitionResponse>, (StatusCode, Json<ApiError>)> {
-    // Return definition based on effect type
-    match effect_type.as_str() {
-        "color_correction" => Ok(Json(EffectDefinitionResponse {
-            effect_type: "color_correction".into(),
-            name: "Color Correction".into(),
-            category: "Color".into(),
-            parameters: vec![
-                EffectParameterDef { name: "brightness".into(), param_type: "float".into(), default: serde_json::json!(1.0), min: Some(0.0), max: Some(2.0) },
-                EffectParameterDef { name: "contrast".into(), param_type: "float".into(), default: serde_json::json!(1.0), min: Some(0.0), max: Some(2.0) },
-                EffectParameterDef { name: "saturation".into(), param_type: "float".into(), default: serde_json::json!(1.0), min: Some(0.0), max: Some(2.0) },
-            ],
-        })),
-        "invert" => Ok(Json(EffectDefinitionResponse {
-            effect_type: "invert".into(),
-            name: "Invert".into(),
-            category: "Color".into(),
-            parameters: vec![],
-        })),
-        _ => Err((StatusCode::NOT_FOUND, Json(ApiError::not_found(format!("Effect type '{}' not found", effect_type))))),
-    }
+    let snapshot = state.get_snapshot();
+    snapshot.effect_types.iter()
+        .find(|e| e.effect_type == effect_type)
+        .map(|e| Json(EffectDefinitionResponse {
+            effect_type: e.effect_type.clone(),
+            name: e.display_name.clone(),
+            category: e.category.clone(),
+            parameters: e.parameters.iter().map(|p| EffectParameterDef {
+                name: p.name.clone(),
+                param_type: p.param_type.clone(),
+                default: p.default.clone(),
+                min: p.min,
+                max: p.max,
+            }).collect(),
+        }))
+        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(ApiError::not_found(format!("Effect type '{}' not found", effect_type)))))
 }
 
 // ============================================================================
@@ -988,22 +1001,34 @@ async fn stop_texture_share(State(state): State<SharedStateHandle>) -> Json<serd
 // Output Handlers
 // ============================================================================
 
-async fn list_outputs(State(_state): State<SharedStateHandle>) -> Json<OutputsResponse> {
-    // TODO: Get actual display outputs
+async fn list_outputs(State(state): State<SharedStateHandle>) -> Json<OutputsResponse> {
+    let snapshot = state.get_snapshot();
     Json(OutputsResponse {
-        outputs: vec![OutputSummary { id: 0, name: "Primary Display".into(), width: 1920, height: 1080, primary: true }],
+        outputs: snapshot.outputs.iter().map(|o| OutputSummary {
+            id: o.id as usize,
+            name: o.name.clone(),
+            width: o.width,
+            height: o.height,
+            primary: o.is_primary,
+        }).collect(),
     })
 }
 
 async fn get_output(
-    State(_state): State<SharedStateHandle>,
+    State(state): State<SharedStateHandle>,
     Path(id): Path<usize>,
 ) -> Result<Json<OutputSummary>, (StatusCode, Json<ApiError>)> {
-    if id == 0 {
-        Ok(Json(OutputSummary { id: 0, name: "Primary Display".into(), width: 1920, height: 1080, primary: true }))
-    } else {
-        Err((StatusCode::NOT_FOUND, Json(ApiError::not_found(format!("Output {} not found", id)))))
-    }
+    let snapshot = state.get_snapshot();
+    snapshot.outputs.iter()
+        .find(|o| o.id as usize == id)
+        .map(|o| Json(OutputSummary {
+            id: o.id as usize,
+            name: o.name.clone(),
+            width: o.width,
+            height: o.height,
+            primary: o.is_primary,
+        }))
+        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(ApiError::not_found(format!("Output {} not found", id)))))
 }
 
 async fn update_output(

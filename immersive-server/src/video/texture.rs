@@ -44,7 +44,27 @@ impl VideoTexture {
             is_gpu_native: false,
         }
     }
-    
+
+    /// Create a new video texture with BGRA format
+    ///
+    /// # Arguments
+    /// * `device` - The wgpu device
+    /// * `width` - Texture width in pixels
+    /// * `height` - Texture height in pixels
+    pub fn new_bgra(device: &wgpu::Device, width: u32, height: u32) -> Self {
+        let format = wgpu::TextureFormat::Bgra8UnormSrgb;
+        let (texture, view) = Self::create_texture_with_format(device, width, height, format);
+
+        Self {
+            texture,
+            view,
+            width,
+            height,
+            format,
+            is_gpu_native: false,
+        }
+    }
+
     /// Create a new video texture for GPU-native (DXT/BC) format
     ///
     /// # Arguments
@@ -270,6 +290,11 @@ impl VideoTexture {
     /// Check if this texture uses GPU-native format
     pub fn is_gpu_native(&self) -> bool {
         self.is_gpu_native
+    }
+
+    /// Check if this texture uses BGRA format
+    pub fn is_bgra(&self) -> bool {
+        matches!(self.format, wgpu::TextureFormat::Bgra8UnormSrgb | wgpu::TextureFormat::Bgra8Unorm)
     }
 }
 

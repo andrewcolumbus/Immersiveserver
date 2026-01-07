@@ -1,9 +1,12 @@
 //! Preview Monitor Panel
 //!
-//! Displays a preview of the selected clip or layer.
+//! Displays a preview of the selected clip, layer, or source.
 //! - Clip mode: Shows preview of a clip with timeline scrubber and transport controls
 //! - Layer mode: Shows live layer output with effects applied (no scrubber)
+//! - Source mode: Shows live network source stream (NDI, OMT) with connection info
 
+use crate::compositor::Viewport;
+use crate::network::SourceType;
 use crate::preview_player::VideoInfo;
 use egui_widgets::{video_scrubber, ScrubberAction, ScrubberState};
 
@@ -46,6 +49,19 @@ pub struct PreviewLayerInfo {
     pub name: String,
 }
 
+/// Information about the network source being previewed
+#[derive(Debug, Clone)]
+pub struct PreviewSourceInfo {
+    /// Type of source (NDI, OMT)
+    pub source_type: SourceType,
+    /// Display name
+    pub name: String,
+    /// NDI source name (for NDI sources)
+    pub ndi_name: Option<String>,
+    /// Network address (for OMT sources)
+    pub address: Option<String>,
+}
+
 /// Current preview mode
 #[derive(Debug, Clone)]
 pub enum PreviewMode {
@@ -55,6 +71,8 @@ pub enum PreviewMode {
     Clip(PreviewClipInfo),
     /// Previewing a layer (live output, no scrubber)
     Layer(PreviewLayerInfo),
+    /// Previewing a network source (live stream, no scrubber)
+    Source(PreviewSourceInfo),
 }
 
 /// State for the preview monitor panel
@@ -63,6 +81,8 @@ pub struct PreviewMonitorPanel {
     mode: PreviewMode,
     /// Scrubber state (only used in clip mode)
     scrubber_state: ScrubberState,
+    /// Viewport for pan/zoom navigation
+    viewport: Viewport,
 }
 
 impl Default for PreviewMonitorPanel {
@@ -77,6 +97,7 @@ impl PreviewMonitorPanel {
         Self {
             mode: PreviewMode::None,
             scrubber_state: ScrubberState::new(),
+            viewport: Viewport::new(),
         }
     }
 
@@ -116,9 +137,47 @@ impl PreviewMonitorPanel {
         matches!(self.mode, PreviewMode::Layer(_))
     }
 
+    /// Set the source to preview (switches to source mode)
+    pub fn set_preview_source(&mut self, info: PreviewSourceInfo) {
+        self.mode = PreviewMode::Source(info);
+    }
+
+    /// Get the currently previewing source info (if in source mode)
+    pub fn current_source(&self) -> Option<&PreviewSourceInfo> {
+        match &self.mode {
+            PreviewMode::Source(info) => Some(info),
+            _ => None,
+        }
+    }
+
+    /// Check if in source preview mode
+    pub fn is_source_mode(&self) -> bool {
+        matches!(self.mode, PreviewMode::Source(_))
+    }
+
     /// Clear the preview
     pub fn clear_preview(&mut self) {
         self.mode = PreviewMode::None;
+    }
+
+    /// Get the viewport (immutable)
+    pub fn viewport(&self) -> &Viewport {
+        &self.viewport
+    }
+
+    /// Get the viewport (mutable)
+    pub fn viewport_mut(&mut self) -> &mut Viewport {
+        &mut self.viewport
+    }
+
+    /// Reset the viewport to default (fit-to-window)
+    pub fn reset_viewport(&mut self) {
+        self.viewport.reset();
+    }
+
+    /// Update viewport animation (call each frame)
+    pub fn update_viewport(&mut self, dt: f32, preview_size: (f32, f32), content_size: (f32, f32)) {
+        self.viewport.update(dt, preview_size, content_size);
     }
 
     /// Render the preview monitor panel contents
@@ -129,7 +188,10 @@ impl PreviewMonitorPanel {
     /// * `is_playing` - Whether the preview is currently playing (not paused) - only relevant for clip mode
     /// * `video_info` - Video information (dimensions, fps, duration) - only for clip mode
     /// * `layer_dimensions` - Layer video dimensions (width, height) - only for layer mode
-    /// * `render_preview` - Callback to render the preview texture into the given rect
+    /// * `source_dimensions` - Source video dimensions (width, height) - only for source mode
+    /// * `render_preview` - Callback to render the preview texture into the given rect with UV coordinates
+    ///   - First Rect is the display rect (where to draw)
+    ///   - Second Rect is the UV rect (which part of texture to show, affected by zoom/pan)
     pub fn render_contents<F>(
         &mut self,
         ui: &mut egui::Ui,
@@ -137,10 +199,11 @@ impl PreviewMonitorPanel {
         is_playing: bool,
         video_info: Option<VideoInfo>,
         layer_dimensions: Option<(u32, u32)>,
+        source_dimensions: Option<(u32, u32)>,
         render_preview: F,
     ) -> Vec<PreviewMonitorAction>
     where
-        F: FnOnce(&mut egui::Ui, egui::Rect),
+        F: FnOnce(&mut egui::Ui, egui::Rect, egui::Rect),
     {
         let mut actions = Vec::new();
 
@@ -190,15 +253,53 @@ impl PreviewMonitorPanel {
                 ui.add_space(4.0);
                 ui.separator();
             }
+            PreviewMode::Source(source) => {
+                ui.horizontal(|ui| {
+                    let icon = match source.source_type {
+                        SourceType::Ndi => "📺",
+                        SourceType::Omt => "📡",
+                    };
+                    ui.label(
+                        egui::RichText::new(format!("{} ", icon))
+                            .size(14.0),
+                    );
+                    ui.label(
+                        egui::RichText::new(&source.name)
+                            .strong()
+                            .size(14.0),
+                    );
+                    // Live indicator
+                    ui.label(
+                        egui::RichText::new(" LIVE")
+                            .size(10.0)
+                            .color(egui::Color32::from_rgb(255, 80, 80))
+                            .strong(),
+                    );
+                });
+
+                let type_name = match source.source_type {
+                    SourceType::Ndi => "NDI",
+                    SourceType::Omt => "OMT",
+                };
+                ui.label(
+                    egui::RichText::new(format!("{} network source", type_name))
+                        .weak()
+                        .small(),
+                );
+
+                ui.add_space(4.0);
+                ui.separator();
+            }
             PreviewMode::None => {}
         }
 
         // Preview area
         let available_size = ui.available_size();
-        // Leave more room for controls in clip mode (scrubber + transport), less in layer mode
+        // Leave more room for controls in clip mode (scrubber + transport), less in layer/source mode
         let controls_height = match &self.mode {
             PreviewMode::Clip(_) => 80.0,
             PreviewMode::Layer(_) => 30.0,
+            PreviewMode::Source(_) => 30.0,
             PreviewMode::None => 30.0,
         };
         let preview_height = (available_size.y - controls_height).max(100.0);
@@ -207,11 +308,12 @@ impl PreviewMonitorPanel {
         let dimensions: Option<(u32, u32)> = match &self.mode {
             PreviewMode::Clip(_) => video_info.as_ref().map(|i| (i.width, i.height)),
             PreviewMode::Layer(_) => layer_dimensions,
+            PreviewMode::Source(_) => source_dimensions,
             PreviewMode::None => None,
         };
 
         // Calculate aspect ratio for preview
-        let preview_rect = if let Some((width, height)) = dimensions {
+        let (preview_rect, response) = if let Some((width, height)) = dimensions {
             let aspect = width as f32 / height as f32;
             let display_width = available_size.x.min(preview_height * aspect);
             let display_height = display_width / aspect;
@@ -223,13 +325,13 @@ impl PreviewMonitorPanel {
                 egui::vec2(display_width, display_height),
             );
 
-            // Reserve the space
-            ui.allocate_rect(
+            // Reserve the space with click_and_drag sense for viewport interaction
+            let response = ui.allocate_rect(
                 egui::Rect::from_min_size(ui.cursor().min, egui::vec2(available_size.x, display_height)),
-                egui::Sense::hover(),
+                egui::Sense::click_and_drag(),
             );
 
-            rect
+            (rect, response)
         } else {
             // No dimensions - use default square
             let size = available_size.x.min(preview_height);
@@ -239,13 +341,81 @@ impl PreviewMonitorPanel {
                 egui::vec2(size, size),
             );
 
-            ui.allocate_rect(
+            let response = ui.allocate_rect(
                 egui::Rect::from_min_size(ui.cursor().min, egui::vec2(available_size.x, size)),
-                egui::Sense::hover(),
+                egui::Sense::click_and_drag(),
             );
 
-            rect
+            (rect, response)
         };
+
+        // Handle viewport interactions (right-click drag for pan, scroll for zoom)
+        let content_size = dimensions
+            .map(|(w, h)| (w as f32, h as f32))
+            .unwrap_or((preview_rect.width(), preview_rect.height()));
+        let preview_size = (preview_rect.width(), preview_rect.height());
+
+        // Handle scroll wheel zoom
+        if response.hovered() {
+            let scroll_delta = ui.input(|i| i.raw_scroll_delta.y);
+            if scroll_delta.abs() > 0.0 {
+                if let Some(pointer_pos) = ui.input(|i| i.pointer.hover_pos()) {
+                    // Convert to position relative to preview rect
+                    let local_pos = (
+                        pointer_pos.x - preview_rect.min.x,
+                        pointer_pos.y - preview_rect.min.y,
+                    );
+                    self.viewport.on_scroll(
+                        scroll_delta / 50.0, // Scale down scroll sensitivity
+                        local_pos,
+                        preview_size,
+                        content_size,
+                    );
+                }
+            }
+        }
+
+        // Handle right-click drag for panning
+        if response.dragged_by(egui::PointerButton::Secondary) {
+            if let Some(pointer_pos) = ui.input(|i| i.pointer.hover_pos()) {
+                let local_pos = (
+                    pointer_pos.x - preview_rect.min.x,
+                    pointer_pos.y - preview_rect.min.y,
+                );
+
+                // Start drag if not already dragging
+                if !self.viewport.offset().0.is_nan() {
+                    // First check if this is a new drag
+                    if response.drag_started_by(egui::PointerButton::Secondary) {
+                        self.viewport.on_right_mouse_down(local_pos);
+                    }
+                    self.viewport.on_mouse_move(local_pos, preview_size, content_size);
+                }
+            }
+        } else if response.drag_stopped_by(egui::PointerButton::Secondary) {
+            self.viewport.on_right_mouse_up();
+        }
+
+        // Handle double-right-click to reset viewport
+        if response.double_clicked_by(egui::PointerButton::Secondary) {
+            self.viewport.reset();
+        }
+
+        // Compute UV rect based on viewport zoom/pan
+        let (scale_x, scale_y, offset_x, offset_y) = self.viewport.get_shader_params(preview_size, content_size);
+
+        // Convert shader params to UV rect
+        // The shader does: adjusted_uv = (uv - 0.5) / scale + 0.5 + offset
+        // So we need to invert this for the UV rect
+        let half_width = 0.5 / scale_x;
+        let half_height = 0.5 / scale_y;
+        let center_u = 0.5 - offset_x / scale_x;
+        let center_v = 0.5 - offset_y / scale_y;
+
+        let uv_rect = egui::Rect::from_min_max(
+            egui::pos2(center_u - half_width, center_v - half_height),
+            egui::pos2(center_u + half_width, center_v + half_height),
+        );
 
         // Draw preview background
         ui.painter().rect_filled(
@@ -255,14 +425,15 @@ impl PreviewMonitorPanel {
         );
 
         if has_frame {
-            // Render the preview texture
-            render_preview(ui, preview_rect);
+            // Render the preview texture with viewport-adjusted UVs
+            render_preview(ui, preview_rect, uv_rect);
         } else {
             // Show appropriate message based on mode
             let message = match &self.mode {
                 PreviewMode::Clip(_) => "Loading...",
                 PreviewMode::Layer(_) => "No video playing",
-                PreviewMode::None => "Click a clip or layer to preview",
+                PreviewMode::Source(_) => "Connecting...",
+                PreviewMode::None => "Click a clip, layer, or source to preview",
             };
             ui.painter().text(
                 preview_rect.center(),
@@ -363,6 +534,19 @@ impl PreviewMonitorPanel {
         // Layer mode: show dimension info only (no scrubber or transport)
         if let PreviewMode::Layer(_) = &self.mode {
             if let Some((width, height)) = layer_dimensions {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("{}x{}", width, height))
+                            .small()
+                            .weak(),
+                    );
+                });
+            }
+        }
+
+        // Source mode: show dimension info only (no scrubber or transport)
+        if let PreviewMode::Source(_) = &self.mode {
+            if let Some((width, height)) = source_dimensions {
                 ui.horizontal(|ui| {
                     ui.label(
                         egui::RichText::new(format!("{}x{}", width, height))

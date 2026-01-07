@@ -108,6 +108,8 @@ pub struct ConversionJob {
     pub output_path: PathBuf,
     /// Target HAP variant
     pub variant: HapVariant,
+    /// Use uncompressed (no Snappy)
+    pub use_uncompressed: bool,
     /// Current status
     pub status: JobStatus,
     /// Total frame count (if known)
@@ -116,12 +118,13 @@ pub struct ConversionJob {
 
 impl ConversionJob {
     /// Create a new conversion job.
-    pub fn new(id: u64, input_path: PathBuf, output_path: PathBuf, variant: HapVariant, total_frames: Option<u64>) -> Self {
+    pub fn new(id: u64, input_path: PathBuf, output_path: PathBuf, variant: HapVariant, use_uncompressed: bool, total_frames: Option<u64>) -> Self {
         Self {
             id,
             input_path,
             output_path,
             variant,
+            use_uncompressed,
             status: JobStatus::Pending,
             total_frames,
         }
@@ -164,6 +167,8 @@ pub struct ConverterWindow {
     output_dir: PathBuf,
     /// Selected HAP variant for new jobs
     selected_variant: HapVariant,
+    /// Use uncompressed HAP (no Snappy) for zero CPU decode
+    use_uncompressed: bool,
     /// FFmpeg path (if found)
     ffmpeg_path: Option<PathBuf>,
     /// FFprobe path (if found)
@@ -248,6 +253,7 @@ impl ConverterWindow {
             next_job_id: 0,
             output_dir,
             selected_variant: HapVariant::default(),
+            use_uncompressed: false,
             ffmpeg_path,
             ffprobe_path,
             ffmpeg_error,
@@ -482,6 +488,19 @@ impl ConverterWindow {
                     .italics()
                     .color(Color32::GRAY),
             );
+        });
+
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.use_uncompressed, "Uncompressed")
+                .on_hover_text("Skip Snappy compression for zero-CPU decode. Files will be ~30% larger.");
+            if self.use_uncompressed {
+                ui.label(
+                    RichText::new("(larger files, zero CPU decode)")
+                        .italics()
+                        .small()
+                        .color(Color32::GRAY),
+                );
+            }
         });
     }
 
@@ -723,6 +742,7 @@ impl ConverterWindow {
                 input_path,
                 output_path,
                 self.selected_variant,
+                self.use_uncompressed,
                 total_frames,
             );
             self.next_job_id += 1;
@@ -798,6 +818,7 @@ impl ConverterWindow {
                         job.input_path.clone(),
                         job.output_path.clone(),
                         job.variant,
+                        job.use_uncompressed,
                         job.total_frames,
                     ))
                 } else {
@@ -808,7 +829,7 @@ impl ConverterWindow {
                 }
             };
 
-            let Some((job_idx, input, output, variant, total_frames)) = job_info else {
+            let Some((job_idx, input, output, variant, use_uncompressed, total_frames)) = job_info else {
                 break;
             };
 
@@ -818,6 +839,7 @@ impl ConverterWindow {
                 &input,
                 &output,
                 variant,
+                use_uncompressed,
                 total_frames,
                 &state,
                 job_idx,
@@ -871,6 +893,7 @@ impl ConverterWindow {
         input: &PathBuf,
         output: &PathBuf,
         variant: HapVariant,
+        use_uncompressed: bool,
         total_frames: Option<u64>,
         state: &Arc<Mutex<SharedState>>,
         job_idx: usize,
@@ -878,6 +901,8 @@ impl ConverterWindow {
     ) -> Result<(), String> {
         // Build FFmpeg command
         let mut cmd = Command::new(ffmpeg_path);
+
+        let compressor = if use_uncompressed { "none" } else { "snappy" };
 
         cmd.args(["-y", "-progress", "pipe:1", "-i"])
             .arg(input)
@@ -887,7 +912,7 @@ impl ConverterWindow {
                 "-format",
                 variant.ffmpeg_format(),
                 "-compressor",
-                "snappy",
+                compressor,
                 "-an", // No audio
             ])
             .arg(output)

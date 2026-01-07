@@ -7,10 +7,11 @@
 //! - Resource counts (layers, clips, effects)
 //! - GPU memory usage
 
-use crate::telemetry::PerformanceMetrics;
+use std::time::Instant;
+
+use crate::telemetry::{NdiStats, PerformanceMetrics};
 
 /// State for the performance panel
-#[derive(Default)]
 pub struct PerformancePanel {
     /// Whether the panel is open
     pub open: bool,
@@ -18,6 +19,17 @@ pub struct PerformancePanel {
     show_frame_stats: bool,
     /// Whether to show GPU timing breakdown
     show_gpu_timings: bool,
+    // Throttled update state (1 second interval for CPU timings and NDI stats)
+    last_slow_update: Option<Instant>,
+    cached_video_frame_time_ms: f64,
+    cached_ui_frame_time_ms: f64,
+    cached_ndi_stats: Vec<NdiStats>,
+}
+
+impl Default for PerformancePanel {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PerformancePanel {
@@ -27,11 +39,29 @@ impl PerformancePanel {
             open: false,
             show_frame_stats: true,
             show_gpu_timings: true,
+            last_slow_update: None,
+            cached_video_frame_time_ms: 0.0,
+            cached_ui_frame_time_ms: 0.0,
+            cached_ndi_stats: Vec::new(),
         }
     }
 
     /// Render the performance panel contents
     pub fn render_contents(&mut self, ui: &mut egui::Ui, metrics: &PerformanceMetrics) {
+        // Update slow-updating sections (once per second) - CPU timings and NDI stats
+        let now = Instant::now();
+        let should_update = self
+            .last_slow_update
+            .map(|t| now.duration_since(t).as_secs_f32() >= 1.0)
+            .unwrap_or(true);
+
+        if should_update {
+            self.last_slow_update = Some(now);
+            self.cached_video_frame_time_ms = metrics.video_frame_time_ms;
+            self.cached_ui_frame_time_ms = metrics.ui_frame_time_ms;
+            self.cached_ndi_stats = metrics.ndi_stats.clone();
+        }
+
         // FPS Display with color coding
         let fps_color = fps_color(metrics.fps, metrics.target_fps);
         ui.horizontal(|ui| {
@@ -214,7 +244,7 @@ impl PerformancePanel {
         ui.add_space(4.0);
         ui.separator();
 
-        // CPU Timings section
+        // CPU Timings section (updated once per second)
         ui.label(egui::RichText::new("CPU Timings").strong());
         egui::Grid::new("cpu_timings_grid")
             .num_columns(2)
@@ -222,15 +252,15 @@ impl PerformancePanel {
             .show(ui, |ui| {
                 // Video upload time
                 ui.label("Video Upload:");
-                let video_color = if metrics.video_frame_time_ms > 5.0 {
+                let video_color = if self.cached_video_frame_time_ms > 5.0 {
                     egui::Color32::from_rgb(255, 150, 100)
-                } else if metrics.video_frame_time_ms > 2.0 {
+                } else if self.cached_video_frame_time_ms > 2.0 {
                     egui::Color32::from_rgb(255, 230, 100)
                 } else {
                     egui::Color32::WHITE
                 };
                 ui.label(
-                    egui::RichText::new(format!("{:.2} ms", metrics.video_frame_time_ms))
+                    egui::RichText::new(format!("{:.2} ms", self.cached_video_frame_time_ms))
                         .monospace()
                         .color(video_color),
                 );
@@ -238,15 +268,15 @@ impl PerformancePanel {
 
                 // UI render time
                 ui.label("UI Render:");
-                let ui_color = if metrics.ui_frame_time_ms > 8.0 {
+                let ui_color = if self.cached_ui_frame_time_ms > 8.0 {
                     egui::Color32::from_rgb(255, 150, 100)
-                } else if metrics.ui_frame_time_ms > 4.0 {
+                } else if self.cached_ui_frame_time_ms > 4.0 {
                     egui::Color32::from_rgb(255, 230, 100)
                 } else {
                     egui::Color32::WHITE
                 };
                 ui.label(
-                    egui::RichText::new(format!("{:.2} ms", metrics.ui_frame_time_ms))
+                    egui::RichText::new(format!("{:.2} ms", self.cached_ui_frame_time_ms))
                         .monospace()
                         .color(ui_color),
                 );
@@ -322,6 +352,79 @@ impl PerformancePanel {
                 );
                 ui.end_row();
             });
+
+        // NDI Sources section (updated once per second, only shown if there are active NDI sources)
+        if !self.cached_ndi_stats.is_empty() {
+            ui.add_space(4.0);
+            ui.separator();
+
+            ui.label(egui::RichText::new("NDI Sources").strong());
+            for ndi in &self.cached_ndi_stats {
+                ui.add_space(2.0);
+                ui.label(
+                    egui::RichText::new(&ndi.source_name)
+                        .small()
+                        .color(egui::Color32::LIGHT_BLUE),
+                );
+
+                egui::Grid::new(format!("ndi_stats_{}", ndi.source_name))
+                    .num_columns(2)
+                    .spacing([20.0, 2.0])
+                    .show(ui, |ui| {
+                        // Pickup latency with color coding
+                        ui.label(egui::RichText::new("Latency:").small());
+                        let latency_color = if ndi.pickup_latency_ms > 50.0 {
+                            egui::Color32::from_rgb(255, 100, 100) // Red
+                        } else if ndi.pickup_latency_ms > 10.0 {
+                            egui::Color32::from_rgb(255, 230, 100) // Yellow
+                        } else {
+                            egui::Color32::from_rgb(100, 255, 100) // Green
+                        };
+                        ui.label(
+                            egui::RichText::new(format!("{:.1} ms", ndi.pickup_latency_ms))
+                                .monospace()
+                                .small()
+                                .color(latency_color),
+                        );
+                        ui.end_row();
+
+                        // Queue depth
+                        ui.label(egui::RichText::new("Buffer:").small());
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{}/{}",
+                                ndi.queue_depth, ndi.buffer_capacity
+                            ))
+                            .monospace()
+                            .small(),
+                        );
+                        ui.end_row();
+
+                        // Frame stats with drop rate
+                        ui.label(egui::RichText::new("Frames:").small());
+                        let drop_rate = if ndi.frames_received > 0 {
+                            ndi.frames_dropped as f64 / ndi.frames_received as f64 * 100.0
+                        } else {
+                            0.0
+                        };
+                        let frames_color = if drop_rate > 1.0 {
+                            egui::Color32::from_rgb(255, 150, 100) // Orange
+                        } else {
+                            egui::Color32::WHITE
+                        };
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} ({:.1}% dropped)",
+                                ndi.frames_received, drop_rate
+                            ))
+                            .monospace()
+                            .small()
+                            .color(frames_color),
+                        );
+                        ui.end_row();
+                    });
+            }
+        }
     }
 
     /// Render as a floating window

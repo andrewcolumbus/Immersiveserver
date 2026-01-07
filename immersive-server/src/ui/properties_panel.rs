@@ -1,12 +1,12 @@
 //! Properties Panel with Environment/Layer/Clip tabs
 //!
 //! A tabbed panel for editing properties of the environment, layers, and clips.
-//! Includes transform controls, tiling (multiplexing), effects, and other settings.
+//! Includes transform controls, effects, and other settings.
 
 use std::collections::HashMap;
 
 use crate::audio::AudioBand;
-use crate::compositor::{BlendMode, ClipTransition, Environment, Layer, LoopMode};
+use crate::compositor::{BlendMode, ClipSource, ClipTransition, Environment, Layer, LoopMode};
 use crate::effects::{AutomationSource, EffectRegistry, EffectStack, FftSource, LfoSource, LfoShape, BeatSource, BeatTrigger, ParameterValue};
 use crate::layer_runtime::LayerVideoInfo;
 use crate::settings::{EnvironmentSettings, ThumbnailMode};
@@ -28,7 +28,7 @@ pub enum PropertiesTab {
     Environment,
     /// Layer settings (transform, opacity, blend mode)
     Layer,
-    /// Clip settings (transport, tiling, source info)
+    /// Clip settings (transport, source info)
     Clip,
 }
 
@@ -39,6 +39,8 @@ pub enum PropertiesAction {
     SetEnvironmentSize { width: u32, height: u32 },
     /// Target FPS changed
     SetTargetFPS { fps: u32 },
+    /// VSYNC toggle changed
+    SetVsyncEnabled { enabled: bool },
     /// Show FPS toggle changed
     SetShowFPS { show: bool },
     /// Layer opacity changed
@@ -53,8 +55,6 @@ pub enum PropertiesAction {
     SetLayerScale { layer_id: u32, scale_x: f32, scale_y: f32 },
     /// Layer rotation changed
     SetLayerRotation { layer_id: u32, degrees: f32 },
-    /// Layer tiling changed
-    SetLayerTiling { layer_id: u32, tile_x: u32, tile_y: u32 },
     /// Layer transition changed
     SetLayerTransition { layer_id: u32, transition: ClipTransition },
     /// OMT broadcast toggle changed
@@ -65,6 +65,8 @@ pub enum PropertiesAction {
     SetNdiBroadcast { enabled: bool },
     /// NDI capture FPS changed
     SetNdiCaptureFps { fps: u32 },
+    /// NDI receive buffer capacity changed
+    SetNdiBufferCapacity { capacity: usize },
     /// Syphon/Spout texture sharing toggle changed
     SetTextureShare { enabled: bool },
     /// REST API server toggle changed
@@ -176,6 +178,8 @@ pub enum PropertiesAction {
     SetLowLatencyMode { enabled: bool },
     /// Test pattern mode changed (replaces composition with calibration pattern)
     SetTestPattern { enabled: bool },
+    /// BGRA pipeline mode changed (requires restart)
+    SetBgraPipelineEnabled { enabled: bool },
 }
 
 /// Context for rendering effect stacks (determines which PropertiesAction variants to emit)
@@ -508,7 +512,7 @@ impl PropertiesPanel {
                 });
             }
             response.context_menu(|ui| {
-                if ui.button("Reset to 0").clicked() {
+                if ui.button("Reset to center (0)").clicked() {
                     actions.push(PropertiesAction::SetLayerPosition { layer_id, x: 0.0, y: pos_y });
                     ui.close_menu();
                 }
@@ -525,7 +529,7 @@ impl PropertiesPanel {
                 });
             }
             response.context_menu(|ui| {
-                if ui.button("Reset to 0").clicked() {
+                if ui.button("Reset to center (0)").clicked() {
                     actions.push(PropertiesAction::SetLayerPosition { layer_id, x: pos_x, y: 0.0 });
                     ui.close_menu();
                 }
@@ -636,85 +640,6 @@ impl PropertiesPanel {
                     ui.close_menu();
                 }
             });
-        });
-
-        ui.add_space(16.0);
-        ui.separator();
-
-        // Tiling section
-        ui.add_space(8.0);
-        ui.heading("Tiling (Multiplex)");
-        ui.add_space(8.0);
-
-        let mut tile_x = layer.tile_x;
-        let mut tile_y = layer.tile_y;
-
-        ui.horizontal(|ui| {
-            ui.label("Tile X:");
-            let response = ui.add(egui::DragValue::new(&mut tile_x).range(1..=16));
-            if response.changed() {
-                actions.push(PropertiesAction::SetLayerTiling { layer_id, tile_x, tile_y });
-            }
-            response.context_menu(|ui| {
-                if ui.button("Reset to 1").clicked() {
-                    actions.push(PropertiesAction::SetLayerTiling { layer_id, tile_x: 1, tile_y });
-                    ui.close_menu();
-                }
-                if ui.button("Reset Both to 1×1").clicked() {
-                    actions.push(PropertiesAction::SetLayerTiling { layer_id, tile_x: 1, tile_y: 1 });
-                    ui.close_menu();
-                }
-            });
-        });
-        ui.horizontal(|ui| {
-            ui.label("Tile Y:");
-            let response = ui.add(egui::DragValue::new(&mut tile_y).range(1..=16));
-            if response.changed() {
-                actions.push(PropertiesAction::SetLayerTiling { layer_id, tile_x, tile_y });
-            }
-            response.context_menu(|ui| {
-                if ui.button("Reset to 1").clicked() {
-                    actions.push(PropertiesAction::SetLayerTiling { layer_id, tile_x, tile_y: 1 });
-                    ui.close_menu();
-                }
-                if ui.button("Reset Both to 1×1").clicked() {
-                    actions.push(PropertiesAction::SetLayerTiling { layer_id, tile_x: 1, tile_y: 1 });
-                    ui.close_menu();
-                }
-            });
-        });
-
-        // Tiling presets
-        ui.add_space(4.0);
-        ui.horizontal_wrapped(|ui| {
-            if ui.small_button("1×1").clicked() {
-                actions.push(PropertiesAction::SetLayerTiling {
-                    layer_id,
-                    tile_x: 1,
-                    tile_y: 1,
-                });
-            }
-            if ui.small_button("2×2").clicked() {
-                actions.push(PropertiesAction::SetLayerTiling {
-                    layer_id,
-                    tile_x: 2,
-                    tile_y: 2,
-                });
-            }
-            if ui.small_button("3×3").clicked() {
-                actions.push(PropertiesAction::SetLayerTiling {
-                    layer_id,
-                    tile_x: 3,
-                    tile_y: 3,
-                });
-            }
-            if ui.small_button("4×4").clicked() {
-                actions.push(PropertiesAction::SetLayerTiling {
-                    layer_id,
-                    tile_x: 4,
-                    tile_y: 4,
-                });
-            }
         });
 
         // Effects section
@@ -1881,7 +1806,16 @@ impl PropertiesPanel {
 
         ui.label("Path:");
         ui.add_space(2.0);
-        let path_str = clip.source_path.display().to_string();
+        let path_str = match &clip.source {
+            ClipSource::File { path } => path.display().to_string(),
+            ClipSource::Omt { address, name } => format!("omt://{}/{}", address, name),
+            ClipSource::Ndi { ndi_name, url_address } => {
+                match url_address {
+                    Some(addr) => format!("ndi://{} ({})", ndi_name, addr),
+                    None => format!("ndi://{}", ndi_name),
+                }
+            }
+        };
         ui.add(
             egui::TextEdit::singleline(&mut path_str.clone())
                 .interactive(false)
@@ -2034,7 +1968,7 @@ impl PropertiesPanel {
                 });
             }
             response.context_menu(|ui| {
-                if ui.button("Reset to 0").clicked() {
+                if ui.button("Reset to center (0)").clicked() {
                     actions.push(PropertiesAction::SetClipPosition { layer_id, slot, x: 0.0, y: pos_y });
                     ui.close_menu();
                 }
@@ -2052,7 +1986,7 @@ impl PropertiesPanel {
                 });
             }
             response.context_menu(|ui| {
-                if ui.button("Reset to 0").clicked() {
+                if ui.button("Reset to center (0)").clicked() {
                     actions.push(PropertiesAction::SetClipPosition { layer_id, slot, x: pos_x, y: 0.0 });
                     ui.close_menu();
                 }

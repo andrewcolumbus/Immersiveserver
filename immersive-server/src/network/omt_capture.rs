@@ -455,6 +455,11 @@ impl OmtCapture {
         (self.width, self.height)
     }
 
+    /// Check if dimensions match the current capture size.
+    pub fn dimensions_match(&self, width: u32, height: u32) -> bool {
+        self.width == width && self.height == height
+    }
+
     /// Check if the sender thread is running.
     pub fn is_sender_running(&self) -> bool {
         self.sender_thread.is_some()

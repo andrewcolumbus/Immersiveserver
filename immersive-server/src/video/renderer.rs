@@ -84,17 +84,18 @@ impl VideoParams {
 /// Parameters for layer rendering with full 2D transforms.
 ///
 /// This struct matches the LayerParams uniform in fullscreen_quad.wgsl.
-/// It includes size scaling, position, rotation, opacity, and tiling.
+/// It includes size scaling, position, rotation, and opacity.
 ///
 /// IMPORTANT: WGSL struct alignment rules require vec2<f32> to be 8-byte aligned.
 /// After `rotation: f32`, we must add 4 bytes of padding before `anchor: vec2<f32>`.
-/// Total size: 56 bytes (14 floats × 4 bytes).
+/// Total size: 48 bytes (12 floats × 4 bytes).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct LayerParams {
     /// Video/layer size relative to environment (video_size / env_size)
     pub size_scale: [f32; 2],          // offset 0, size 8
-    /// Position in normalized coordinates (0-1, where 0.5,0.5 = center)
+    /// Position offset from center in normalized coordinates
+    /// (0,0) = centered, positive = right/down, negative = left/up
     pub position: [f32; 2],            // offset 8, size 8
     /// Scale factors for the transform (1.0 = 100%)
     pub scale: [f32; 2],               // offset 16, size 8
@@ -106,11 +107,9 @@ pub struct LayerParams {
     pub anchor: [f32; 2],              // offset 32, size 8
     /// Opacity (0.0 - 1.0)
     pub opacity: f32,                  // offset 40, size 4
-    /// Padding for WGSL vec2 alignment
-    pub _pad_opacity: f32,             // offset 44, size 4
-    /// Tiling factors (1.0 = no repeat, 2.0 = 2x2 grid, etc.)
-    pub tile: [f32; 2],                // offset 48, size 8
-}                                      // Total: 56 bytes
+    /// Whether texture is BGRA (1.0) or RGBA (0.0) - shader swaps R↔B
+    pub is_bgra: f32,                  // offset 44, size 4
+}                                      // Total: 48 bytes
 
 impl Default for LayerParams {
     fn default() -> Self {
@@ -122,8 +121,7 @@ impl Default for LayerParams {
             env_aspect: 1.0,  // Default to square aspect
             anchor: [0.5, 0.5],
             opacity: 1.0,
-            _pad_opacity: 0.0,
-            tile: [1.0, 1.0],
+            is_bgra: 0.0,  // Default to RGBA (no swizzle)
         }
     }
 }
@@ -144,9 +142,9 @@ impl LayerParams {
         let size_scale_x = video_width as f32 / env_width as f32;
         let size_scale_y = video_height as f32 / env_height as f32;
 
-        // Convert pixel position to normalized coordinates (0-1)
-        // Position (0,0) means layer anchor is at environment top-left
-        // We need to account for the layer's size when positioning
+        // Convert pixel position to normalized coordinates (center-relative)
+        // Position (0,0) means layer is centered in environment
+        // Positive values move right/down, negative values move left/up
         let pos_norm_x = layer.transform.position.0 / env_width as f32;
         let pos_norm_y = layer.transform.position.1 / env_height as f32;
 
@@ -158,8 +156,7 @@ impl LayerParams {
             env_aspect: env_width as f32 / env_height.max(1) as f32,
             anchor: [layer.transform.anchor.0, layer.transform.anchor.1],
             opacity: layer.opacity,
-            _pad_opacity: 0.0,
-            tile: [layer.tile_x as f32, layer.tile_y as f32],
+            is_bgra: 0.0,
         }
     }
 
@@ -186,8 +183,7 @@ impl LayerParams {
             env_aspect: env_width as f32 / env_height.max(1) as f32,
             anchor: [transform.anchor.0, transform.anchor.1],
             opacity,
-            _pad_opacity: 0.0,
-            tile: [1.0, 1.0],
+            is_bgra: 0.0,
         }
     }
 
@@ -204,8 +200,7 @@ impl LayerParams {
             env_aspect: env_width as f32 / env_height.max(1) as f32,
             anchor: [0.5, 0.5],
             opacity: 1.0,
-            _pad_opacity: 0.0,
-            tile: [1.0, 1.0],
+            is_bgra: 0.0,
         }
     }
 
@@ -260,7 +255,7 @@ impl LayerParams {
             layer.transform.position.1 + rotated_clip_pos.1 * layer.transform.scale.1,
         );
 
-        // Convert combined pixel position to normalized coordinates
+        // Convert combined pixel position to normalized coordinates (center-relative)
         let pos_norm_x = combined_position.0 / env_width as f32;
         let pos_norm_y = combined_position.1 / env_height as f32;
 
@@ -273,8 +268,7 @@ impl LayerParams {
             // Use layer anchor for the combined transform
             anchor: [layer.transform.anchor.0, layer.transform.anchor.1],
             opacity: layer.opacity,
-            _pad_opacity: 0.0,
-            tile: [layer.tile_x as f32, layer.tile_y as f32],
+            is_bgra: 0.0,
         }
     }
 }
@@ -520,8 +514,7 @@ impl VideoRenderer {
             env_aspect: 1.0,  // Legacy - assume square aspect
             anchor: [0.5, 0.5],
             opacity: params.opacity,
-            _pad_opacity: 0.0,
-            tile: [1.0, 1.0],
+            is_bgra: 0.0,
         };
         self.set_layer_params(queue, layer_params);
     }

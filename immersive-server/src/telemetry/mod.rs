@@ -7,5 +7,5 @@ pub mod metrics;
 pub mod profiling;
 
 pub use logging::{init_logging, LogConfig};
-pub use metrics::{FrameProfiler, FrameStats, GpuMemoryStats, PerformanceMetrics};
+pub use metrics::{FrameProfiler, FrameStats, GpuMemoryStats, NdiStats, PerformanceMetrics};
 pub use profiling::GpuProfiler;

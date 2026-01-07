@@ -33,7 +33,6 @@ pub enum ApiCommand {
     SetLayerOpacity { id: u32, opacity: f32 },
     SetLayerBlendMode { id: u32, blend_mode: BlendMode },
     SetLayerVisibility { id: u32, visible: bool },
-    SetLayerTiling { id: u32, tile_x: u32, tile_y: u32 },
     SetLayerTransition { id: u32, transition: ClipTransition },
 
     // Clip commands
@@ -118,11 +117,11 @@ pub struct LayerSnapshot {
     pub scale: (f32, f32),
     pub rotation: f32,
     pub anchor: (f32, f32),
-    pub tile_x: u32,
-    pub tile_y: u32,
     pub transition: ClipTransition,
     pub clips: Vec<ClipSnapshot>,
     pub active_clip: Option<usize>,
+    /// Effects applied to this layer
+    pub effects: Vec<EffectSnapshot>,
 }
 
 /// Snapshot of clip state for API reads
@@ -132,6 +131,8 @@ pub struct ClipSnapshot {
     pub source_type: Option<String>,
     pub source_path: Option<String>,
     pub label: Option<String>,
+    /// Effects applied to this clip
+    pub effects: Vec<EffectSnapshot>,
 }
 
 /// Snapshot of viewport state
@@ -180,6 +181,66 @@ pub struct EffectSnapshot {
     pub solo: bool,
 }
 
+/// Snapshot of output display
+#[derive(Debug, Clone)]
+pub struct OutputSnapshot {
+    pub id: u32,
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+    pub is_primary: bool,
+    pub refresh_rate_hz: Option<u32>,
+}
+
+/// Performance metrics snapshot
+#[derive(Debug, Clone, Default)]
+pub struct PerformanceSnapshot {
+    /// Average frame time in milliseconds
+    pub frame_time_avg_ms: f32,
+    /// Minimum frame time in milliseconds
+    pub frame_time_min_ms: f32,
+    /// Maximum frame time in milliseconds
+    pub frame_time_max_ms: f32,
+    /// 95th percentile frame time in milliseconds
+    pub frame_time_p95_ms: f32,
+    /// 99th percentile frame time in milliseconds
+    pub frame_time_p99_ms: f32,
+    /// GPU timing breakdown by pass name
+    pub gpu_timings: std::collections::HashMap<String, f32>,
+    /// Total GPU time in milliseconds
+    pub gpu_total_ms: f32,
+    /// Estimated GPU memory usage in MB
+    pub gpu_memory_mb: f32,
+}
+
+/// Effect parameter info for API
+#[derive(Debug, Clone)]
+pub struct EffectParamInfo {
+    /// Parameter name
+    pub name: String,
+    /// Parameter type (float, color, bool, etc.)
+    pub param_type: String,
+    /// Default value as JSON
+    pub default: serde_json::Value,
+    /// Minimum value (for numeric types)
+    pub min: Option<f32>,
+    /// Maximum value (for numeric types)
+    pub max: Option<f32>,
+}
+
+/// Effect type definition from registry
+#[derive(Debug, Clone)]
+pub struct EffectTypeInfo {
+    /// Effect type identifier (e.g., "color_correction")
+    pub effect_type: String,
+    /// Display name (e.g., "Color Correction")
+    pub display_name: String,
+    /// Category (e.g., "Color")
+    pub category: String,
+    /// Parameter definitions
+    pub parameters: Vec<EffectParamInfo>,
+}
+
 /// Snapshot of application state for API reads
 #[derive(Debug, Clone)]
 pub struct AppSnapshot {
@@ -196,6 +257,14 @@ pub struct AppSnapshot {
     pub file: FileSnapshot,
     pub environment_effects: Vec<EffectSnapshot>,
     pub clip_columns: usize,
+    /// Available output displays
+    pub outputs: Vec<OutputSnapshot>,
+    /// Performance metrics
+    pub performance: PerformanceSnapshot,
+    /// Available effect types from registry
+    pub effect_types: Vec<EffectTypeInfo>,
+    /// Effect categories in display order
+    pub effect_categories: Vec<String>,
 }
 
 impl Default for AppSnapshot {
@@ -230,6 +299,10 @@ impl Default for AppSnapshot {
             },
             environment_effects: Vec::new(),
             clip_columns: 8,
+            outputs: Vec::new(),
+            performance: PerformanceSnapshot::default(),
+            effect_types: Vec::new(),
+            effect_categories: Vec::new(),
         }
     }
 }
@@ -314,11 +387,16 @@ impl SharedState {
     }
 
     /// Update the snapshot (called by main thread)
+    /// Uses try_write() to avoid blocking if API handlers hold read locks
     pub fn update_snapshot(&self, snapshot: AppSnapshot) {
-        *self.snapshot.write().unwrap() = snapshot;
+        if let Ok(mut guard) = self.snapshot.try_write() {
+            *guard = snapshot;
+        }
+        // If lock busy, skip update - next frame will catch up
     }
 
     /// Update snapshot and broadcast FPS to WebSocket clients
+    /// Uses try_write() to avoid blocking if API handlers hold read locks
     pub fn update_snapshot_with_broadcast(&self, snapshot: AppSnapshot) {
         let fps_event = WsEvent::Fps {
             fps: snapshot.current_fps,
@@ -326,7 +404,9 @@ impl SharedState {
         };
         // Ignore send errors (no subscribers is fine)
         let _ = self.ws_tx.send(fps_event);
-        *self.snapshot.write().unwrap() = snapshot;
+        if let Ok(mut guard) = self.snapshot.try_write() {
+            *guard = snapshot;
+        }
     }
 
     /// Send a command to the main application
@@ -378,8 +458,6 @@ impl LayerSnapshot {
                 anchor_x: self.anchor.0,
                 anchor_y: self.anchor.1,
             },
-            tile_x: self.tile_x,
-            tile_y: self.tile_y,
             clip_count: self.clips.len(),
             active_clip: self.active_clip,
             transition: match &self.transition {

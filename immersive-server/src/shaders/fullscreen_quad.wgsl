@@ -13,7 +13,8 @@ struct VertexOutput {
 struct LayerParams {
     // Video/layer size relative to environment (video_size / env_size)
     size_scale: vec2<f32>,
-    // Position in normalized coordinates (0-1)
+    // Position offset from center in normalized coordinates
+    // (0,0) = centered, positive = right/down, negative = left/up
     position: vec2<f32>,
     // Scale factors for the transform
     scale: vec2<f32>,
@@ -25,10 +26,8 @@ struct LayerParams {
     anchor: vec2<f32>,
     // Opacity (0.0 - 1.0)
     opacity: f32,
-    // Padding for alignment
-    _pad: f32,
-    // Tiling factors (1.0 = no repeat, 2.0 = 2x2 grid, etc.)
-    tile: vec2<f32>,
+    // Whether texture is BGRA (1.0) or RGBA (0.0) - swaps R and B channels
+    is_bgra: f32,
 }
 
 @group(0) @binding(0) var t_video: texture_2d<f32>;
@@ -59,76 +58,65 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
 // Fragment shader - samples video texture with full 2D transform
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    // MULTIPLEX: Tile the layer across the environment
-    // tile = (1, 1) means single layer, (2, 2) means 2x2 grid of layer copies
-    var uv = in.uv;
-    
-    // If tiling > 1, divide environment into grid cells and work in local cell space
-    let tile_count = max(params.tile, vec2<f32>(1.0, 1.0));
-    let grid_uv = uv * tile_count;
-    let local_uv = fract(grid_uv);  // Position within current cell (0-1)
-    
-    // Now work in local cell space - each cell renders a complete layer
-    uv = local_uv;
-    
-    // Adjust size_scale for tiled cells:
-    // Each cell is smaller than the full environment, so the layer must be scaled
-    // to fit within the cell. Multiply size_scale by tile_count.
-    let adjusted_size_scale = params.size_scale * tile_count;
-    
-    // Adjust aspect ratio for cells:
-    // Cell aspect = (env_width/tile_x) / (env_height/tile_y) = env_aspect * tile_y / tile_x
-    let cell_aspect = params.env_aspect * tile_count.y / max(tile_count.x, 0.0001);
-    
+    // Convert UV to center-relative coordinates (-0.5 to 0.5)
+    // This makes (0,0) the center of the environment
+    var uv = in.uv - 0.5;
+
     // INVERSE TRANSFORM: Transform UV coordinates to sample the texture correctly
     // The layer transform moves the layer visually, so we apply the inverse to UVs.
-    
-    // Step 1: Undo position translation
+
+    // Step 1: Undo position translation (position is center-relative)
     uv = uv - params.position;
-    
-    // Calculate the layer's center in UV space for scale/rotate transforms
-    let layer_center = params.anchor;
-    
+
+    // Convert anchor from 0-1 space to center-relative
+    let anchor_offset = params.anchor - 0.5;
+
     // Step 2: Move to anchor-relative coordinates
-    uv = uv - layer_center;
-    
+    uv = uv - anchor_offset;
+
     // Step 3: Undo rotation (rotate by negative angle)
-    // Use CELL aspect ratio for proper rotation without distortion
-    let safe_cell_aspect = max(cell_aspect, 0.0001);
-    
+    // Use environment aspect ratio for proper rotation without distortion
+    let safe_aspect = max(params.env_aspect, 0.0001);
+
     // Convert to aspect-corrected coordinates (square space)
     var rotated_uv = uv;
-    rotated_uv.x = rotated_uv.x * safe_cell_aspect;
-    
+    rotated_uv.x = rotated_uv.x * safe_aspect;
+
     let cos_r = cos(-params.rotation);
     let sin_r = sin(-params.rotation);
     rotated_uv = vec2<f32>(
         rotated_uv.x * cos_r - rotated_uv.y * sin_r,
         rotated_uv.x * sin_r + rotated_uv.y * cos_r
     );
-    
+
     // Convert back from square space
-    rotated_uv.x = rotated_uv.x / safe_cell_aspect;
+    rotated_uv.x = rotated_uv.x / safe_aspect;
     uv = rotated_uv;
-    
+
     // Step 4: Undo scale (divide by scale factors)
     let safe_scale = max(params.scale, vec2<f32>(0.0001, 0.0001));
     uv = uv / safe_scale;
-    
+
     // Step 5: Restore anchor offset
-    uv = uv + layer_center;
-    
-    // Step 6: Apply adjusted size_scale for video-to-cell mapping
-    uv = (uv - 0.5) / adjusted_size_scale + 0.5;
-    
+    uv = uv + anchor_offset;
+
+    // Step 6: Apply size_scale for video centering and convert back to 0-1 space
+    // Video is centered within the layer (which is environment-sized)
+    uv = uv / params.size_scale + 0.5;
+
     // Bounds check - if UV is outside [0,1], return transparent
     if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
         return vec4<f32>(0.0, 0.0, 0.0, 0.0);
     }
-    
+
     // Sample the video texture
-    let color = textureSample(t_video, s_video, uv);
-    
+    var color = textureSample(t_video, s_video, uv);
+
+    // Swap R and B channels for BGRA textures (NDI provides BGRA)
+    if (params.is_bgra > 0.5) {
+        color = vec4<f32>(color.b, color.g, color.r, color.a);
+    }
+
     // Apply opacity
     return vec4<f32>(color.rgb, color.a * params.opacity);
 }

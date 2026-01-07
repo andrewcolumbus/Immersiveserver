@@ -153,6 +153,8 @@ pub struct EffectStackRuntime {
     copy_bind_group_layout: Option<wgpu::BindGroupLayout>,
     /// Sampler for texture sampling
     sampler: Option<wgpu::Sampler>,
+    /// Uniform buffer for copy shader params (is_bgra flag)
+    copy_params_buffer: Option<wgpu::Buffer>,
 }
 
 impl Default for EffectStackRuntime {
@@ -170,6 +172,7 @@ impl EffectStackRuntime {
             copy_pipeline: None,
             copy_bind_group_layout: None,
             sampler: None,
+            copy_params_buffer: None,
         }
     }
 
@@ -221,8 +224,28 @@ impl EffectStackRuntime {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
+
+        // Create uniform buffer for copy params (is_bgra flag)
+        // Layout: f32 is_bgra (4) + 12 padding + vec3<f32> (12) + 4 struct padding = 32 bytes
+        let copy_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Effect Copy Params Buffer"),
+            size: 32,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.copy_params_buffer = Some(copy_params_buffer);
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Effect Copy Pipeline Layout"),
@@ -365,16 +388,16 @@ impl EffectStackRuntime {
         let active_effects: Vec<&EffectInstance> = stack.active_effects().collect();
 
         if active_effects.is_empty() {
-            // No effects: copy input to output
-            self.copy_texture(encoder, device, input, output);
+            // No effects: copy input to output (no size transformation needed)
+            self.copy_texture(encoder, device, queue, input, output, false, (1.0, 1.0));
             return;
         }
 
         let pool = match &self.texture_pool {
             Some(p) => p,
             None => {
-                // No texture pool: just copy
-                self.copy_texture(encoder, device, input, output);
+                // No texture pool: just copy (no size transformation needed)
+                self.copy_texture(encoder, device, queue, input, output, false, (1.0, 1.0));
                 return;
             }
         };
@@ -415,17 +438,32 @@ impl EffectStackRuntime {
         }
     }
 
-    /// Copy a texture to another texture
+    /// Copy a texture to another texture with optional BGRA→RGBA conversion
+    /// and size_scale transformation for proper video positioning
     fn copy_texture(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         input: &wgpu::TextureView,
         output: &wgpu::TextureView,
+        is_bgra: bool,
+        size_scale: (f32, f32),
     ) {
         let Some(pipeline) = &self.copy_pipeline else { return };
         let Some(layout) = &self.copy_bind_group_layout else { return };
         let Some(sampler) = &self.sampler else { return };
+        let Some(params_buffer) = &self.copy_params_buffer else { return };
+
+        // Write params to uniform buffer
+        // Layout: f32 is_bgra, f32 size_scale_x, f32 size_scale_y, f32 _pad = 16 bytes
+        let is_bgra_value: f32 = if is_bgra { 1.0 } else { 0.0 };
+        queue.write_buffer(params_buffer, 0, bytemuck::cast_slice(&[
+            is_bgra_value,
+            size_scale.0,
+            size_scale.1,
+            0.0f32,
+        ]));
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Effect Copy Bind Group"),
@@ -438,6 +476,10 @@ impl EffectStackRuntime {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: wgpu::BindingResource::Sampler(sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: params_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -489,25 +531,52 @@ impl EffectStackRuntime {
 
     /// Copy an external texture to the effect pool's input texture.
     ///
-    /// This uses a simple 1:1 copy with NO transforms applied.
-    /// Used to copy video textures to effect input before processing.
+    /// This applies size_scale transformation to properly position video content
+    /// within the environment-sized effect texture. Used to copy video textures
+    /// to effect input before processing.
+    ///
+    /// # Arguments
+    /// * `is_bgra` - If true, performs R↔B channel swap (for NDI BGRA sources)
+    /// * `video_width` - Width of the video source
+    /// * `video_height` - Height of the video source
+    /// * `env_width` - Width of the environment canvas
+    /// * `env_height` - Height of the environment canvas
     pub fn copy_input_texture(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         input: &wgpu::TextureView,
+        is_bgra: bool,
+        video_width: u32,
+        video_height: u32,
+        env_width: u32,
+        env_height: u32,
     ) {
         if let Some(pool) = &self.texture_pool {
-            self.copy_texture(encoder, device, input, pool.first_view());
+            // Calculate size_scale: how big is the video relative to the environment
+            let size_scale = (
+                video_width as f32 / env_width as f32,
+                video_height as f32 / env_height as f32,
+            );
+            self.copy_texture(encoder, device, queue, input, pool.first_view(), is_bgra, size_scale);
         }
     }
 }
 
-/// Simple copy shader for texture blitting
+/// Simple copy shader for texture blitting with optional BGRA→RGBA conversion
+/// and size_scale transformation for proper video positioning within environment
 const COPY_SHADER: &str = r#"
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) uv: vec2<f32>,
+}
+
+struct CopyParams {
+    is_bgra: f32,
+    size_scale_x: f32,  // video_width / env_width
+    size_scale_y: f32,  // video_height / env_height
+    _pad: f32,
 }
 
 @vertex
@@ -523,10 +592,26 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
 
 @group(0) @binding(0) var t_input: texture_2d<f32>;
 @group(0) @binding(1) var s_input: sampler;
+@group(0) @binding(2) var<uniform> params: CopyParams;
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    return textureSample(t_input, s_input, in.uv);
+    // Apply size_scale to properly position video within environment space
+    // This centers the video and maps environment UVs to video UVs
+    var uv = in.uv - 0.5;  // Center origin
+    uv = uv / vec2<f32>(params.size_scale_x, params.size_scale_y) + 0.5;
+
+    // Bounds check - outside video area is transparent
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+        return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    }
+
+    var color = textureSample(t_input, s_input, uv);
+    // Swap R and B channels for BGRA textures (NDI provides BGRA)
+    if (params.is_bgra > 0.5) {
+        color = vec4<f32>(color.b, color.g, color.r, color.a);
+    }
+    return color;
 }
 "#;
 

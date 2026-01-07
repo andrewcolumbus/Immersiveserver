@@ -4,7 +4,7 @@
 //! Accessible via View → Advanced Output.
 
 use crate::compositor::Viewport;
-use crate::output::{DisplayInfo, EdgeBlendConfig, MaskShape, OutputDevice, OutputManager, Point2D as MaskPoint2D, Screen, ScreenId, Slice, SliceId, SliceInput, SliceMask, WarpMesh};
+use crate::output::{DisplayInfo, EdgeBlendConfig, MaskShape, OutputDevice, OutputManager, OutputPresetManager, Point2D as MaskPoint2D, Screen, ScreenId, Slice, SliceId, SliceInput, SliceMask, WarpMesh};
 use crate::output::slice::{Point2D, Rect};
 
 /// Tab selection for the Advanced Output window
@@ -91,6 +91,25 @@ pub enum AdvancedOutputAction {
     UpdateScreenInputRect { screen_id: ScreenId, input_rect: Rect },
     /// Save the composition (triggered when window is closed)
     SaveComposition,
+    /// Load an output preset by name
+    LoadPreset { name: String },
+    /// Save current configuration as a new preset
+    SaveAsPreset { name: String },
+    /// Delete a user preset
+    DeletePreset { name: String },
+    /// Create a new configuration with a single virtual screen
+    NewConfiguration,
+}
+
+/// Pending action when the user has unsaved changes and tries to switch presets
+#[derive(Debug, Clone)]
+pub enum PendingPresetAction {
+    /// Load a preset (after confirming discard)
+    LoadPreset { name: String },
+    /// Close the window (after confirming discard)
+    CloseWindow,
+    /// Create new configuration (after confirming discard)
+    NewConfiguration,
 }
 
 /// Advanced Output window for configuring multi-screen outputs
@@ -134,6 +153,20 @@ pub struct AdvancedOutputWindow {
     output_viewport: Viewport,
     /// Track last frame time for viewport animation
     last_viewport_update: std::time::Instant,
+
+    // Preset state
+    /// Current preset name (if loaded from a preset)
+    pub current_preset_name: Option<String>,
+    /// Whether current config differs from loaded preset
+    is_dirty: bool,
+    /// Whether to show the save preset dialog
+    show_save_dialog: bool,
+    /// Preset name being entered in save dialog
+    save_dialog_name: String,
+    /// Pending action when showing unsaved changes dialog
+    pending_action: Option<PendingPresetAction>,
+    /// Preset name to save (set by dialog, processed outside nested closures)
+    save_requested: Option<String>,
 }
 
 impl Default for AdvancedOutputWindow {
@@ -166,6 +199,14 @@ impl AdvancedOutputWindow {
             env_viewport: Viewport::new(),
             output_viewport: Viewport::new(),
             last_viewport_update: std::time::Instant::now(),
+
+            // Preset state
+            current_preset_name: None,
+            is_dirty: false,
+            show_save_dialog: false,
+            save_dialog_name: String::new(),
+            pending_action: None,
+            save_requested: None,
         }
     }
 
@@ -186,6 +227,222 @@ impl AdvancedOutputWindow {
     /// Toggle the window open/closed
     pub fn toggle(&mut self) {
         self.open = !self.open;
+    }
+
+    /// Set the current preset name (called after loading a preset)
+    pub fn set_current_preset(&mut self, name: Option<String>) {
+        self.current_preset_name = name;
+        self.is_dirty = false;
+    }
+
+    /// Mark the configuration as dirty (modified since last load/save)
+    pub fn mark_dirty(&mut self) {
+        self.is_dirty = true;
+    }
+
+    /// Clear the dirty flag
+    pub fn clear_dirty(&mut self) {
+        self.is_dirty = false;
+    }
+
+    /// Check if there are unsaved changes
+    pub fn has_unsaved_changes(&self) -> bool {
+        self.is_dirty
+    }
+
+    /// Render the preset selector bar at the top of the window
+    fn render_preset_selector(
+        &mut self,
+        ui: &mut egui::Ui,
+        preset_manager: &OutputPresetManager,
+        actions: &mut Vec<AdvancedOutputAction>,
+    ) {
+        ui.horizontal(|ui| {
+            ui.label("Preset:");
+
+            // Current preset display label
+            let current_label = self
+                .current_preset_name
+                .as_deref()
+                .unwrap_or("(Custom)");
+
+            // Preset dropdown
+            egui::ComboBox::from_id_salt("output_preset_selector")
+                .selected_text(current_label)
+                .width(180.0)
+                .show_ui(ui, |ui| {
+                    // Built-in presets section
+                    ui.label(egui::RichText::new("Built-in").weak().small());
+                    for (_index, preset) in preset_manager.builtin_presets() {
+                        let is_selected = self.current_preset_name.as_deref() == Some(&preset.name);
+                        if ui.selectable_label(is_selected, &preset.name).clicked() {
+                            if self.is_dirty {
+                                // Show unsaved changes warning - store pending action
+                                self.pending_action = Some(PendingPresetAction::LoadPreset {
+                                    name: preset.name.clone(),
+                                });
+                            } else {
+                                actions.push(AdvancedOutputAction::LoadPreset {
+                                    name: preset.name.clone(),
+                                });
+                            }
+                        }
+                    }
+
+                    // User presets section (if any)
+                    let user_presets: Vec<_> = preset_manager.user_presets().collect();
+                    tracing::trace!("Rendering preset dropdown: {} user presets", user_presets.len());
+                    if !user_presets.is_empty() {
+                        ui.separator();
+                        ui.label(egui::RichText::new("User Presets").weak().small());
+                        for (_index, preset) in user_presets {
+                            let is_selected = self.current_preset_name.as_deref() == Some(&preset.name);
+                            ui.horizontal(|ui| {
+                                if ui.selectable_label(is_selected, &preset.name).clicked() {
+                                    if self.is_dirty {
+                                        self.pending_action = Some(PendingPresetAction::LoadPreset {
+                                            name: preset.name.clone(),
+                                        });
+                                    } else {
+                                        actions.push(AdvancedOutputAction::LoadPreset {
+                                            name: preset.name.clone(),
+                                        });
+                                    }
+                                }
+                                // Delete button for user presets
+                                if ui.small_button("🗑").on_hover_text("Delete preset").clicked() {
+                                    actions.push(AdvancedOutputAction::DeletePreset {
+                                        name: preset.name.clone(),
+                                    });
+                                }
+                            });
+                        }
+                    }
+                });
+
+            // New button
+            if ui.button("New").on_hover_text("Create new configuration with single screen").clicked() {
+                if self.is_dirty {
+                    self.pending_action = Some(PendingPresetAction::NewConfiguration);
+                } else {
+                    actions.push(AdvancedOutputAction::NewConfiguration);
+                }
+            }
+
+            // Save button
+            if ui.button("Save...").clicked() {
+                // Pre-fill with current preset name if saving over existing
+                self.save_dialog_name = self.current_preset_name.clone().unwrap_or_default();
+                self.show_save_dialog = true;
+            }
+
+            // Dirty indicator
+            if self.is_dirty {
+                ui.label(egui::RichText::new("*").color(egui::Color32::YELLOW))
+                    .on_hover_text("Unsaved changes");
+            }
+        });
+
+        // Unsaved changes dialog
+        if self.pending_action.is_some() {
+            self.render_unsaved_changes_dialog(ui, actions);
+        }
+    }
+
+    /// Render the unsaved changes confirmation dialog
+    fn render_unsaved_changes_dialog(
+        &mut self,
+        ui: &mut egui::Ui,
+        _actions: &mut Vec<AdvancedOutputAction>,
+    ) {
+        egui::Window::new("Unsaved Changes")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ui.ctx(), |ui| {
+                ui.label("You have unsaved changes to the output configuration.");
+                ui.label("What would you like to do?");
+                ui.add_space(8.0);
+
+                ui.horizontal(|ui| {
+                    if ui.button("Save First...").clicked() {
+                        // Open save dialog, keep pending action for after save
+                        self.save_dialog_name = self.current_preset_name.clone().unwrap_or_default();
+                        self.show_save_dialog = true;
+                    }
+                    if ui.button("Discard").clicked() {
+                        // Proceed with pending action, discarding changes
+                        self.is_dirty = false;
+                        // pending_action will be processed in render()
+                    }
+                    if ui.button("Cancel").clicked() {
+                        // Cancel the pending action
+                        self.pending_action = None;
+                    }
+                });
+            });
+    }
+
+    /// Render the save preset dialog
+    fn render_save_preset_dialog(
+        &mut self,
+        ui: &mut egui::Ui,
+        preset_manager: &OutputPresetManager,
+        _actions: &mut Vec<AdvancedOutputAction>,
+    ) {
+        if !self.show_save_dialog {
+            return;
+        }
+
+        egui::Window::new("Save Output Preset")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ui.ctx(), |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Preset name:");
+                    ui.text_edit_singleline(&mut self.save_dialog_name);
+                });
+
+                // Warning if name conflicts with built-in
+                let is_builtin = preset_manager
+                    .builtin_presets()
+                    .any(|(_, p)| p.name == self.save_dialog_name);
+                if is_builtin {
+                    ui.colored_label(
+                        egui::Color32::YELLOW,
+                        "Cannot overwrite built-in presets",
+                    );
+                }
+
+                // Warning if will overwrite existing user preset
+                let exists_user = preset_manager
+                    .user_presets()
+                    .any(|(_, p)| p.name == self.save_dialog_name);
+                if exists_user {
+                    ui.colored_label(
+                        egui::Color32::LIGHT_BLUE,
+                        "Will overwrite existing preset",
+                    );
+                }
+
+                ui.add_space(8.0);
+
+                ui.horizontal(|ui| {
+                    let can_save = !self.save_dialog_name.trim().is_empty() && !is_builtin;
+                    ui.add_enabled_ui(can_save, |ui| {
+                        if ui.button("Save").clicked() {
+                            // Set flag instead of pushing action here (nested closure issue)
+                            // The action will be pushed outside the dialog closure
+                            self.save_requested = Some(self.save_dialog_name.trim().to_string());
+                            self.show_save_dialog = false;
+                        }
+                    });
+                    if ui.button("Cancel").clicked() {
+                        self.show_save_dialog = false;
+                    }
+                });
+            });
     }
 
     /// Generate a unique NDI name that doesn't conflict with existing screens
@@ -227,6 +484,7 @@ impl AdvancedOutputWindow {
         &mut self,
         ctx: &egui::Context,
         output_manager: Option<&OutputManager>,
+        preset_manager: &OutputPresetManager,
         layer_count: usize,
         available_displays: &[DisplayInfo],
         env_dimensions: (u32, u32),
@@ -262,8 +520,32 @@ impl AdvancedOutputWindow {
             .resizable(true)
             .collapsible(true)
             .show(ctx, |ui| {
-                self.render_contents(ui, output_manager, layer_count, available_displays, env_dimensions, &mut actions);
+                self.render_contents(ui, output_manager, preset_manager, layer_count, available_displays, env_dimensions, &mut actions);
             });
+
+        // Handle pending actions (from unsaved changes dialog)
+        if let Some(pending) = self.pending_action.take() {
+            match pending {
+                PendingPresetAction::LoadPreset { name } => {
+                    actions.push(AdvancedOutputAction::LoadPreset { name });
+                }
+                PendingPresetAction::CloseWindow => {
+                    open = false;
+                    actions.push(AdvancedOutputAction::SaveComposition);
+                }
+                PendingPresetAction::NewConfiguration => {
+                    actions.push(AdvancedOutputAction::NewConfiguration);
+                }
+            }
+        }
+
+        // Handle save preset request (set by dialog, processed here outside all closures)
+        if let Some(name) = self.save_requested.take() {
+            tracing::info!("Pushing SaveAsPreset action for preset: {}", name);
+            actions.push(AdvancedOutputAction::SaveAsPreset { name: name.clone() });
+            self.current_preset_name = Some(name);
+            self.is_dirty = false;
+        }
 
         // Detect window close and trigger save
         if self.open && !open {
@@ -279,6 +561,7 @@ impl AdvancedOutputWindow {
         &mut self,
         ui: &mut egui::Ui,
         output_manager: Option<&OutputManager>,
+        preset_manager: &OutputPresetManager,
         layer_count: usize,
         available_displays: &[DisplayInfo],
         env_dimensions: (u32, u32),
@@ -296,6 +579,14 @@ impl AdvancedOutputWindow {
                 self.selected_slice = None;
             }
         }
+
+        // Preset selector at top
+        self.render_preset_selector(ui, preset_manager, actions);
+        ui.separator();
+        ui.add_space(4.0);
+
+        // Save preset dialog (sets save_requested flag, processed in render() outside closures)
+        self.render_save_preset_dialog(ui, preset_manager, actions);
 
         // Tab bar at top
         ui.horizontal(|ui| {
@@ -1237,9 +1528,19 @@ impl AdvancedOutputWindow {
         ui.add_space(4.0);
 
         // Device type selector (full options)
-        let current_device_type = screen.device.type_name();
+        // Show actual display name when Display is selected
+        let current_device_type = match &screen.device {
+            OutputDevice::Display { display_id } => {
+                available_displays
+                    .iter()
+                    .find(|d| d.id == *display_id)
+                    .map(|d| d.label())
+                    .unwrap_or_else(|| format!("Display {} (disconnected)", display_id))
+            }
+            _ => screen.device.type_name().to_string(),
+        };
         egui::ComboBox::from_id_salt("device_type_screens_tab")
-            .selected_text(current_device_type)
+            .selected_text(&current_device_type)
             .show_ui(ui, |ui| {
                 // Virtual
                 if ui.selectable_label(matches!(screen_copy.device, OutputDevice::Virtual), "Virtual").clicked() {
@@ -1247,20 +1548,22 @@ impl AdvancedOutputWindow {
                     changed = true;
                 }
 
-                // Display (only show if displays are available)
+                // Display header with individual displays below (only if displays available)
                 if !available_displays.is_empty() {
-                    if ui.selectable_label(matches!(screen_copy.device, OutputDevice::Display { .. }), "Display").clicked() {
-                        // Prefer non-primary display to avoid covering the main UI
-                        let default_display = available_displays
-                            .iter()
-                            .find(|d| !d.is_primary)
-                            .or_else(|| available_displays.first())
-                            .unwrap();
-                        screen_copy.device = OutputDevice::Display {
-                            display_id: default_display.id,
-                        };
-                        changed = true;
+                    ui.separator();
+                    ui.add_enabled(false, egui::SelectableLabel::new(false,
+                        egui::RichText::new("Display").strong()));
+
+                    // Individual displays indented
+                    for display in available_displays {
+                        let is_selected = matches!(&screen_copy.device, OutputDevice::Display { display_id } if *display_id == display.id);
+                        let label = format!("  {}", display.label());
+                        if ui.selectable_label(is_selected, &label).clicked() {
+                            screen_copy.device = OutputDevice::Display { display_id: display.id };
+                            changed = true;
+                        }
                     }
+                    ui.separator();
                 }
 
                 // NDI
@@ -1350,26 +1653,9 @@ impl AdvancedOutputWindow {
         if is_virtual {
             ui.label(egui::RichText::new("Preview only (no output)").weak().italics());
         } else if let Some(display_id) = current_display_id {
-            // Display selector dropdown
+            // Display warnings (selection now done in main device dropdown)
             let current_display = available_displays.iter().find(|d| d.id == display_id);
             let is_disconnected = current_display.is_none();
-            let display_label = current_display
-                .map(|d| d.label())
-                .unwrap_or_else(|| format!("Display {} (disconnected)", display_id));
-
-            ui.horizontal(|ui| {
-                ui.label("Monitor:");
-                egui::ComboBox::from_id_salt("display_selector_screens_tab")
-                    .selected_text(&display_label)
-                    .show_ui(ui, |ui| {
-                        for display in available_displays {
-                            if ui.selectable_label(display.id == display_id, display.label()).clicked() {
-                                screen_copy.device = OutputDevice::Display { display_id: display.id };
-                                changed = true;
-                            }
-                        }
-                    });
-            });
 
             // Show warning if display is disconnected
             if is_disconnected {

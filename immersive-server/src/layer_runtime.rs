@@ -9,7 +9,19 @@ use std::time::{Duration, Instant};
 use crate::compositor::layer::Transform2D;
 use crate::compositor::ClipTransition;
 use crate::network::NdiReceiver;
+use crate::telemetry::NdiStats;
 use crate::video::{VideoPlayer, VideoTexture};
+
+/// Result of attempting to update a layer's texture
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextureUpdateResult {
+    /// No frame was available
+    NoFrame,
+    /// Frame was uploaded successfully
+    Uploaded,
+    /// Frame available but texture needs resize first
+    NeedsResize { width: u32, height: u32 },
+}
 
 /// Video information for a layer's playing clip
 #[derive(Debug, Clone)]
@@ -83,6 +95,10 @@ pub struct LayerRuntime {
     pub fade_out_start: Option<Instant>,
     /// Duration of the fade-out
     pub fade_out_duration: Duration,
+
+    /// Whether the current NDI frame is in BGRA format (requires R↔B swap).
+    /// Updated each time an NDI frame is received based on actual FourCC.
+    pub ndi_is_bgra: bool,
 }
 
 impl LayerRuntime {
@@ -112,6 +128,8 @@ impl LayerRuntime {
             fade_out_active: false,
             fade_out_start: None,
             fade_out_duration: Duration::ZERO,
+            // NDI format tracking
+            ndi_is_bgra: true, // Default to BGRA (common case)
         }
     }
 
@@ -123,6 +141,17 @@ impl LayerRuntime {
     /// Check if this runtime has an NDI source
     pub fn has_ndi(&self) -> bool {
         self.ndi_receiver.is_some()
+    }
+
+    /// Returns 1.0 if texture is BGRA (requires R↔B swap), 0.0 if RGBA.
+    /// For NDI sources, this reflects the actual format from the received frame.
+    /// Video files always return 0.0 (decoded to RGBA).
+    pub fn is_bgra(&self) -> f32 {
+        if self.ndi_receiver.is_some() && self.ndi_is_bgra {
+            1.0
+        } else {
+            0.0
+        }
     }
 
     /// Check if video is paused
@@ -174,16 +203,16 @@ impl LayerRuntime {
 
     /// Take the latest decoded frame (if any) and upload to texture
     pub fn update_texture(&mut self, queue: &wgpu::Queue) {
-        self.try_update_texture(queue);
+        let _ = self.try_update_texture(queue);
     }
 
     /// Take the latest decoded frame (if any) and upload to texture.
-    /// Returns true if a frame was uploaded, false if no new frame was available.
+    /// Returns the result of the update attempt.
     ///
     /// Note: For GPU-native frames, the texture format may need to be updated.
     /// This requires the device to recreate the texture with the right format.
-    pub fn try_update_texture(&mut self, queue: &wgpu::Queue) -> bool {
-        let Some(texture) = &mut self.texture else { return false };
+    pub fn try_update_texture(&mut self, queue: &wgpu::Queue) -> TextureUpdateResult {
+        let Some(texture) = &mut self.texture else { return TextureUpdateResult::NoFrame };
 
         // Try VideoPlayer first
         if let Some(player) = &self.player {
@@ -195,51 +224,74 @@ impl LayerRuntime {
                         frame.is_gpu_native,
                         texture.is_gpu_native()
                     );
-                    return false;
+                    return TextureUpdateResult::NoFrame;
                 }
 
                 texture.upload(queue, &frame);
                 self.has_frame = true;
-                return true;
+                return TextureUpdateResult::Uploaded;
             }
         }
 
         // Try NdiReceiver
         if let Some(ndi_receiver) = &mut self.ndi_receiver {
             if let Some(ndi_frame) = ndi_receiver.take_frame() {
-                // Convert NDI frame to DecodedFrame format (BGRA -> RGBA)
-                // NDI provides BGRA, our texture expects RGBA
-                let mut rgba_data = ndi_frame.data.to_vec();
-                for chunk in rgba_data.chunks_exact_mut(4) {
-                    chunk.swap(0, 2); // Swap B and R channels
-                }
-
-                // Update stored dimensions if they changed
-                if ndi_frame.width != self.video_width || ndi_frame.height != self.video_height {
+                // Check if texture needs resize BEFORE processing the frame
+                if ndi_frame.width != texture.width() || ndi_frame.height != texture.height() {
                     self.video_width = ndi_frame.width;
                     self.video_height = ndi_frame.height;
                     tracing::info!(
-                        "NDI frame resolution updated: {}x{}",
+                        "NDI frame resolution changed: {}x{} (texture was {}x{})",
                         ndi_frame.width,
-                        ndi_frame.height
+                        ndi_frame.height,
+                        texture.width(),
+                        texture.height()
                     );
+                    // Frame is lost but next one will have same dimensions
+                    return TextureUpdateResult::NeedsResize {
+                        width: ndi_frame.width,
+                        height: ndi_frame.height,
+                    };
                 }
 
-                let decoded_frame = crate::video::DecodedFrame::new(
-                    rgba_data,
-                    ndi_frame.width,
-                    ndi_frame.height,
-                    ndi_frame.timestamp.as_secs_f64(),
-                    0, // NDI doesn't have frame indices
-                );
+                // Update BGRA format tracking from actual frame data
+                self.ndi_is_bgra = ndi_frame.is_bgra;
 
-                texture.upload(queue, &decoded_frame);
+                // Upload frame data directly - shader swaps R↔B channels if BGRA
+                texture.upload_raw(queue, &ndi_frame.data, ndi_frame.width, ndi_frame.height);
                 self.has_frame = true;
-                return true;
+                return TextureUpdateResult::Uploaded;
             }
         }
 
-        false
+        TextureUpdateResult::NoFrame
+    }
+
+    /// Resize texture and recreate bind group for NDI resolution changes
+    ///
+    /// Called from App when try_update_texture returns NeedsResize.
+    /// Requires device and video_renderer since bind groups reference the texture view.
+    pub fn resize_texture(
+        &mut self,
+        device: &wgpu::Device,
+        video_renderer: &crate::video::VideoRenderer,
+        width: u32,
+        height: u32,
+    ) {
+        if let Some(texture) = &mut self.texture {
+            texture.resize(device, width, height);
+
+            // Recreate bind group with new texture view
+            if let Some(params_buffer) = &self.params_buffer {
+                self.bind_group = Some(
+                    video_renderer.create_bind_group_with_buffer(device, texture, params_buffer),
+                );
+            }
+
+            self.video_width = width;
+            self.video_height = height;
+            tracing::info!("Resized NDI texture to {}x{}", width, height);
+        }
     }
 
     /// Clear all resources
@@ -343,6 +395,18 @@ impl LayerRuntime {
     /// Check if the fade-out is complete
     pub fn is_fade_out_complete(&self) -> bool {
         self.fade_out_active && self.fade_out_progress() >= 1.0
+    }
+
+    /// Get NDI receiver statistics (if this layer has an NDI source)
+    pub fn ndi_stats(&self) -> Option<NdiStats> {
+        self.ndi_receiver.as_ref().map(|recv| NdiStats {
+            source_name: recv.source_name().to_string(),
+            pickup_latency_ms: recv.pickup_latency_ms(),
+            queue_depth: recv.queue_depth(),
+            buffer_capacity: recv.buffer_capacity(),
+            frames_received: recv.frame_count(),
+            frames_dropped: recv.frames_dropped(),
+        })
     }
 }
 

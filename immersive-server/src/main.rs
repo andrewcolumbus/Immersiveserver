@@ -17,7 +17,7 @@ use winit::dpi::LogicalSize;
 use winit::event::{ElementState, KeyEvent, Modifiers, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{Window, WindowAttributes, WindowId};
+use winit::window::{Window, WindowAttributes, WindowId, WindowLevel};
 
 const WINDOW_TITLE: &str = "Immersive Server";
 
@@ -1032,7 +1032,7 @@ impl ApplicationHandler for ImmersiveApp {
                 app.menu_bar.pending_action = Some(immersive_server::ui::menu_bar::FileAction::Save);
             }
 
-            // Handle Cmd/Ctrl+Shift+A to toggle Advanced Output window
+            // Handle Cmd/Ctrl+Shift+A to toggle Advanced Output window and window level
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
@@ -1045,6 +1045,12 @@ impl ApplicationHandler for ImmersiveApp {
                 && self.modifiers.state().shift_key() =>
             {
                 app.advanced_output_window.toggle();
+                // Set window level based on Advanced Output visibility
+                if app.advanced_output_window.open {
+                    window.set_window_level(WindowLevel::AlwaysOnTop);
+                } else {
+                    window.set_window_level(WindowLevel::Normal);
+                }
             }
 
             // Handle Cmd/Ctrl+Shift+L to toggle test pattern
@@ -1286,6 +1292,9 @@ impl ApplicationHandler for ImmersiveApp {
                     }
                 }
 
+                // Track Advanced Output window state to detect close via X button
+                let was_advanced_output_open = app.advanced_output_window.open;
+
                 // Begin frame timing
                 app.begin_frame();
 
@@ -1314,6 +1323,11 @@ impl ApplicationHandler for ImmersiveApp {
                     Err(e) => {
                         tracing::warn!("Surface error: {:?}", e);
                     }
+                }
+
+                // Check if Advanced Output was closed via X button
+                if was_advanced_output_open && !app.advanced_output_window.open {
+                    window.set_window_level(WindowLevel::Normal);
                 }
 
                 // End frame: update stats and apply frame rate limiting
@@ -1369,6 +1383,17 @@ impl ApplicationHandler for ImmersiveApp {
             Self::handle_display_hotplug(event_loop, app, window_registry, display_manager);
         }
 
+        // VSYNC mode: let the display control timing via Fifo present mode
+        if app.settings.vsync_enabled {
+            window.request_redraw();
+            for (_, entry) in window_registry.iter() {
+                entry.window.request_redraw();
+            }
+            event_loop.set_control_flow(ControlFlow::Poll);
+            return;
+        }
+
+        // Manual FPS control mode: use precise frame timing
         let target_fps = app.settings.target_fps.max(1);
         if target_fps != self.last_target_fps {
             self.last_target_fps = target_fps;

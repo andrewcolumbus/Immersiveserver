@@ -16,7 +16,7 @@ use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
 use crate::compositor::{Environment, LayerSource, Viewport};
-use crate::layer_runtime::LayerRuntime;
+use crate::layer_runtime::{LayerRuntime, TextureUpdateResult};
 use crate::settings::EnvironmentSettings;
 use crate::ui::MenuBar;
 use crate::video::{LayerParams, VideoParams, VideoPlayer, VideoRenderer, VideoTexture};
@@ -95,10 +95,12 @@ pub struct App {
     // Test pattern pipeline
     /// Render pipeline for test pattern
     test_pattern_pipeline: wgpu::RenderPipeline,
-    /// Uniform buffer for test pattern params (environment size, time)
+    /// Uniform buffer for test pattern params (environment size, time, logo size)
     test_pattern_params_buffer: wgpu::Buffer,
-    /// Bind group for test pattern params
+    /// Bind group for test pattern params and logo texture
     test_pattern_bind_group: wgpu::BindGroup,
+    /// Logo dimensions for test pattern (constant, loaded from embedded PNG)
+    test_pattern_logo_size: [f32; 2],
 
     // Present pass (Environment -> WindowSurface)
     /// Bind group layout for presenting the environment to the window
@@ -155,6 +157,20 @@ pub struct App {
     preview_player: crate::preview_player::PreviewPlayer,
     /// Layer ID for layer preview mode (None = clip preview, Some = layer preview)
     preview_layer_id: Option<u32>,
+    /// NDI receiver for source preview (separate from layer runtimes)
+    preview_source_receiver: Option<crate::network::NdiReceiver>,
+    /// Texture for source preview frames (raw BGRA from NDI)
+    preview_source_texture: Option<VideoTexture>,
+    /// Output texture after GPU BGRA→RGBA conversion (for egui display)
+    preview_source_output_texture: Option<wgpu::Texture>,
+    /// View for the output texture
+    preview_source_output_view: Option<wgpu::TextureView>,
+    /// Bind group for source preview rendering
+    preview_source_bind_group: Option<wgpu::BindGroup>,
+    /// Params buffer for source preview rendering
+    preview_source_params_buffer: Option<wgpu::Buffer>,
+    /// Whether source preview has received at least one frame
+    preview_source_has_frame: bool,
     /// Thumbnail cache for video previews in clip grid
     pub thumbnail_cache: crate::ui::ThumbnailCache,
     /// HAP Converter window
@@ -240,6 +256,8 @@ pub struct App {
     // Advanced Output system
     /// Output manager for multi-screen projection mapping
     output_manager: Option<crate::output::OutputManager>,
+    /// Output preset manager for saving/restoring output configurations
+    pub output_preset_manager: crate::output::OutputPresetManager,
 
     // REST API server
     /// Whether the API server is running
@@ -267,6 +285,8 @@ pub struct App {
     frames_in_flight: VecDeque<wgpu::SubmissionIndex>,
     /// Last known low_latency_mode value, for detecting changes and reconfiguring surface.
     last_low_latency_mode: bool,
+    /// Last known vsync_enabled value, for detecting changes and reconfiguring surface.
+    last_vsync_mode: bool,
 }
 
 impl App {
@@ -330,9 +350,13 @@ impl App {
 
         tracing::info!("Surface format: {:?}", surface_format);
 
-        // Always use Immediate mode for manual FPS control
-        // Fall back to Mailbox or Fifo if Immediate is not available
-        let present_mode = if surface_caps.present_modes.contains(&wgpu::PresentMode::Immediate) {
+        // Select present mode based on vsync setting:
+        // - VSYNC enabled: Use Fifo (syncs to display refresh rate)
+        // - VSYNC disabled: Use Immediate for manual FPS control
+        let initial_vsync_mode = settings.vsync_enabled;
+        let present_mode = if initial_vsync_mode {
+            wgpu::PresentMode::Fifo
+        } else if surface_caps.present_modes.contains(&wgpu::PresentMode::Immediate) {
             wgpu::PresentMode::Immediate
         } else if surface_caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
             wgpu::PresentMode::Mailbox
@@ -340,7 +364,7 @@ impl App {
             wgpu::PresentMode::Fifo
         };
 
-        tracing::info!("Present mode: {:?}", present_mode);
+        tracing::info!("Present mode: {:?} (vsync: {})", present_mode, initial_vsync_mode);
 
         // Configure frame latency based on low_latency_mode setting:
         // - Low latency mode (true): 1 frame buffer, ~16ms less latency but may stutter
@@ -382,7 +406,7 @@ impl App {
             Self::create_checker_pipeline(&device, &queue, surface_format, env_width, env_height);
 
         // Create test pattern pipeline
-        let (test_pattern_pipeline, test_pattern_params_buffer, test_pattern_bind_group) =
+        let (test_pattern_pipeline, test_pattern_params_buffer, test_pattern_bind_group, test_pattern_logo_size) =
             Self::create_test_pattern_pipeline(&device, &queue, surface_format, env_width, env_height);
 
         // Create present pipeline (Environment -> WindowSurface)
@@ -498,6 +522,9 @@ impl App {
         let texture_share_enabled = settings.texture_share_enabled;
         let gpu_profiler = crate::telemetry::GpuProfiler::new(&device, &queue, 32);
 
+        // Initialize NDI buffer capacity from settings
+        crate::network::ndi::set_ndi_buffer_capacity(settings.ndi_buffer_capacity);
+
         // Create shared GPU context for multi-window support
         // Note: instance and adapter are moved into GpuContext, device/queue are cloned for convenience
         let gpu = Arc::new(crate::gpu_context::GpuContext::from_parts(
@@ -528,6 +555,7 @@ impl App {
             test_pattern_pipeline,
             test_pattern_params_buffer,
             test_pattern_bind_group,
+            test_pattern_logo_size,
             copy_bind_group_layout,
             copy_bind_group,
             copy_pipeline,
@@ -593,6 +621,13 @@ impl App {
             previs_renderer: Some(previs_renderer),
             preview_player: crate::preview_player::PreviewPlayer::new(bc_texture_supported),
             preview_layer_id: None,
+            preview_source_receiver: None,
+            preview_source_texture: None,
+            preview_source_output_texture: None,
+            preview_source_output_view: None,
+            preview_source_bind_group: None,
+            preview_source_params_buffer: None,
+            preview_source_has_frame: false,
             thumbnail_cache: crate::ui::ThumbnailCache::new(),
             converter_window: crate::converter::ConverterWindow::new(),
             preferences_window: crate::ui::PreferencesWindow::new(),
@@ -651,6 +686,11 @@ impl App {
 
             // Advanced Output system
             output_manager: None, // Initialized lazily when screens are added
+            output_preset_manager: {
+                let mut manager = crate::output::OutputPresetManager::new();
+                manager.load_user_presets();
+                manager
+            },
 
             // API server
             api_server_running: false,
@@ -667,6 +707,7 @@ impl App {
             // Frame pacing (GPU double-buffering)
             frames_in_flight: VecDeque::with_capacity(3),
             last_low_latency_mode: initial_low_latency_mode,
+            last_vsync_mode: initial_vsync_mode,
         }
     }
 
@@ -882,6 +923,22 @@ impl App {
                         return vec4<f32>(0.0, 0.0, 0.0, 1.0);
                     }
 
+                    // Border around environment edge (fixed screen pixel width regardless of zoom)
+                    // Convert border width from env UV to compensate for scale
+                    let border_base = 0.002;
+                    let border_x = border_base / params.scale.x;
+                    let border_y = border_base / params.scale.y;
+
+                    let near_edge = adjusted_uv.x < border_x ||
+                                    adjusted_uv.x > 1.0 - border_x ||
+                                    adjusted_uv.y < border_y ||
+                                    adjusted_uv.y > 1.0 - border_y;
+
+                    if (near_edge) {
+                        let border_color = vec3<f32>(0.4, 0.4, 0.4);
+                        return vec4<f32>(border_color, 1.0);
+                    }
+
                     let color = textureSample(t_texture, s_sampler, adjusted_uv);
                     return vec4<f32>(color.rgb, 1.0);
                 }
@@ -1075,7 +1132,7 @@ impl App {
         format: wgpu::TextureFormat,
         env_width: u32,
         env_height: u32,
-    ) -> (wgpu::RenderPipeline, wgpu::Buffer, wgpu::BindGroup) {
+    ) -> (wgpu::RenderPipeline, wgpu::Buffer, wgpu::BindGroup, [f32; 2]) {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Test Pattern Shader"),
             source: wgpu::ShaderSource::Wgsl(
@@ -1083,19 +1140,79 @@ impl App {
             ),
         });
 
-        // Test pattern params: env_size (vec2), time (f32), padding (f32)
+        // Load logo texture
+        let logo_png_data = include_bytes!("../assets/logos/TIG_TypeLogo_1_Alpha_White.png");
+        let logo_img = image::load_from_memory(logo_png_data)
+            .expect("Failed to load logo PNG")
+            .to_rgba8();
+        let (logo_width, logo_height) = logo_img.dimensions();
+        let logo_pixels = logo_img.into_raw();
+
+        let logo_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Logo Texture"),
+            size: wgpu::Extent3d {
+                width: logo_width,
+                height: logo_height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &logo_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &logo_pixels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(logo_width * 4),
+                rows_per_image: Some(logo_height),
+            },
+            wgpu::Extent3d {
+                width: logo_width,
+                height: logo_height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        let logo_texture_view = logo_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let logo_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Logo Sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+
+        // Test pattern params: env_size (vec2), time (f32), padding (f32), logo_size (vec2), padding (vec2)
         #[repr(C)]
         #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
         struct TestPatternParams {
             env_size: [f32; 2],
             time: f32,
             _pad: f32,
+            logo_size: [f32; 2],
+            _pad2: [f32; 2],
         }
 
         let params = TestPatternParams {
             env_size: [env_width as f32, env_height as f32],
             time: 0.0,
             _pad: 0.0,
+            logo_size: [logo_width as f32, logo_height as f32],
+            _pad2: [0.0, 0.0],
         };
 
         let params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -1109,25 +1226,53 @@ impl App {
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Test Pattern Bind Group Layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
         });
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Test Pattern Bind Group"),
             layout: &bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: params_buffer.as_entire_binding(),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&logo_texture_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&logo_sampler),
+                },
+            ],
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1165,7 +1310,8 @@ impl App {
             cache: None,
         });
 
-        (pipeline, params_buffer, bind_group)
+        let logo_size = [logo_width as f32, logo_height as f32];
+        (pipeline, params_buffer, bind_group, logo_size)
     }
 
     /// Update test pattern params (called each frame when test pattern is active)
@@ -1176,12 +1322,16 @@ impl App {
             env_size: [f32; 2],
             time: f32,
             _pad: f32,
+            logo_size: [f32; 2],
+            _pad2: [f32; 2],
         }
 
         let params = TestPatternParams {
             env_size: [self.environment.width() as f32, self.environment.height() as f32],
             time,
             _pad: 0.0,
+            logo_size: self.test_pattern_logo_size,
+            _pad2: [0.0, 0.0],
         };
 
         self.queue
@@ -1336,6 +1486,34 @@ impl App {
         }
     }
 
+    /// Sync vsync_enabled setting - reconfigures surface present mode if changed
+    fn sync_vsync_mode(&mut self) {
+        if self.settings.vsync_enabled != self.last_vsync_mode {
+            self.last_vsync_mode = self.settings.vsync_enabled;
+
+            // Select new present mode based on vsync setting
+            let surface_caps = self.surface.get_capabilities(&self.gpu.adapter);
+            let present_mode = if self.settings.vsync_enabled {
+                wgpu::PresentMode::Fifo
+            } else if surface_caps.present_modes.contains(&wgpu::PresentMode::Immediate) {
+                wgpu::PresentMode::Immediate
+            } else if surface_caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
+                wgpu::PresentMode::Mailbox
+            } else {
+                wgpu::PresentMode::Fifo
+            };
+
+            self.config.present_mode = present_mode;
+            self.surface.configure(&self.device, &self.config);
+
+            tracing::info!(
+                "VSYNC {}: present mode set to {:?}",
+                if self.settings.vsync_enabled { "enabled" } else { "disabled" },
+                present_mode
+            );
+        }
+    }
+
     /// Sync layers, effects, and screens from environment to settings (for saving)
     pub fn sync_layers_to_settings(&mut self) {
         let layers: Vec<_> = self.environment.layers().to_vec();
@@ -1484,9 +1662,10 @@ impl App {
 
     /// Render a frame with egui UI
     pub fn render(&mut self) -> Result<bool, wgpu::SurfaceError> {
-        // Apply low latency mode changes BEFORE acquiring surface texture.
+        // Apply surface configuration changes BEFORE acquiring surface texture.
         // Surface must be reconfigured before get_current_texture() is called.
         self.sync_low_latency_mode();
+        self.sync_vsync_mode();
 
         // Acquire surface texture early - allows GPU to prepare it while CPU does other work.
         // This overlaps GPU surface preparation with CPU work (egui building, video polling).
@@ -1521,19 +1700,135 @@ impl App {
                 label: Some("Render Encoder"),
             });
 
+        // ========== LIVE SOURCE FRAME POLLING ==========
+        // Poll NDI receiver and convert BGRA→RGBA BEFORE effect processing
+        // This ensures the converted texture is available for effects
+        if let Some(receiver) = &mut self.preview_source_receiver {
+            if let Some(frame) = receiver.take_frame() {
+                let (width, height) = (frame.width, frame.height);
+
+                // Create or recreate texture if dimensions changed
+                let need_new_texture = self.preview_source_texture.as_ref()
+                    .map(|t| t.width() != width || t.height() != height)
+                    .unwrap_or(true);
+
+                if need_new_texture {
+                    // Create input texture for raw BGRA frames from NDI
+                    // Use BGRA texture format in BGRA pipeline mode
+                    let texture = if self.settings.bgra_pipeline_enabled {
+                        VideoTexture::new_bgra(&self.device, width, height)
+                    } else {
+                        VideoTexture::new(&self.device, width, height)
+                    };
+                    let params_buffer = self.video_renderer.create_params_buffer(&self.device);
+
+                    // Create output texture for RGBA result (render target for GPU swizzle)
+                    let output_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                        label: Some("Source Preview Output Texture"),
+                        size: wgpu::Extent3d {
+                            width,
+                            height,
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: self.config.format,
+                        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                            | wgpu::TextureUsages::TEXTURE_BINDING
+                            | wgpu::TextureUsages::COPY_SRC,
+                        view_formats: &[],
+                    });
+                    let output_view = output_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+                    self.preview_source_texture = Some(texture);
+                    self.preview_source_params_buffer = Some(params_buffer);
+                    self.preview_source_output_texture = Some(output_texture);
+                    self.preview_source_output_view = Some(output_view);
+                }
+
+                // Upload raw BGRA frame to input texture
+                if let Some(texture) = &mut self.preview_source_texture {
+                    let decoded_frame = crate::video::DecodedFrame {
+                        width,
+                        height,
+                        data: frame.data.to_vec(),
+                        pts: 0.0,
+                        frame_index: 0,
+                        is_gpu_native: false,
+                        is_bc3: false,
+                    };
+                    texture.upload(&self.queue, &decoded_frame);
+
+                    // Create bind group for rendering
+                    if let Some(params_buffer) = &self.preview_source_params_buffer {
+                        let bind_group = self.video_renderer.create_bind_group_with_buffer(
+                            &self.device,
+                            texture,
+                            params_buffer,
+                        );
+                        self.preview_source_bind_group = Some(bind_group);
+
+                        // Set params with BGRA swizzle enabled (unless BGRA pipeline mode)
+                        let layer_params = LayerParams {
+                            is_bgra: if self.settings.bgra_pipeline_enabled { 0.0 } else { 1.0 },
+                            ..LayerParams::default()
+                        };
+                        self.video_renderer.write_layer_params(&self.queue, params_buffer, &layer_params);
+                    }
+
+                    self.preview_source_has_frame = true;
+                }
+
+                // GPU render pass: convert BGRA→RGBA using main encoder (no separate submit)
+                if self.preview_source_has_frame {
+                    if let (Some(output_view), Some(bind_group)) = (
+                        &self.preview_source_output_view,
+                        &self.preview_source_bind_group,
+                    ) {
+                        self.video_renderer.render_with_blend(
+                            &mut encoder,
+                            output_view,
+                            bind_group,
+                            crate::compositor::BlendMode::Normal,
+                            true, // clear before rendering
+                        );
+                    }
+                }
+            }
+        }
+
         // ========== PREVIEW EFFECT PROCESSING ==========
         // Process effects for the preview clip BEFORE building egui UI
         // This ensures the egui texture ID points to the effect output when the UI is built
-        if self.preview_player.has_frame() {
+        // Works for both file sources (preview_player) and live sources (preview_source_receiver)
+        let has_file_frame = self.preview_player.has_frame();
+        let has_live_frame = self.preview_source_has_frame && self.preview_monitor_panel.current_clip().is_some();
+
+        if has_file_frame || has_live_frame {
             if let Some(preview_clip_info) = self.preview_monitor_panel.current_clip() {
                 // Get the clip's effects from the environment
                 if let Some(layer) = self.environment.get_layer(preview_clip_info.layer_id) {
                     if let Some(clip) = layer.get_clip(preview_clip_info.slot) {
                         let active_effect_count = clip.effects.active_effects().count();
 
-                        if active_effect_count > 0 {
-                            let (width, height) = self.preview_player.dimensions();
+                        // Get dimensions and input view based on source type
+                        let (width, height, input_view_ptr) = if has_file_frame {
+                            let dims = self.preview_player.dimensions();
+                            let view = self.preview_player.texture_view()
+                                .map(|v| v as *const wgpu::TextureView);
+                            (dims.0, dims.1, view)
+                        } else {
+                            // Live source - use the converted RGBA output texture
+                            let dims = self.preview_source_output_texture.as_ref()
+                                .map(|t| (t.width(), t.height()))
+                                .unwrap_or((1920, 1080));
+                            let view = self.preview_source_output_view.as_ref()
+                                .map(|v| v as *const wgpu::TextureView);
+                            (dims.0, dims.1, view)
+                        };
 
+                        if active_effect_count > 0 {
                             // 1. Ensure preview runtime exists
                             self.effect_manager.ensure_preview_runtime(
                                 &self.device,
@@ -1550,14 +1845,22 @@ impl App {
                                 self.config.format,
                             );
 
-                            // 3. Copy video texture to preview effect input
-                            if let Some(video_view) = self.preview_player.texture_view() {
+                            // 3. Copy source texture to preview effect input
+                            // Note: Both file preview and live source output are already RGBA
+                            // Preview runtime is created at source dimensions, so no size transformation needed
+                            if let Some(view_ptr) = input_view_ptr {
                                 if let Some(preview_runtime) = self.effect_manager.get_preview_runtime_mut() {
-                                    preview_runtime.copy_input_texture(
-                                        &mut encoder,
-                                        &self.device,
-                                        video_view,
-                                    );
+                                    unsafe {
+                                        preview_runtime.copy_input_texture(
+                                            &mut encoder,
+                                            &self.device,
+                                            &self.queue,
+                                            &*view_ptr,
+                                            false, // is_bgra: false - sources are already RGBA
+                                            width, height, // source dimensions
+                                            width, height, // dest dimensions (same as source for clip preview)
+                                        );
+                                    }
                                 }
                             }
 
@@ -1602,19 +1905,15 @@ impl App {
                                 }
                             }
                         } else {
-                            // No active effects - ensure we're showing the raw video texture
-                            // Re-register the video texture if effects were just disabled
-                            // Use a raw pointer to work around borrow checker since we know the lifetime is safe
-                            let video_view_ptr = self.preview_player.texture_view()
-                                .map(|v| v as *const wgpu::TextureView);
-                            if let Some(video_view_ptr) = video_view_ptr {
+                            // No active effects - show raw source texture
+                            if let Some(view_ptr) = input_view_ptr {
                                 if let Some(old_id) = self.preview_player.egui_texture_id.take() {
                                     self.egui_renderer.free_texture(&old_id);
                                 }
                                 let texture_id = unsafe {
                                     self.egui_renderer.register_native_texture(
                                         &self.device,
-                                        &*video_view_ptr,
+                                        &*view_ptr,
                                         wgpu::FilterMode::Linear,
                                     )
                                 };
@@ -1652,7 +1951,9 @@ impl App {
                             let total_effects = clip_effect_count + layer_effect_count;
 
                             if total_effects > 0 {
-                                let (width, height) = (texture.width(), texture.height());
+                                // Use environment dimensions for layer preview effects
+                                // This ensures effects like multiplex fill the entire canvas
+                                let (width, height) = (self.environment.width(), self.environment.height());
 
                                 // Ensure preview runtime exists
                                 self.effect_manager.ensure_preview_runtime(
@@ -1683,16 +1984,34 @@ impl App {
                                 );
 
                                 // Copy layer texture to preview effect input
+                                // In BGRA pipeline mode, no swap needed (all sources are BGRA)
+                                // Video texture is positioned within environment-sized preview texture
+                                let is_bgra = if self.settings.bgra_pipeline_enabled {
+                                    false  // No swap needed
+                                } else {
+                                    layer_runtime.is_bgra() > 0.5  // Swap NDI sources
+                                };
+                                let video_w = layer_runtime.video_width;
+                                let video_h = layer_runtime.video_height;
+                                let env_w = self.environment.width();
+                                let env_h = self.environment.height();
                                 if let Some(preview_runtime) = self.effect_manager.get_preview_runtime_mut() {
                                     preview_runtime.copy_input_texture(
                                         &mut encoder,
                                         &self.device,
+                                        &self.queue,
                                         texture.view(),
+                                        is_bgra,
+                                        video_w, video_h,
+                                        env_w, env_h,
                                     );
                                 }
 
                                 // Process effects
-                                let effect_params = self.effect_manager.build_params();
+                                let mut effect_params = self.effect_manager.build_params();
+                                // Set size_scale for effects that need content dimensions
+                                effect_params.params[26] = video_w as f32 / env_w as f32;
+                                effect_params.params[27] = video_h as f32 / env_h as f32;
                                 let bpm_clock = self.effect_manager.bpm_clock().clone();
                                 let combined_effect_count = combined_effects.active_effects().count();
                                 if let Some(preview_runtime) = self.effect_manager.get_preview_runtime_mut() {
@@ -1751,6 +2070,27 @@ impl App {
                         }
                     }
                 }
+            }
+        }
+
+        // ========== SOURCE PREVIEW EGUI REGISTRATION ==========
+        // Register source texture with egui ONLY if in Source mode (no effects)
+        // In Clip mode, the effect processing section handles egui registration
+        // Frame polling and BGRA conversion now happens in LIVE SOURCE FRAME POLLING section above
+        if self.preview_source_has_frame && self.preview_monitor_panel.current_source().is_some() {
+            if let Some(output_view) = &self.preview_source_output_view {
+                let output_view_ptr = output_view as *const wgpu::TextureView;
+                if let Some(old_id) = self.preview_player.egui_texture_id.take() {
+                    self.egui_renderer.free_texture(&old_id);
+                }
+                let texture_id = unsafe {
+                    self.egui_renderer.register_native_texture(
+                        &self.device,
+                        &*output_view_ptr,
+                        wgpu::FilterMode::Linear,
+                    )
+                };
+                self.preview_player.egui_texture_id = Some(texture_id);
             }
         }
 
@@ -1942,6 +2282,7 @@ impl App {
         let output_actions = self.advanced_output_window.render(
             &self.egui_ctx,
             self.output_manager.as_ref(),
+            &self.output_preset_manager,
             layer_count,
             &self.available_displays,
             env_dimensions,
@@ -2361,8 +2702,11 @@ impl App {
                 let size = floating_size.unwrap_or((320.0, 280.0));
                 let mut open = true;
 
-                // Determine has_frame based on mode (clip vs layer preview)
-                let has_frame = if let Some(layer_id) = self.preview_layer_id {
+                // Determine has_frame based on mode (clip vs layer vs source preview)
+                let has_frame = if self.preview_source_receiver.is_some() {
+                    // Source preview mode - check if we have received a frame
+                    self.preview_source_has_frame
+                } else if let Some(layer_id) = self.preview_layer_id {
                     // Layer preview mode - check if layer runtime has a frame
                     self.layer_runtimes.get(&layer_id)
                         .map(|r| r.has_frame)
@@ -2372,14 +2716,34 @@ impl App {
                     self.preview_player.has_frame()
                 };
                 let is_playing = !self.preview_player.is_paused();
-                let video_info = self.preview_player.video_info();
+                // Get video_info - for live source clips, synthesize from source texture dimensions
+                let video_info = if self.preview_player.has_frame() {
+                    self.preview_player.video_info()
+                } else if self.preview_source_has_frame && self.preview_monitor_panel.current_clip().is_some() {
+                    // Live source clip - create synthetic video info from source dimensions
+                    self.preview_source_output_texture.as_ref().map(|t| {
+                        crate::preview_player::VideoInfo {
+                            width: t.width(),
+                            height: t.height(),
+                            frame_rate: 0.0,
+                            duration: 0.0,
+                            position: 0.0,
+                            frame_index: 0,
+                        }
+                    })
+                } else {
+                    self.preview_player.video_info()
+                };
 
                 // Get layer dimensions for layer preview mode
-                let layer_dimensions = self.preview_layer_id.and_then(|layer_id| {
-                    self.layer_runtimes.get(&layer_id)
-                        .and_then(|r| r.texture.as_ref())
-                        .map(|t| (t.width(), t.height()))
+                // Use environment dimensions since layers are logically environment-sized
+                let layer_dimensions = self.preview_layer_id.map(|_| {
+                    (self.environment.width(), self.environment.height())
                 });
+
+                // Get source dimensions for source preview mode
+                let source_dimensions = self.preview_source_texture.as_ref()
+                    .map(|t| (t.width(), t.height()));
 
                 let window_response = egui::Window::new("Preview Monitor")
                     .id(egui::Id::new("preview_monitor_window"))
@@ -2396,17 +2760,18 @@ impl App {
                             is_playing,
                             video_info,
                             layer_dimensions,
-                            |ui, rect| {
-                                // Render the preview texture into the given rect
+                            source_dimensions,
+                            |ui, rect, uv_rect| {
+                                // Render the preview texture into the given rect with viewport-adjusted UVs
                                 if let Some(texture_id) = self.preview_player.egui_texture_id {
-                                    // Display the actual video/layer texture
+                                    // Display the actual video/layer texture with pan/zoom UVs
                                     ui.painter().image(
                                         texture_id,
                                         rect,
-                                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                        uv_rect,
                                         egui::Color32::WHITE,
                                     );
-                                } else if self.preview_player.is_loaded() || self.preview_layer_id.is_some() {
+                                } else if self.preview_player.is_loaded() || self.preview_layer_id.is_some() || self.preview_source_receiver.is_some() {
                                     // Texture not yet registered, show loading state
                                     ui.painter().rect_filled(
                                         rect,
@@ -2557,14 +2922,14 @@ impl App {
             render_pass.set_bind_group(0, &self.test_pattern_bind_group, &[]);
             render_pass.draw(0..3, 0..1);
         } else {
-            // NORMAL MODE: Render checkerboard background first
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Checker Pass"),
+            // NORMAL MODE: Clear to transparent black (no checkerboard)
+            encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Environment Clear Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: self.environment.texture_view(),
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -2572,9 +2937,6 @@ impl App {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            render_pass.set_pipeline(&self.checker_pipeline);
-            render_pass.set_bind_group(0, &self.checker_bind_group, &[]);
-            render_pass.draw(0..3, 0..1);
         }
 
         // 2. Render layers back-to-front (index 0 = back, last = front) - skip in test pattern mode
@@ -2607,6 +2969,12 @@ impl App {
                                     self.environment.height(),
                                 );
                                 params.opacity = old_opacity;
+                                // In BGRA pipeline mode, everything is BGRA so no swap needed
+                                params.is_bgra = if self.settings.bgra_pipeline_enabled {
+                                    0.0
+                                } else {
+                                    runtime.is_bgra()
+                                };
                                 // Write to old layer's params buffer (not shared)
                                 self.video_renderer.write_layer_params(&self.queue, old_params_buffer, &params);
 
@@ -2659,7 +3027,8 @@ impl App {
 
                                 if has_any_effects {
                                     // --- EFFECT PROCESSING PATH ---
-                                    // Effect textures are VIDEO-SIZED so effects process at native resolution
+                                    // Effect textures are ENVIRONMENT-SIZED so effects process at composition resolution
+                                    // This allows effects like multiplex to extend beyond video bounds
 
                                     // Track what texture to use as input for the next stage
                                     let mut current_input_is_clip_output = false;
@@ -2667,13 +3036,13 @@ impl App {
                                     // ========== CLIP EFFECTS ==========
                                     if has_clip_effects {
                                         if let Some(slot) = clip_slot {
-                                            // 1. Ensure clip effect runtime exists
+                                            // 1. Ensure clip effect runtime exists (environment-sized)
                                             self.effect_manager.ensure_clip_runtime(
                                                 layer.id,
                                                 slot,
                                                 &self.device,
-                                                runtime.video_width,
-                                                runtime.video_height,
+                                                self.environment.width(),
+                                                self.environment.height(),
                                                 self.config.format,
                                             );
 
@@ -2690,18 +3059,33 @@ impl App {
                                             }
 
                                             // 3. Copy video texture to clip effect input
+                                            // In BGRA pipeline mode, no swap needed (all sources are BGRA)
+                                            let is_bgra = if self.settings.bgra_pipeline_enabled {
+                                                false  // No swap needed
+                                            } else {
+                                                runtime.is_bgra() > 0.5  // Swap NDI sources
+                                            };
                                             if let Some(video_texture) = &runtime.texture {
                                                 if let Some(clip_runtime) = self.effect_manager.get_clip_runtime(layer.id, slot) {
                                                     clip_runtime.copy_input_texture(
                                                         &mut encoder,
                                                         &self.device,
+                                                        &self.queue,
                                                         video_texture.view(),
+                                                        is_bgra,
+                                                        runtime.video_width,
+                                                        runtime.video_height,
+                                                        self.environment.width(),
+                                                        self.environment.height(),
                                                     );
                                                 }
                                             }
 
                                             // 4. Process clip effects with automation (LFO/FFT)
-                                            let effect_params = self.effect_manager.build_params();
+                                            let mut effect_params = self.effect_manager.build_params();
+                                            // Set size_scale for effects that need content dimensions
+                                            effect_params.params[26] = runtime.video_width as f32 / self.environment.width() as f32;
+                                            effect_params.params[27] = runtime.video_height as f32 / self.environment.height() as f32;
                                             let bpm_clock = self.effect_manager.bpm_clock().clone();
                                             if let Some(clip_runtime) = self.effect_manager.get_clip_runtime_mut(layer.id, slot) {
                                                 if let (Some(input_view), Some(output_view)) = (
@@ -2731,12 +3115,12 @@ impl App {
 
                                     // ========== LAYER EFFECTS ==========
                                     if has_layer_effects {
-                                        // 1. Ensure layer effect runtime exists
+                                        // 1. Ensure layer effect runtime exists (environment-sized)
                                         self.effect_manager.ensure_layer_runtime(
                                             layer.id,
                                             &self.device,
-                                            runtime.video_width,
-                                            runtime.video_height,
+                                            self.environment.width(),
+                                            self.environment.height(),
                                             self.config.format,
                                         );
 
@@ -2752,35 +3136,57 @@ impl App {
                                         // 3. Copy input to layer effect input
                                         // Input is either clip effect output or video texture
                                         if current_input_is_clip_output {
-                                            // Use clip effect output as input
+                                            // Use clip effect output as input (effects output RGBA)
+                                            // Clip effects are already environment-sized, so no size transformation needed
                                             if let Some(slot) = clip_slot {
                                                 if let Some(clip_runtime) = self.effect_manager.get_clip_runtime(layer.id, slot) {
                                                     if let Some(clip_output) = clip_runtime.output_view(clip_active_effect_count) {
                                                         if let Some(layer_runtime) = self.effect_manager.get_layer_runtime(layer.id) {
+                                                            let env_w = self.environment.width();
+                                                            let env_h = self.environment.height();
                                                             layer_runtime.copy_input_texture(
                                                                 &mut encoder,
                                                                 &self.device,
+                                                                &self.queue,
                                                                 clip_output,
+                                                                false, // is_bgra: clip effect output is RGBA
+                                                                env_w, env_h, // source is already environment-sized
+                                                                env_w, env_h,
                                                             );
                                                         }
                                                     }
                                                 }
                                             }
                                         } else {
-                                            // Use video texture directly
+                                            // Use video texture directly (may be BGRA for NDI)
+                                            // In BGRA pipeline mode, no swap needed
+                                            let is_bgra = if self.settings.bgra_pipeline_enabled {
+                                                false  // No swap needed
+                                            } else {
+                                                runtime.ndi_is_bgra  // Swap NDI sources
+                                            };
                                             if let Some(video_texture) = &runtime.texture {
                                                 if let Some(layer_runtime) = self.effect_manager.get_layer_runtime(layer.id) {
                                                     layer_runtime.copy_input_texture(
                                                         &mut encoder,
                                                         &self.device,
+                                                        &self.queue,
                                                         video_texture.view(),
+                                                        is_bgra,
+                                                        runtime.video_width,
+                                                        runtime.video_height,
+                                                        self.environment.width(),
+                                                        self.environment.height(),
                                                     );
                                                 }
                                             }
                                         }
 
                                         // 4. Process layer effects with automation (LFO/FFT)
-                                        let effect_params = self.effect_manager.build_params();
+                                        let mut effect_params = self.effect_manager.build_params();
+                                        // Set size_scale for effects that need content dimensions
+                                        effect_params.params[26] = runtime.video_width as f32 / self.environment.width() as f32;
+                                        effect_params.params[27] = runtime.video_height as f32 / self.environment.height() as f32;
                                         let bpm_clock = self.effect_manager.bpm_clock().clone();
                                         if let Some(layer_runtime) = self.effect_manager.get_layer_runtime_mut(layer.id) {
                                             if let (Some(input_view), Some(output_view)) = (
@@ -2863,6 +3269,13 @@ impl App {
                                         self.environment.height(),
                                     );
                                     params.opacity = effective_opacity;
+                                    // In BGRA pipeline mode, everything is BGRA so no swap needed.
+                                    // Otherwise, only NDI sources need R↔B swap.
+                                    params.is_bgra = if self.settings.bgra_pipeline_enabled {
+                                        0.0  // All sources are BGRA, no swap needed
+                                    } else {
+                                        runtime.is_bgra()  // Only swap NDI sources
+                                    };
                                     self.video_renderer.write_layer_params(&self.queue, params_buffer, &params);
 
                                     self.video_renderer.render_with_blend(
@@ -2958,6 +3371,9 @@ impl App {
 
                 // Capture frame to NDI if this screen has NDI output
                 output_manager.capture_ndi_frame(&mut encoder, screen_id);
+
+                // Capture frame to OMT if this screen has OMT output
+                output_manager.capture_omt_frame(&mut encoder, screen_id);
             }
         }
 
@@ -3179,6 +3595,11 @@ impl App {
         // Process advanced output NDI captures (non-blocking)
         if let Some(output_manager) = &mut self.output_manager {
             output_manager.process_ndi_captures(&self.device);
+        }
+
+        // Process advanced output OMT captures (non-blocking)
+        if let Some(output_manager) = &mut self.output_manager {
+            output_manager.process_omt_captures(&self.device);
         }
 
         // Process Spout capture pipeline (Windows, non-blocking)
@@ -3454,12 +3875,17 @@ impl App {
             * 4; // RGBA
 
         let mut layer_texture_bytes: u64 = 0;
+        let mut ndi_stats = Vec::new();
         for (_, runtime) in &self.layer_runtimes {
             if runtime.texture.is_some() && runtime.has_frame {
                 // Estimate texture size: width * height * 4 bytes (RGBA)
                 layer_texture_bytes += (runtime.video_width as u64)
                     * (runtime.video_height as u64)
                     * 4;
+            }
+            // Collect NDI stats from active NDI receivers
+            if let Some(stats) = runtime.ndi_stats() {
+                ndi_stats.push(stats);
             }
         }
 
@@ -3482,6 +3908,7 @@ impl App {
             gpu_memory,
             video_frame_time_ms: self.video_frame_time_ms,
             ui_frame_time_ms: self.ui_frame_time_ms,
+            ndi_stats,
         }
     }
 
@@ -3518,27 +3945,36 @@ impl App {
         let old_runtime_exists = self.layer_runtimes.contains_key(&layer_id);
 
         // Open video player (starts background decode thread)
-        let player =
-            VideoPlayer::open(path).map_err(|e| format!("Failed to open video: {}", e))?;
+        // Use BGRA output format when BGRA pipeline mode is enabled
+        let use_bgra = self.settings.bgra_pipeline_enabled;
+        let player = if use_bgra {
+            VideoPlayer::open_bgra(path).map_err(|e| format!("Failed to open video: {}", e))?
+        } else {
+            VideoPlayer::open(path).map_err(|e| format!("Failed to open video: {}", e))?
+        };
 
         tracing::info!(
-            "Layer {}: Loaded video {}x{} @ {:.2}fps, duration: {:.2}s, gpu_native: {}",
+            "Layer {}: Loaded video {}x{} @ {:.2}fps, duration: {:.2}s, gpu_native: {}, bgra: {}",
             layer_id,
             player.width(),
             player.height(),
             player.frame_rate(),
             player.duration(),
-            player.is_gpu_native()
+            player.is_gpu_native(),
+            use_bgra
         );
 
         // Create video texture with appropriate format
         // HAP uses raw DXT extraction for GPU-native upload
         // DXV v4 (most common) requires FFmpeg decode to RGBA due to proprietary compression
         let use_gpu_native = player.is_hap() && self.bc_texture_supported;
-        
+
         let video_texture = if use_gpu_native {
             tracing::info!("Using GPU-native BC texture for layer {} (HAP fast path)", layer_id);
             VideoTexture::new_gpu_native(&self.device, player.width(), player.height(), player.is_bc3())
+        } else if use_bgra {
+            tracing::info!("Using BGRA texture for layer {} (BGRA pipeline mode)", layer_id);
+            VideoTexture::new_bgra(&self.device, player.width(), player.height())
         } else {
             VideoTexture::new(&self.device, player.width(), player.height())
         };
@@ -3576,6 +4012,8 @@ impl App {
             fade_out_active: false,
             fade_out_start: None,
             fade_out_duration: std::time::Duration::ZERO,
+            // NDI format (not used for video files)
+            ndi_is_bgra: false,
         };
 
         if old_runtime_exists {
@@ -3612,7 +4050,12 @@ impl App {
         let default_width = 1920;
         let default_height = 1080;
 
-        let video_texture = VideoTexture::new(&self.device, default_width, default_height);
+        // Use BGRA texture format in BGRA pipeline mode
+        let video_texture = if self.settings.bgra_pipeline_enabled {
+            VideoTexture::new_bgra(&self.device, default_width, default_height)
+        } else {
+            VideoTexture::new(&self.device, default_width, default_height)
+        };
 
         // Create per-layer params buffer
         let params_buffer = self.video_renderer.create_params_buffer(&self.device);
@@ -3647,6 +4090,8 @@ impl App {
             fade_out_active: false,
             fade_out_start: None,
             fade_out_duration: std::time::Duration::ZERO,
+            // NDI format - default to BGRA, will be updated from actual frame data
+            ndi_is_bgra: true,
         };
 
         if old_runtime_exists {
@@ -3812,9 +4257,16 @@ impl App {
 
                 // Rate-limited texture upload
                 if uploads_this_frame < MAX_UPLOADS_PER_FRAME {
-                    if runtime.try_update_texture(&self.queue) {
-                        self.last_upload_layer = layer_id;
-                        uploads_this_frame += 1;
+                    match runtime.try_update_texture(&self.queue) {
+                        TextureUpdateResult::Uploaded => {
+                            self.last_upload_layer = layer_id;
+                            uploads_this_frame += 1;
+                        }
+                        TextureUpdateResult::NeedsResize { width, height } => {
+                            runtime.resize_texture(&self.device, &self.video_renderer, width, height);
+                            // Next frame will upload after resize
+                        }
+                        TextureUpdateResult::NoFrame => {}
                     }
                 }
             }
@@ -3837,8 +4289,15 @@ impl App {
         // Still count toward upload limit to prevent bandwidth spikes
         for runtime in self.pending_runtimes.values_mut() {
             if uploads_this_frame < MAX_UPLOADS_PER_FRAME {
-                if runtime.try_update_texture(&self.queue) {
-                    uploads_this_frame += 1;
+                match runtime.try_update_texture(&self.queue) {
+                    TextureUpdateResult::Uploaded => {
+                        uploads_this_frame += 1;
+                    }
+                    TextureUpdateResult::NeedsResize { width, height } => {
+                        runtime.resize_texture(&self.device, &self.video_renderer, width, height);
+                        // Next frame will upload after resize
+                    }
+                    TextureUpdateResult::NoFrame => {}
                 }
             }
         }
@@ -4406,8 +4865,22 @@ impl App {
 
     /// Create an API snapshot from current app state
     fn create_api_snapshot(&self) -> crate::api::AppSnapshot {
-        use crate::api::{AppSnapshot, ClipSnapshot, LayerSnapshot, StreamingSnapshot, ViewportSnapshot};
+        use crate::api::{
+            AppSnapshot, ClipSnapshot, EffectSnapshot, EffectTypeInfo, LayerSnapshot,
+            OutputSnapshot, PerformanceSnapshot, StreamingSnapshot, ViewportSnapshot,
+        };
         use crate::compositor::ClipSource;
+
+        // Helper to convert effect instances to snapshots
+        let effect_to_snapshot = |effect: &crate::effects::EffectInstance| -> EffectSnapshot {
+            EffectSnapshot {
+                id: effect.id.to_string(),
+                effect_type: effect.effect_type.clone(),
+                enabled: !effect.bypassed,
+                bypassed: effect.bypassed,
+                solo: effect.soloed,
+            }
+        };
 
         let layers: Vec<LayerSnapshot> = self.environment.layers().iter().map(|layer| {
             let clips: Vec<ClipSnapshot> = layer.clips.iter().enumerate().map(|(slot, clip_opt)| {
@@ -4417,11 +4890,16 @@ impl App {
                         ClipSource::Omt { name, .. } => (Some("omt".to_string()), Some(name.clone())),
                         ClipSource::Ndi { ndi_name, .. } => (Some("ndi".to_string()), Some(ndi_name.clone())),
                     };
+                    // Include clip effects
+                    let clip_effects: Vec<EffectSnapshot> = clip.effects.effects.iter()
+                        .map(&effect_to_snapshot)
+                        .collect();
                     ClipSnapshot {
                         slot,
                         source_type,
                         source_path,
                         label: clip.label.clone(),
+                        effects: clip_effects,
                     }
                 } else {
                     ClipSnapshot {
@@ -4429,9 +4907,15 @@ impl App {
                         source_type: None,
                         source_path: None,
                         label: None,
+                        effects: Vec::new(),
                     }
                 }
             }).collect();
+
+            // Include layer effects
+            let layer_effects: Vec<EffectSnapshot> = layer.effects.effects.iter()
+                .map(&effect_to_snapshot)
+                .collect();
 
             LayerSnapshot {
                 id: layer.id,
@@ -4443,13 +4927,80 @@ impl App {
                 scale: layer.transform.scale,
                 rotation: layer.transform.rotation,
                 anchor: layer.transform.anchor,
-                tile_x: layer.tile_x,
-                tile_y: layer.tile_y,
                 transition: layer.transition.clone(),
                 clips,
                 active_clip: layer.active_clip,
+                effects: layer_effects,
             }
         }).collect();
+
+        // Build output displays from available_displays
+        let outputs: Vec<OutputSnapshot> = self.available_displays.iter().map(|display| {
+            OutputSnapshot {
+                id: display.id,
+                name: display.name.clone(),
+                width: display.size.0,
+                height: display.size.1,
+                is_primary: display.is_primary,
+                refresh_rate_hz: display.refresh_rate_millihertz.map(|mhz| mhz / 1000),
+            }
+        }).collect();
+
+        // Build performance metrics from frame profiler
+        let frame_stats = self.frame_profiler.stats();
+        let performance = PerformanceSnapshot {
+            frame_time_avg_ms: frame_stats.avg_ms as f32,
+            frame_time_min_ms: frame_stats.min_ms as f32,
+            frame_time_max_ms: frame_stats.max_ms as f32,
+            frame_time_p95_ms: frame_stats.p95_ms as f32,
+            frame_time_p99_ms: frame_stats.p99_ms as f32,
+            gpu_timings: self.gpu_profiler.last_timings().iter()
+                .map(|(k, v)| (k.clone(), *v as f32))
+                .collect(),
+            gpu_total_ms: self.gpu_profiler.total_ms() as f32,
+            gpu_memory_mb: 0.0, // GPU memory tracking not yet implemented
+        };
+
+        // Build effect types from registry with parameter definitions
+        let effect_types: Vec<EffectTypeInfo> = self.effect_manager.registry().effects()
+            .map(|def| {
+                let parameters: Vec<crate::api::EffectParamInfo> = def.default_parameters()
+                    .iter()
+                    .map(|p| {
+                        let (param_type, default_val) = match &p.meta.default {
+                            crate::effects::ParameterValue::Float(v) => ("float", serde_json::json!(v)),
+                            crate::effects::ParameterValue::Int(v) => ("int", serde_json::json!(v)),
+                            crate::effects::ParameterValue::Bool(v) => ("bool", serde_json::json!(v)),
+                            crate::effects::ParameterValue::Color(v) => ("color", serde_json::json!(v)),
+                            crate::effects::ParameterValue::Vec2(v) => ("vec2", serde_json::json!(v)),
+                            crate::effects::ParameterValue::Vec3(v) => ("vec3", serde_json::json!(v)),
+                            crate::effects::ParameterValue::Enum { index, options } => ("enum", serde_json::json!({"index": index, "options": options})),
+                            crate::effects::ParameterValue::String(v) => ("string", serde_json::json!(v)),
+                        };
+                        crate::api::EffectParamInfo {
+                            name: p.meta.name.clone(),
+                            param_type: param_type.to_string(),
+                            default: default_val,
+                            min: p.meta.min,
+                            max: p.meta.max,
+                        }
+                    })
+                    .collect();
+                EffectTypeInfo {
+                    effect_type: def.effect_type().to_string(),
+                    display_name: def.display_name().to_string(),
+                    category: def.category().to_string(),
+                    parameters,
+                }
+            })
+            .collect();
+
+        // Get effect categories in display order
+        let effect_categories: Vec<String> = self.effect_manager.registry()
+            .categories()
+            .iter()
+            .cloned()
+            .collect();
 
         AppSnapshot {
             env_width: self.environment.width(),
@@ -4479,16 +5030,14 @@ impl App {
                 modified: false, // TODO: Track modified state
                 recent_files: Vec::new(), // TODO: Track recent files
             },
-            environment_effects: self.environment.effects().effects.iter().map(|effect| {
-                crate::api::EffectSnapshot {
-                    id: effect.id.to_string(),
-                    effect_type: effect.effect_type.clone(),
-                    enabled: !effect.bypassed,
-                    bypassed: effect.bypassed,
-                    solo: effect.soloed,
-                }
-            }).collect(),
+            environment_effects: self.environment.effects().effects.iter()
+                .map(&effect_to_snapshot)
+                .collect(),
             clip_columns: self.settings.global_clip_count,
+            outputs,
+            performance,
+            effect_types,
+            effect_categories,
         }
     }
 
@@ -4584,11 +5133,6 @@ impl App {
                 ApiCommand::SetLayerVisibility { id, visible } => {
                     if let Some(layer) = self.environment.get_layer_mut(id) {
                         layer.visible = visible;
-                    }
-                }
-                ApiCommand::SetLayerTiling { id, tile_x, tile_y } => {
-                    if let Some(layer) = self.environment.get_layer_mut(id) {
-                        layer.set_tiling(tile_x, tile_y);
                     }
                 }
                 ApiCommand::SetLayerTransition { id, transition } => {
@@ -5513,6 +6057,16 @@ impl App {
                 // Clear layer preview mode (switching to clip mode)
                 self.preview_layer_id = None;
 
+                // Clear all existing preview state (switching to new clip)
+                self.preview_source_receiver = None;
+                self.preview_source_texture = None;
+                self.preview_source_output_texture = None;
+                self.preview_source_output_view = None;
+                self.preview_source_bind_group = None;
+                self.preview_source_params_buffer = None;
+                self.preview_source_has_frame = false;
+                self.preview_player.clear();
+
                 // Load the clip into the preview player
                 if let Some(layer) = self.environment.layers().iter().find(|l| l.id == layer_id) {
                     if let Some(clip) = layer.get_clip(slot) {
@@ -5553,13 +6107,24 @@ impl App {
                                     }
                                 }
                             }
-                            crate::compositor::ClipSource::Omt { .. } => {
-                                tracing::info!("OMT preview not yet implemented");
-                                self.menu_bar.set_status("OMT preview not yet supported".to_string());
+                            crate::compositor::ClipSource::Omt { address, name: _ } => {
+                                // Set up OMT receiver for clip preview (stay in Clip mode for effects)
+                                // OMT receiver not yet implemented
+                                tracing::warn!("Clip preview: OMT receiver not yet implemented for '{}'", address);
                             }
-                            crate::compositor::ClipSource::Ndi { .. } => {
-                                tracing::info!("NDI preview not yet implemented");
-                                self.menu_bar.set_status("NDI preview not yet supported".to_string());
+                            crate::compositor::ClipSource::Ndi { ndi_name, url_address: _ } => {
+                                // Set up NDI receiver for clip preview (stay in Clip mode for effects)
+                                tracing::info!("Clip preview: Connecting to NDI source '{}'", ndi_name);
+                                match crate::network::NdiReceiver::connect(ndi_name) {
+                                    Ok(receiver) => {
+                                        self.preview_source_receiver = Some(receiver);
+                                        tracing::info!("Clip preview: NDI receiver connected");
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("Clip preview: Failed to connect to NDI source '{}': {}", ndi_name, e);
+                                        self.menu_bar.set_status(format!("NDI connect failed: {}", e));
+                                    }
+                                }
                             }
                         }
 
@@ -5585,7 +6150,14 @@ impl App {
                     // Store the layer ID for preview rendering
                     self.preview_layer_id = Some(layer_id);
 
-                    // Stop any clip preview playback (we're now in layer mode)
+                    // Clear all existing preview state (switching to layer mode)
+                    self.preview_source_receiver = None;
+                    self.preview_source_texture = None;
+                    self.preview_source_output_texture = None;
+                    self.preview_source_output_view = None;
+                    self.preview_source_bind_group = None;
+                    self.preview_source_params_buffer = None;
+                    self.preview_source_has_frame = false;
                     self.preview_player.clear();
 
                     // Free old preview texture from egui
@@ -5662,11 +6234,6 @@ impl App {
                     layer.transform.rotation = degrees.to_radians();
                 }
             }
-            PropertiesAction::SetLayerTiling { layer_id, tile_x, tile_y } => {
-                if let Some(layer) = self.environment.get_layer_mut(layer_id) {
-                    layer.set_tiling(tile_x, tile_y);
-                }
-            }
             PropertiesAction::SetLayerTransition { layer_id, transition } => {
                 self.set_layer_transition(layer_id, transition);
             }
@@ -5697,6 +6264,10 @@ impl App {
             PropertiesAction::SetNdiCaptureFps { fps: _ } => {
                 // NDI capture is now synced to environment FPS (target_fps).
                 // This setting is ignored - NDI sends every rendered frame.
+            }
+            PropertiesAction::SetNdiBufferCapacity { capacity } => {
+                self.settings.ndi_buffer_capacity = capacity;
+                crate::network::ndi::set_ndi_buffer_capacity(capacity);
             }
             PropertiesAction::SetThumbnailMode { mode } => {
                 self.settings.thumbnail_mode = mode;
@@ -6016,6 +6587,10 @@ impl App {
                 self.settings.low_latency_mode = enabled;
                 // Note: sync_low_latency_mode() will reconfigure the surface on next render
             }
+            PropertiesAction::SetVsyncEnabled { enabled } => {
+                self.settings.vsync_enabled = enabled;
+                // Note: sync_vsync_mode() will reconfigure the surface on next render
+            }
             PropertiesAction::SetTestPattern { enabled } => {
                 self.settings.test_pattern_enabled = enabled;
                 self.environment.set_test_pattern_enabled(enabled);
@@ -6023,6 +6598,15 @@ impl App {
                     "Test pattern enabled"
                 } else {
                     "Test pattern disabled"
+                });
+            }
+            PropertiesAction::SetBgraPipelineEnabled { enabled } => {
+                self.settings.bgra_pipeline_enabled = enabled;
+                tracing::info!("BGRA pipeline mode set to {}. Restart required.", enabled);
+                self.menu_bar.set_status(if enabled {
+                    "BGRA pipeline enabled (restart required)"
+                } else {
+                    "BGRA pipeline disabled (restart required)"
                 });
             }
             PropertiesAction::StartScrub { layer_id } => {
@@ -6070,6 +6654,7 @@ impl App {
                     let screen_id = manager.add_screen(&self.device, &screen_name);
                     // Auto-select the newly added screen
                     self.advanced_output_window.select_screen(screen_id, &screen_name, 1920, 1080);
+                    self.advanced_output_window.mark_dirty();
                     self.menu_bar.set_status(format!("Added Screen {}", screen_num));
                     tracing::info!("Added screen {:?}", screen_id);
                 }
@@ -6077,6 +6662,7 @@ impl App {
             AdvancedOutputAction::RemoveScreen { screen_id } => {
                 if let Some(manager) = self.output_manager.as_mut() {
                     manager.remove_screen(screen_id);
+                    self.advanced_output_window.mark_dirty();
                     self.menu_bar.set_status("Removed screen");
                 }
             }
@@ -6084,6 +6670,7 @@ impl App {
                 if let Some(manager) = self.output_manager.as_mut() {
                     let slice_num = manager.get_screen(screen_id).map(|s| s.slices.len() + 1).unwrap_or(1);
                     if let Some(slice_id) = manager.add_slice(&self.device, screen_id, format!("Slice {}", slice_num)) {
+                        self.advanced_output_window.mark_dirty();
                         self.menu_bar.set_status(format!("Added Slice {}", slice_num));
                         tracing::info!("Added slice {:?} to screen {:?}", slice_id, screen_id);
                     }
@@ -6092,6 +6679,7 @@ impl App {
             AdvancedOutputAction::RemoveSlice { screen_id, slice_id } => {
                 if let Some(manager) = self.output_manager.as_mut() {
                     manager.remove_slice(screen_id, slice_id);
+                    self.advanced_output_window.mark_dirty();
                     self.menu_bar.set_status("Removed slice");
                 }
             }
@@ -6103,9 +6691,11 @@ impl App {
                             *existing = slice;
                         }
                     }
+                    self.advanced_output_window.mark_dirty();
                     // Sync runtime to pick up changes
                     let target_fps = self.settings.target_fps as f32;
-                    manager.sync_runtime(&self.device, screen_id, target_fps);
+                    let tokio_handle = self.tokio_runtime.as_ref().map(|rt| rt.handle());
+                    manager.sync_runtime(&self.device, screen_id, target_fps, tokio_handle);
                 }
             }
             AdvancedOutputAction::UpdateScreen { screen_id, screen: updated_screen } => {
@@ -6123,9 +6713,11 @@ impl App {
                             screen.height = updated_screen.height;
                         }
                     }
+                    self.advanced_output_window.mark_dirty();
                     // Sync runtime to pick up changes
                     let target_fps = self.settings.target_fps as f32;
-                    manager.sync_runtime(&self.device, screen_id, target_fps);
+                    let tokio_handle = self.tokio_runtime.as_ref().map(|rt| rt.handle());
+                    manager.sync_runtime(&self.device, screen_id, target_fps, tokio_handle);
                 }
             }
             AdvancedOutputAction::UpdateScreenInputRect { screen_id, input_rect } => {
@@ -6139,9 +6731,11 @@ impl App {
                             slice.output.rect.height = input_rect.height;
                         }
                     }
+                    self.advanced_output_window.mark_dirty();
                     // Sync runtime to pick up changes
                     let target_fps = self.settings.target_fps as f32;
-                    manager.sync_runtime(&self.device, screen_id, target_fps);
+                    let tokio_handle = self.tokio_runtime.as_ref().map(|rt| rt.handle());
+                    manager.sync_runtime(&self.device, screen_id, target_fps, tokio_handle);
                 }
             }
             AdvancedOutputAction::SaveComposition => {
@@ -6158,6 +6752,94 @@ impl App {
                         self.menu_bar.set_status("Composition saved");
                     }
                 }
+            }
+            AdvancedOutputAction::LoadPreset { name } => {
+                // Load screens from preset and apply to output manager
+                if let Some(preset) = self.output_preset_manager.get_preset_by_name(&name) {
+                    let screens = preset.screens.clone();
+                    self.apply_output_preset_screens(screens);
+                    self.advanced_output_window.set_current_preset(Some(name.clone()));
+                    self.output_preset_manager.set_active_preset_by_name(&name);
+                    self.menu_bar.set_status(format!("Loaded preset: {}", name));
+                    tracing::info!("Loaded output preset: {}", name);
+                } else {
+                    self.menu_bar.set_status(format!("Preset not found: {}", name));
+                }
+            }
+            AdvancedOutputAction::SaveAsPreset { name } => {
+                // Get current screens from output manager and save as preset
+                if let Some(manager) = &self.output_manager {
+                    let screens: Vec<_> = manager.screens().cloned().collect();
+                    match self.output_preset_manager.save_as_preset(&name, screens) {
+                        Ok(()) => {
+                            self.advanced_output_window.set_current_preset(Some(name.clone()));
+                            self.menu_bar.set_status(format!("Saved preset: {}", name));
+                            tracing::info!("Saved output preset: {}", name);
+                        }
+                        Err(e) => {
+                            self.menu_bar.set_status(format!("Failed to save preset: {}", e));
+                            tracing::error!("Failed to save output preset: {}", e);
+                        }
+                    }
+                } else {
+                    self.menu_bar.set_status("No output configuration to save");
+                }
+            }
+            AdvancedOutputAction::DeletePreset { name } => {
+                // Delete a user preset
+                match self.output_preset_manager.delete_preset(&name) {
+                    Ok(()) => {
+                        // If deleted preset was current, clear it
+                        if self.advanced_output_window.current_preset_name.as_deref() == Some(&name) {
+                            self.advanced_output_window.set_current_preset(None);
+                        }
+                        self.menu_bar.set_status(format!("Deleted preset: {}", name));
+                        tracing::info!("Deleted output preset: {}", name);
+                    }
+                    Err(e) => {
+                        self.menu_bar.set_status(format!("Failed to delete preset: {}", e));
+                        tracing::error!("Failed to delete output preset: {}", e);
+                    }
+                }
+            }
+            AdvancedOutputAction::NewConfiguration => {
+                // Create a new configuration with a single virtual screen
+                let screens = vec![crate::output::Screen::new_with_default_slice(
+                    crate::output::ScreenId(1),
+                    "Screen 1",
+                    crate::output::SliceId(1),
+                )];
+                self.apply_output_preset_screens(screens);
+                self.advanced_output_window.set_current_preset(None);
+                self.advanced_output_window.clear_dirty();
+                self.menu_bar.set_status("Created new output configuration");
+                tracing::info!("Created new output configuration");
+            }
+        }
+    }
+
+    /// Apply screens from a preset to the output manager
+    fn apply_output_preset_screens(&mut self, screens: Vec<crate::output::Screen>) {
+        // Ensure output manager exists
+        let _ = self.ensure_output_manager();
+
+        if let Some(manager) = self.output_manager.as_mut() {
+            // Clear existing screens
+            let existing_ids: Vec<_> = manager.screens().map(|s| s.id).collect();
+            for id in existing_ids {
+                manager.remove_screen(id);
+            }
+
+            // Add new screens from preset
+            for screen in screens {
+                manager.add_screen_from_data(&self.device, screen);
+            }
+
+            // Sync all screen runtimes
+            let target_fps = self.settings.target_fps as f32;
+            let tokio_handle = self.tokio_runtime.as_ref().map(|rt| rt.handle());
+            for screen_id in manager.screens().map(|s| s.id).collect::<Vec<_>>() {
+                manager.sync_runtime(&self.device, screen_id, target_fps, tokio_handle);
             }
         }
     }
@@ -6178,6 +6860,73 @@ impl App {
             }
             SourcesAction::StopNdiDiscovery => {
                 self.stop_ndi_discovery();
+            }
+            SourcesAction::SelectSourceForPreview { source } => {
+                self.select_source_for_preview(source);
+            }
+        }
+    }
+
+    /// Select a network source for preview in the Preview Monitor
+    fn select_source_for_preview(&mut self, source: crate::ui::DraggableSource) {
+        use crate::network::SourceType;
+        use crate::ui::{DraggableSource, PreviewSourceInfo};
+
+        // Clear any existing preview mode
+        self.preview_layer_id = None;
+        self.preview_player.clear();
+
+        // Clear existing source preview
+        self.preview_source_receiver = None;
+        self.preview_source_texture = None;
+        self.preview_source_output_texture = None;
+        self.preview_source_output_view = None;
+        self.preview_source_bind_group = None;
+        self.preview_source_params_buffer = None;
+        self.preview_source_has_frame = false;
+
+        // Free old preview texture from egui
+        if let Some(texture_id) = self.preview_player.egui_texture_id.take() {
+            self.egui_renderer.free_texture(&texture_id);
+        }
+
+        match &source {
+            DraggableSource::Ndi { ndi_name, display_name, url_address } => {
+                tracing::info!("Source preview: Connecting to NDI source '{}'", ndi_name);
+
+                // Connect to NDI source
+                match crate::network::NdiReceiver::connect(ndi_name) {
+                    Ok(receiver) => {
+                        self.preview_source_receiver = Some(receiver);
+
+                        // Set preview mode to Source
+                        self.preview_monitor_panel.set_preview_source(PreviewSourceInfo {
+                            source_type: SourceType::Ndi,
+                            name: display_name.clone(),
+                            ndi_name: Some(ndi_name.clone()),
+                            address: url_address.clone(),
+                        });
+                    }
+                    Err(e) => {
+                        tracing::error!("Source preview: Failed to connect to NDI source '{}': {}", ndi_name, e);
+                    }
+                }
+            }
+            DraggableSource::Omt { name, address, .. } => {
+                // OMT receiver not yet implemented
+                tracing::warn!("Source preview: OMT receiver not yet implemented for '{}'", name);
+
+                // Set preview mode to Source anyway to show "Connecting..." state
+                self.preview_monitor_panel.set_preview_source(PreviewSourceInfo {
+                    source_type: SourceType::Omt,
+                    name: name.clone(),
+                    ndi_name: None,
+                    address: Some(address.clone()),
+                });
+            }
+            DraggableSource::File { path: _, name } => {
+                // File sources should use clip preview, not source preview
+                tracing::warn!("Source preview: File source '{}' should use clip preview", name);
             }
         }
     }
@@ -6436,11 +7185,22 @@ impl App {
         let dt = now.duration_since(self.last_frame_time).as_secs_f32();
         self.last_frame_time = now;
 
+        // Update main environment viewport
         if self.viewport.needs_update() {
             let window_size = (self.size.width as f32, self.size.height as f32);
             let env_size = (self.environment.width() as f32, self.environment.height() as f32);
             self.viewport.update(dt, window_size, env_size);
             self.update_present_params();
+        }
+
+        // Update preview monitor viewport
+        if self.preview_monitor_panel.viewport().needs_update() {
+            // Use environment size as content size for preview (layers are environment-sized)
+            let env_size = (self.environment.width() as f32, self.environment.height() as f32);
+            // Preview size is approximate - the actual size depends on the panel layout
+            // Using a reasonable default that matches typical preview panel dimensions
+            let preview_size = (320.0, 180.0);
+            self.preview_monitor_panel.update_viewport(dt, preview_size, env_size);
         }
     }
 

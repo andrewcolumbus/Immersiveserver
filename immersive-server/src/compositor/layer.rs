@@ -14,6 +14,11 @@ use crate::effects::EffectStack;
 
 /// 2D transform for layer positioning within the environment.
 ///
+/// Coordinate system uses center-origin:
+/// - Position (0, 0) = center of environment
+/// - Positive X = right, Positive Y = down
+/// - Negative values allowed (move left/up)
+///
 /// The transform is applied in the following order:
 /// 1. Translate to anchor point
 /// 2. Scale
@@ -21,7 +26,8 @@ use crate::effects::EffectStack;
 /// 4. Translate to final position
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Transform2D {
-    /// Position in pixels relative to environment origin (top-left)
+    /// Position in pixels relative to environment CENTER
+    /// (0, 0) = centered, positive = right/down, negative = left/up
     pub position: (f32, f32),
     /// Scale factors (1.0 = 100%, 2.0 = 200%, etc.)
     pub scale: (f32, f32),
@@ -134,19 +140,9 @@ pub struct Layer {
     /// Transition mode for clips on this layer
     #[serde(default)]
     pub transition: crate::compositor::ClipTransition,
-    /// Horizontal tiling (1 = no repeat, 2 = 2x repeat, etc.)
-    #[serde(default = "default_tile")]
-    pub tile_x: u32,
-    /// Vertical tiling (1 = no repeat, 2 = 2x repeat, etc.)
-    #[serde(default = "default_tile")]
-    pub tile_y: u32,
     /// Effect stack for this layer
     #[serde(default)]
     pub effects: EffectStack,
-}
-
-fn default_tile() -> u32 {
-    1
 }
 
 impl Default for Layer {
@@ -162,8 +158,6 @@ impl Default for Layer {
             clips: Vec::new(),
             active_clip: None,
             transition: crate::compositor::ClipTransition::Cut,
-            tile_x: 1,
-            tile_y: 1,
             effects: EffectStack::default(),
         }
     }
@@ -183,8 +177,6 @@ impl Layer {
             clips: vec![None; DEFAULT_CLIP_SLOTS],
             active_clip: None,
             transition: crate::compositor::ClipTransition::Cut,
-            tile_x: 1,
-            tile_y: 1,
             effects: EffectStack::new(),
         }
     }
@@ -202,16 +194,8 @@ impl Layer {
             clips: vec![None; DEFAULT_CLIP_SLOTS],
             active_clip: None,
             transition: crate::compositor::ClipTransition::Cut,
-            tile_x: 1,
-            tile_y: 1,
             effects: EffectStack::new(),
         }
-    }
-
-    /// Set the layer's tiling
-    pub fn set_tiling(&mut self, tile_x: u32, tile_y: u32) {
-        self.tile_x = tile_x.max(1);
-        self.tile_y = tile_y.max(1);
     }
 
     /// Get the number of clip slots

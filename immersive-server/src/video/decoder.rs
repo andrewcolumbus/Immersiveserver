@@ -91,7 +91,7 @@ pub struct VideoDecoder {
     video_stream_index: usize,
     /// Video decoder
     decoder: ffmpeg_next::decoder::Video,
-    /// Scaler for converting to RGBA
+    /// Scaler for converting to RGBA/BGRA
     scaler: ffmpeg_next::software::scaling::Context,
     /// Video width
     width: u32,
@@ -111,18 +111,26 @@ pub struct VideoDecoder {
     hwaccel: HwAccelMethod,
     /// Codec name (for Hap detection)
     codec_name: String,
+    /// Output pixel format (RGBA or BGRA)
+    output_format: ffmpeg_next::format::Pixel,
 }
 
 impl VideoDecoder {
-    /// Open a video file for decoding with automatic hardware acceleration
+    /// Open a video file for decoding with automatic hardware acceleration (RGBA output)
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, VideoDecoderError> {
-        Self::open_with_options(path, true)
+        Self::open_with_options(path, true, false)
     }
 
-    /// Open a video file with explicit hardware acceleration control
+    /// Open a video file for decoding with BGRA output format
+    pub fn open_bgra<P: AsRef<Path>>(path: P) -> Result<Self, VideoDecoderError> {
+        Self::open_with_options(path, true, true)
+    }
+
+    /// Open a video file with explicit hardware acceleration and pixel format control
     pub fn open_with_options<P: AsRef<Path>>(
         path: P,
         try_hwaccel: bool,
+        use_bgra: bool,
     ) -> Result<Self, VideoDecoderError> {
         // Initialize FFmpeg (safe to call multiple times)
         ffmpeg_next::init()?;
@@ -215,12 +223,19 @@ impl VideoDecoder {
             hwaccel
         );
 
-        // Create scaler to convert to RGBA
+        // Determine output pixel format
+        let output_format = if use_bgra {
+            ffmpeg_next::format::Pixel::BGRA
+        } else {
+            ffmpeg_next::format::Pixel::RGBA
+        };
+
+        // Create scaler to convert to RGBA or BGRA
         let scaler = ffmpeg_next::software::scaling::Context::get(
             decoder.format(),
             width,
             height,
-            ffmpeg_next::format::Pixel::RGBA,
+            output_format,
             width,
             height,
             ffmpeg_next::software::scaling::Flags::BILINEAR,
@@ -241,6 +256,7 @@ impl VideoDecoder {
             eof: false,
             hwaccel,
             codec_name,
+            output_format,
         })
     }
 
@@ -448,7 +464,7 @@ impl VideoDecoder {
                             frame_to_scale.format(),
                             self.width,
                             self.height,
-                            ffmpeg_next::format::Pixel::RGBA,
+                            self.output_format,
                             self.width,
                             self.height,
                             ffmpeg_next::software::scaling::Flags::BILINEAR,
@@ -456,7 +472,7 @@ impl VideoDecoder {
                         .map_err(|e| VideoDecoderError::ScalerCreationFailed(e.to_string()))?;
                     }
 
-                    // Convert to RGBA
+                    // Convert to RGBA/BGRA
                     let mut rgba_frame = ffmpeg_next::frame::Video::empty();
                     self.scaler.run(&frame_to_scale, &mut rgba_frame)?;
 
@@ -642,6 +658,11 @@ impl VideoDecoder {
     /// These codecs store frames in DXT/BC format for direct GPU upload
     pub fn is_gpu_native(&self) -> bool {
         self.is_hap() || self.is_dxv()
+    }
+
+    /// Check if the decoder outputs BGRA format (instead of RGBA)
+    pub fn is_bgra_output(&self) -> bool {
+        self.output_format == ffmpeg_next::format::Pixel::BGRA
     }
 }
 

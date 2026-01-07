@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use crate::compositor::Layer;
 use crate::effects::EffectStack;
-use crate::output::{Screen, ScreenId, SliceId};
+use crate::output::{OutputPresetReference, Screen, ScreenId, SliceId};
 use crate::previs::PrevisSettings;
 
 /// Thumbnail display mode for clip grid cells
@@ -53,6 +53,12 @@ pub struct EnvironmentSettings {
     /// Target frame rate (24-240)
     #[serde(rename = "targetFps")]
     pub target_fps: u32,
+
+    /// Whether VSYNC is enabled (syncs to display refresh rate)
+    /// - true:  Use Fifo present mode, display controls timing
+    /// - false: Use Immediate mode with manual FPS control
+    #[serde(rename = "vsyncEnabled", default)]
+    pub vsync_enabled: bool,
 
     /// Whether to show FPS overlay
     #[serde(rename = "showFps")]
@@ -106,6 +112,11 @@ pub struct EnvironmentSettings {
     #[serde(rename = "ndiCaptureFps", default = "default_ndi_capture_fps")]
     pub ndi_capture_fps: u32,
 
+    /// NDI receive buffer capacity (1-10 frames, default 3)
+    /// Higher values absorb more timing jitter but add latency
+    #[serde(rename = "ndiBufferCapacity", default = "default_ndi_buffer_capacity")]
+    pub ndi_buffer_capacity: usize,
+
     /// Whether Syphon (macOS) / Spout (Windows) texture sharing is enabled
     #[serde(rename = "textureShareEnabled", default)]
     pub texture_share_enabled: bool,
@@ -130,6 +141,10 @@ pub struct EnvironmentSettings {
     #[serde(rename = "screens", default)]
     pub screens: Vec<Screen>,
 
+    /// Output preset reference (name + embedded copy for portability)
+    #[serde(rename = "outputPreset", default)]
+    pub output_preset: Option<OutputPresetReference>,
+
     /// 3D previsualization settings
     #[serde(rename = "previsSettings", default)]
     pub previs_settings: PrevisSettings,
@@ -152,6 +167,13 @@ pub struct EnvironmentSettings {
     /// Whether test pattern mode is enabled (replaces composition with calibration pattern)
     #[serde(rename = "testPatternEnabled", default)]
     pub test_pattern_enabled: bool,
+
+    /// BGRA pipeline mode: Use BGRA format throughout for reduced CPU overhead
+    /// - true:  FFmpeg outputs BGRA, textures use Bgra8UnormSrgb (NDI/OMT native)
+    /// - false: FFmpeg outputs RGBA (default, wider compatibility)
+    /// Requires restart to take effect.
+    #[serde(rename = "bgraPipelineEnabled", default)]
+    pub bgra_pipeline_enabled: bool,
 }
 
 /// Default show BPM setting
@@ -167,6 +189,11 @@ fn default_omt_capture_fps() -> u32 {
 /// Default NDI capture FPS
 fn default_ndi_capture_fps() -> u32 {
     30
+}
+
+/// Default NDI receive buffer capacity (frames)
+fn default_ndi_buffer_capacity() -> usize {
+    3
 }
 
 /// Default number of clip columns
@@ -188,6 +215,7 @@ impl Default for EnvironmentSettings {
     fn default() -> Self {
         Self {
             target_fps: 60,
+            vsync_enabled: false,
             show_fps: true,
             show_bpm: true,
             environment_width: 1920,
@@ -200,17 +228,20 @@ impl Default for EnvironmentSettings {
             omt_capture_fps: default_omt_capture_fps(),
             ndi_broadcast_enabled: false,
             ndi_capture_fps: default_ndi_capture_fps(),
+            ndi_buffer_capacity: default_ndi_buffer_capacity(),
             texture_share_enabled: false,
             api_server_enabled: default_api_enabled(),
             api_port: default_api_port(),
             thumbnail_mode: ThumbnailMode::default(),
             effects: EffectStack::new(),
             screens: vec![Screen::new_with_default_slice(ScreenId(1), "Screen 1", SliceId(1))],
+            output_preset: None,
             previs_settings: PrevisSettings::default(),
             floor_sync_enabled: false,
             floor_layer_index: 0,
             low_latency_mode: false, // Default to stability (2 frames in flight)
             test_pattern_enabled: false,
+            bgra_pipeline_enabled: false, // Default to RGBA for compatibility
         }
     }
 }

@@ -214,48 +214,71 @@ impl PreferencesWindow {
         ui.heading("Frame Rate");
         ui.add_space(4.0);
 
+        // VSYNC checkbox
+        let mut vsync = settings.vsync_enabled;
+        if ui
+            .checkbox(&mut vsync, "VSYNC")
+            .on_hover_text("Sync to display refresh rate (disables manual FPS control)")
+            .changed()
+        {
+            actions.push(PropertiesAction::SetVsyncEnabled { enabled: vsync });
+        }
+
+        ui.add_space(4.0);
+
         // Sync temp_fps from settings if it drifted
         if self.temp_fps != settings.target_fps {
             self.temp_fps = settings.target_fps;
         }
 
-        // FPS slider
-        ui.horizontal(|ui| {
-            ui.label("Target FPS:");
-            let response = ui.add(
-                egui::Slider::new(&mut self.temp_fps, 24..=240)
-                    .suffix(" fps")
-                    .clamping(egui::SliderClamping::Always),
-            );
-            if response.changed() {
-                actions.push(PropertiesAction::SetTargetFPS { fps: self.temp_fps });
-            }
-            response.context_menu(|ui| {
-                if ui.button("Reset to 60 fps").clicked() {
-                    self.temp_fps = 60;
-                    actions.push(PropertiesAction::SetTargetFPS { fps: 60 });
-                    ui.close_menu();
+        // FPS controls (disabled when VSYNC is enabled)
+        ui.add_enabled_ui(!vsync, |ui| {
+            // FPS slider
+            ui.horizontal(|ui| {
+                ui.label("Target FPS:");
+                let response = ui.add(
+                    egui::Slider::new(&mut self.temp_fps, 24..=240)
+                        .suffix(" fps")
+                        .clamping(egui::SliderClamping::Always),
+                );
+                if response.changed() {
+                    actions.push(PropertiesAction::SetTargetFPS { fps: self.temp_fps });
+                }
+                response.context_menu(|ui| {
+                    if ui.button("Reset to 60 fps").clicked() {
+                        self.temp_fps = 60;
+                        actions.push(PropertiesAction::SetTargetFPS { fps: 60 });
+                        ui.close_menu();
+                    }
+                });
+            });
+
+            // FPS presets
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Presets:");
+                for &fps in &[24u32, 30, 60, 120, 144, 240] {
+                    if ui.small_button(format!("{}", fps)).clicked() {
+                        self.temp_fps = fps;
+                        actions.push(PropertiesAction::SetTargetFPS { fps });
+                    }
                 }
             });
         });
 
-        // FPS presets
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Presets:");
-            for &fps in &[24u32, 30, 60, 120, 144, 240] {
-                if ui.small_button(format!("{}", fps)).clicked() {
-                    self.temp_fps = fps;
-                    actions.push(PropertiesAction::SetTargetFPS { fps });
-                }
-            }
-        });
-
         ui.add_space(4.0);
-        ui.label(
-            egui::RichText::new(format!("Targeting {} fps", self.temp_fps))
-                .small()
-                .weak(),
-        );
+        if vsync {
+            ui.label(
+                egui::RichText::new("Synced to display refresh rate")
+                    .small()
+                    .weak(),
+            );
+        } else {
+            ui.label(
+                egui::RichText::new(format!("Targeting {} fps", self.temp_fps))
+                    .small()
+                    .weak(),
+            );
+        }
 
         ui.add_space(8.0);
 
@@ -364,6 +387,18 @@ impl PreferencesWindow {
             actions.push(PropertiesAction::SetLowLatencyMode { enabled: low_latency });
         }
 
+        ui.add_space(8.0);
+
+        // BGRA Pipeline Mode toggle
+        let mut bgra_pipeline = settings.bgra_pipeline_enabled;
+        if ui
+            .checkbox(&mut bgra_pipeline, "BGRA Pipeline Mode")
+            .on_hover_text("Use BGRA format throughout video pipeline. Matches NDI/OMT native format, reduces CPU color conversion. Requires restart.")
+            .changed()
+        {
+            actions.push(PropertiesAction::SetBgraPipelineEnabled { enabled: bgra_pipeline });
+        }
+
         ui.add_space(16.0);
         ui.separator();
 
@@ -417,6 +452,37 @@ impl PreferencesWindow {
                     .color(egui::Color32::from_rgb(100, 149, 237)), // Cornflower blue for NDI
             );
         }
+
+        ui.add_space(16.0);
+        ui.separator();
+
+        // ========== NDI RECEIVE ==========
+        ui.add_space(8.0);
+        ui.heading("NDI Receive");
+        ui.add_space(4.0);
+
+        let mut buffer_capacity = settings.ndi_buffer_capacity as i32;
+        let response = ui.add(
+            egui::Slider::new(&mut buffer_capacity, 1..=10)
+                .text("Buffer Size")
+                .suffix(" frames"),
+        );
+        if response.changed() {
+            actions.push(PropertiesAction::SetNdiBufferCapacity {
+                capacity: buffer_capacity as usize,
+            });
+        }
+        response.context_menu(|ui| {
+            if ui.button("Reset to 3").clicked() {
+                actions.push(PropertiesAction::SetNdiBufferCapacity { capacity: 3 });
+                ui.close_menu();
+            }
+        });
+        ui.label(
+            egui::RichText::new("Higher values reduce drops but add latency")
+                .small()
+                .weak(),
+        );
 
         ui.add_space(16.0);
         ui.separator();
