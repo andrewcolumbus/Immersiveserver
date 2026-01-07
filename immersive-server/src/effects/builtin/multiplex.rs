@@ -1,6 +1,7 @@
 //! Multiplex Effect
 //!
-//! Tiles/repeats the input texture in a grid pattern.
+//! Creates horizontal copies of the video at its exact size.
+//! Copies are centered and spacing pushes them apart.
 
 use crate::effects::traits::{
     CpuEffectRuntime, EffectDefinition, EffectParams, EffectProcessor, GpuEffectRuntime,
@@ -29,10 +30,8 @@ impl EffectDefinition for MultiplexDefinition {
 
     fn default_parameters(&self) -> Vec<Parameter> {
         vec![
-            Parameter::new(ParameterMeta::float_with_step("tile_x", "Tiles X", 2.0, 1.0, 16.0, 1.0)),
-            Parameter::new(ParameterMeta::float_with_step("tile_y", "Tiles Y", 2.0, 1.0, 16.0, 1.0)),
-            Parameter::new(ParameterMeta::float("spacing_x", "Spacing X", 0.0, 0.0, 1.0)),
-            Parameter::new(ParameterMeta::float("spacing_y", "Spacing Y", 0.0, 0.0, 1.0)),
+            Parameter::new(ParameterMeta::float_with_step("copies", "Copies", 2.0, 1.0, 16.0, 1.0)),
+            Parameter::new(ParameterMeta::float("spacing", "Spacing", 0.0, 0.0, 1.0)),
         ]
     }
 
@@ -138,8 +137,7 @@ impl MultiplexRuntime {
         });
 
         // Create uniform buffer for parameters
-        // Layout: time, delta_time, beat_phase, bar_phase, tile_x, tile_y, spacing_x, spacing_y,
-        //         size_scale_x, size_scale_y, _pad, _pad
+        // Layout: time, delta_time, beat_phase, bar_phase, copies, spacing, size_scale_x, size_scale_y, _pad (vec4)
         // Total: 12 floats = 48 bytes
         let params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Multiplex Params Buffer"),
@@ -148,12 +146,12 @@ impl MultiplexRuntime {
             mapped_at_creation: false,
         });
 
-        // Use Repeat address mode for tiling
+        // Use ClampToEdge since we sample specific regions, not tile
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("Multiplex Sampler"),
-            address_mode_u: wgpu::AddressMode::Repeat,
-            address_mode_v: wgpu::AddressMode::Repeat,
-            address_mode_w: wgpu::AddressMode::Repeat,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             mipmap_filter: wgpu::FilterMode::Nearest,
@@ -180,20 +178,17 @@ impl GpuEffectRuntime for MultiplexRuntime {
         queue: &wgpu::Queue,
     ) {
         // Pack parameters into uniform buffer format:
-        // [time, delta_time, beat_phase, bar_phase, tile_x, tile_y, spacing_x, spacing_y,
-        //  size_scale_x, size_scale_y, pad, pad]
+        // [time, delta_time, beat_phase, bar_phase, copies, spacing, size_scale_x, size_scale_y, pad (vec4)]
         let uniform_data: [f32; 12] = [
             params.time,
             params.delta_time,
             params.beat_phase,
             params.bar_phase,
-            params.params[0], // tile_x
-            params.params[1], // tile_y
-            params.params[2], // spacing_x
-            params.params[3], // spacing_y
-            params.params[26], // size_scale_x (from reserved slots)
-            params.params[27], // size_scale_y
-            0.0, 0.0,          // padding
+            params.params[0],  // copies
+            params.params[1],  // spacing
+            params.params[26], // size_scale_x (video_w / env_w)
+            params.params[27], // size_scale_y (video_h / env_h)
+            0.0, 0.0, 0.0, 0.0, // padding (vec4)
         ];
 
         queue.write_buffer(&self.params_buffer, 0, bytemuck::cast_slice(&uniform_data));

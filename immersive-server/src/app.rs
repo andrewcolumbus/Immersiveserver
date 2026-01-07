@@ -3229,11 +3229,13 @@ impl App {
                                         let clip_transform = layer.active_clip
                                             .and_then(|slot| layer.get_clip(slot))
                                             .map(|clip| &clip.transform);
+                                        // Effect output is environment-sized, use 1:1 size_scale
+                                        // This allows effects like multiplex to extend beyond video bounds
                                         let mut composite_params = LayerParams::from_layer_and_clip(
                                             layer,
                                             clip_transform,
-                                            runtime.video_width,
-                                            runtime.video_height,
+                                            self.environment.width(),
+                                            self.environment.height(),
                                             self.environment.width(),
                                             self.environment.height(),
                                         );
