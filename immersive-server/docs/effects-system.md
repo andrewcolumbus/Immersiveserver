@@ -84,12 +84,14 @@ src/effects/
 └── builtin/
     ├── mod.rs          # Registers all built-in effects
     ├── color_correction.rs
-    └── invert.rs
+    ├── invert.rs
+    └── multiplex.rs
 
 src/shaders/effects/
 ├── common.wgsl         # Shared utilities (HSV conversion, etc.)
 ├── color_correction.wgsl
-└── invert.wgsl
+├── invert.wgsl
+└── multiplex.wgsl
 
 src/ui/
 ├── effects_browser_panel.rs  # Effects browser with categories
@@ -263,10 +265,12 @@ Update `src/effects/builtin/mod.rs`:
 ```rust
 mod color_correction;
 mod invert;
+mod multiplex;
 mod your_effect;  // Add this
 
 pub use color_correction::*;
 pub use invert::*;
+pub use multiplex::*;
 pub use your_effect::*;  // Add this
 
 use super::EffectRegistry;
@@ -274,6 +278,7 @@ use super::EffectRegistry;
 pub fn register_builtin_effects(registry: &mut EffectRegistry) {
     registry.register(ColorCorrectionDefinition);
     registry.register(InvertDefinition);
+    registry.register(MultiplexDefinition);
     registry.register(YourEffectDefinition);  // Add this
 }
 ```
@@ -316,6 +321,26 @@ pub fn register_builtin_effects(registry: &mut EffectRegistry) {
 |-----------|------|-------|---------|-------------|
 | amount | Float | 0.0 to 1.0 | 1.0 | Blend with original |
 | invert_alpha | Bool | - | false | Also invert alpha channel |
+
+### Multiplex (GPU)
+
+**Category:** Distort
+
+Creates horizontal copies of the video at its exact size, centered as a group in the environment. Copies can extend beyond environment boundaries.
+
+| Parameter | Type | Range | Default | Description |
+|-----------|------|-------|---------|-------------|
+| copies | Float (step) | 1 to 16 | 2.0 | Number of horizontal copies (1 = pass-through) |
+| spacing | Float | 0.0 to 1.0 | 0.0 | Gap between copies as fraction of video width |
+
+**Behavior:**
+- `copies=1`: Pass-through, video appears unchanged
+- `copies=2, spacing=0`: Two copies touching, centered as a group
+- `spacing=0.5`: Gap between copies is half the video width
+- `spacing=1.0`: Gap between copies equals one full video width
+- Copies extend beyond environment edges if total width exceeds environment
+
+**Use case:** Ultrawide environments where video needs to be tiled horizontally (e.g., 1920×1200 video in 16364×1200 environment).
 
 ---
 
