@@ -21,7 +21,8 @@
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
 
-use super::omt_ffi::{LibOmtReceiver, LibOmtSender};
+use super::omt_ffi::{LibOmtReceiver, LibOmtSender, ReceivedAnyFrame};
+use crate::audio::{push_omt_audio_to_state, AudioSourceState};
 use bytes::Bytes;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -69,10 +70,16 @@ struct OmtReceiverState {
     last_queue_depth: AtomicUsize,
     /// Buffer capacity (configurable).
     buffer_capacity: AtomicUsize,
+    /// Optional audio source state for FFT analysis.
+    audio_state: Option<Arc<AudioSourceState>>,
 }
 
 impl OmtReceiverState {
     fn new() -> Self {
+        Self::with_audio(None)
+    }
+
+    fn with_audio(audio_state: Option<Arc<AudioSourceState>>) -> Self {
         Self {
             frame_buffer: Mutex::new(VecDeque::with_capacity(DEFAULT_OMT_BUFFER_CAPACITY)),
             running: AtomicBool::new(true),
@@ -82,6 +89,7 @@ impl OmtReceiverState {
             last_pickup_latency_us: AtomicU64::new(0),
             last_queue_depth: AtomicUsize::new(0),
             buffer_capacity: AtomicUsize::new(DEFAULT_OMT_BUFFER_CAPACITY),
+            audio_state,
         }
     }
 }
@@ -114,9 +122,20 @@ impl OmtReceiver {
     ///
     /// Spawns a background thread to receive frames.
     pub fn connect(address: &str) -> Result<Self, OmtError> {
-        tracing::info!("📡 OMT Receiver: Connecting to '{}'", address);
+        Self::connect_with_audio(address, None)
+    }
 
-        let state = Arc::new(OmtReceiverState::new());
+    /// Connect to an OMT source with optional audio capture for FFT analysis.
+    ///
+    /// If `audio_state` is provided, audio frames will be captured and pushed
+    /// to the audio ring buffer for FFT analysis.
+    pub fn connect_with_audio(
+        address: &str,
+        audio_state: Option<Arc<AudioSourceState>>,
+    ) -> Result<Self, OmtError> {
+        tracing::info!("📡 OMT Receiver: Connecting to '{}' (audio: {})", address, audio_state.is_some());
+
+        let state = Arc::new(OmtReceiverState::with_audio(audio_state));
         let state_clone = Arc::clone(&state);
         let address_clone = address.to_string();
 
@@ -142,8 +161,9 @@ impl OmtReceiver {
     fn receive_loop(state: Arc<OmtReceiverState>, address: &str) {
         tracing::info!("📡 OMT receiver thread started for '{}'", address);
 
-        // Create libOMT receiver
-        let receiver = match LibOmtReceiver::new(address) {
+        // Create libOMT receiver with audio if we have audio state
+        let enable_audio = state.audio_state.is_some();
+        let receiver = match LibOmtReceiver::new_with_audio(address, enable_audio) {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!("📡 OMT receiver failed to create: {}", e);
@@ -155,51 +175,67 @@ impl OmtReceiver {
 
         // Main receive loop
         while state.running.load(Ordering::Acquire) {
-            // Receive frame with 100ms timeout
-            if let Some(frame_ref) = receiver.receive_frame(100) {
-                // Mark as connected on first frame
-                if !state.connected.swap(true, Ordering::AcqRel) {
-                    tracing::info!(
-                        "📡 OMT receiver connected: {}x{} @ {:.1}fps",
-                        frame_ref.width,
-                        frame_ref.height,
-                        if frame_ref.frame_rate_d > 0 {
-                            frame_ref.frame_rate_n as f64 / frame_ref.frame_rate_d as f64
-                        } else {
-                            60.0
+            // Receive any frame with 100ms timeout
+            if let Some(any_frame) = receiver.receive_any_frame(100) {
+                match any_frame {
+                    ReceivedAnyFrame::Video(frame_ref) => {
+                        // Mark as connected on first frame
+                        if !state.connected.swap(true, Ordering::AcqRel) {
+                            tracing::info!(
+                                "📡 OMT receiver connected: {}x{} @ {:.1}fps",
+                                frame_ref.width,
+                                frame_ref.height,
+                                if frame_ref.frame_rate_d > 0 {
+                                    frame_ref.frame_rate_n as f64 / frame_ref.frame_rate_d as f64
+                                } else {
+                                    60.0
+                                }
+                            );
                         }
-                    );
-                }
 
-                // Copy frame data (must be done before next omt_receive call)
-                let data = unsafe { frame_ref.copy_data() };
+                        // Copy frame data (must be done before next omt_receive call)
+                        let data = unsafe { frame_ref.copy_data() };
 
-                let omt_frame = OmtFrame {
-                    width: frame_ref.width,
-                    height: frame_ref.height,
-                    data: Bytes::from(data),
-                    timestamp: start_time.elapsed(),
-                    frame_rate: if frame_ref.frame_rate_d > 0 {
-                        frame_ref.frame_rate_n as f64 / frame_ref.frame_rate_d as f64
-                    } else {
-                        60.0
-                    },
-                    received_at: Instant::now(),
-                    is_bgra: frame_ref.is_bgra,
-                };
+                        let omt_frame = OmtFrame {
+                            width: frame_ref.width,
+                            height: frame_ref.height,
+                            data: Bytes::from(data),
+                            timestamp: start_time.elapsed(),
+                            frame_rate: if frame_ref.frame_rate_d > 0 {
+                                frame_ref.frame_rate_n as f64 / frame_ref.frame_rate_d as f64
+                            } else {
+                                60.0
+                            },
+                            received_at: Instant::now(),
+                            is_bgra: frame_ref.is_bgra,
+                        };
 
-                // Store in ring buffer
-                if let Ok(mut buffer) = state.frame_buffer.lock() {
-                    let capacity = state.buffer_capacity.load(Ordering::Relaxed);
-                    if buffer.len() >= capacity {
-                        // Drop oldest frame
-                        buffer.pop_front();
-                        state.frames_dropped.fetch_add(1, Ordering::Relaxed);
+                        // Store in ring buffer
+                        if let Ok(mut buffer) = state.frame_buffer.lock() {
+                            let capacity = state.buffer_capacity.load(Ordering::Relaxed);
+                            if buffer.len() >= capacity {
+                                // Drop oldest frame
+                                buffer.pop_front();
+                                state.frames_dropped.fetch_add(1, Ordering::Relaxed);
+                            }
+                            buffer.push_back(omt_frame);
+                        }
+
+                        state.frame_count.fetch_add(1, Ordering::Relaxed);
                     }
-                    buffer.push_back(omt_frame);
+                    ReceivedAnyFrame::Audio(audio_ref) => {
+                        // Push audio to the audio state for FFT analysis
+                        if let Some(ref audio_state) = state.audio_state {
+                            let audio_data = unsafe { audio_ref.copy_data() };
+                            push_omt_audio_to_state(
+                                audio_state,
+                                &audio_data,
+                                audio_ref.sample_rate,
+                                audio_ref.channels,
+                            );
+                        }
+                    }
                 }
-
-                state.frame_count.fetch_add(1, Ordering::Relaxed);
             }
             // Timeout - continue loop (will check running flag)
         }

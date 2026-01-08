@@ -160,6 +160,53 @@ impl SourcesPanel {
         self.ndi_discovery_enabled
     }
 
+    /// Get all discovered sources for use by other UI components
+    pub fn all_discovered_sources(&self) -> Vec<crate::network::discovery::DiscoveredSource> {
+        use crate::network::discovery::{DiscoveredSource, SourceType};
+        use std::collections::HashMap;
+
+        let mut sources = Vec::new();
+
+        // Convert OMT sources
+        for source in &self.omt_sources {
+            if let DraggableSource::Omt { id, name, address } = source {
+                sources.push(DiscoveredSource {
+                    id: id.clone(),
+                    name: name.clone(),
+                    source_type: SourceType::Omt,
+                    host: address.clone(),
+                    port: 0,
+                    properties: HashMap::new(),
+                });
+            }
+        }
+
+        // Convert NDI sources
+        for source in &self.ndi_sources {
+            if let DraggableSource::Ndi {
+                ndi_name,
+                display_name,
+                url_address,
+            } = source
+            {
+                let mut props = HashMap::new();
+                if let Some(addr) = url_address {
+                    props.insert("url_address".to_string(), addr.clone());
+                }
+                sources.push(DiscoveredSource {
+                    id: ndi_name.clone(),
+                    name: display_name.clone(),
+                    source_type: SourceType::Ndi,
+                    host: String::new(),
+                    port: 0,
+                    properties: props,
+                });
+            }
+        }
+
+        sources
+    }
+
     /// Render the sources panel contents
     pub fn render_contents(&mut self, ui: &mut egui::Ui) -> Vec<SourcesAction> {
         let mut actions = Vec::new();

@@ -23,9 +23,10 @@
 //! ```
 
 use super::ndi_ffi::*;
+use crate::audio::{push_ndi_audio_to_state, AudioSourceState};
 use bytes::Bytes;
-use std::ffi::{CStr, CString};
 use std::collections::VecDeque;
+use std::ffi::{CStr, CString};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Once};
 use std::thread::{self, JoinHandle};
@@ -146,10 +147,16 @@ struct NdiReceiverState {
     last_pickup_latency_us: AtomicU64,
     /// Last queue depth when frame was picked up.
     last_queue_depth: AtomicUsize,
+    /// Optional audio source state for FFT analysis.
+    audio_state: Option<Arc<AudioSourceState>>,
 }
 
 impl NdiReceiverState {
     fn new() -> Self {
+        Self::with_audio(None)
+    }
+
+    fn with_audio(audio_state: Option<Arc<AudioSourceState>>) -> Self {
         Self {
             frame_buffer: Mutex::new(VecDeque::with_capacity(get_ndi_buffer_capacity())),
             running: AtomicBool::new(true),
@@ -158,6 +165,7 @@ impl NdiReceiverState {
             frames_overwritten: AtomicU64::new(0),
             last_pickup_latency_us: AtomicU64::new(0),
             last_queue_depth: AtomicUsize::new(0),
+            audio_state,
         }
     }
 }
@@ -190,7 +198,18 @@ impl NdiReceiver {
     /// The `ndi_name` should be in the format "MACHINE_NAME (SOURCE_NAME)"
     /// as returned by NDI discovery.
     pub fn connect(ndi_name: &str) -> Result<Self, NdiError> {
-        let state = Arc::new(NdiReceiverState::new());
+        Self::connect_with_audio(ndi_name, None)
+    }
+
+    /// Connect to an NDI source with optional audio capture for FFT analysis.
+    ///
+    /// If `audio_state` is provided, audio frames will be captured and pushed
+    /// to the audio ring buffer for FFT analysis.
+    pub fn connect_with_audio(
+        ndi_name: &str,
+        audio_state: Option<Arc<AudioSourceState>>,
+    ) -> Result<Self, NdiError> {
+        let state = Arc::new(NdiReceiverState::with_audio(audio_state));
         let source_name = ndi_name.to_string();
 
         let state_clone = Arc::clone(&state);
@@ -254,12 +273,20 @@ impl NdiReceiver {
         // Receive loop
         while state.running.load(Ordering::Acquire) {
             let mut video_frame = NDIlib_video_frame_v2_t::default();
+            let mut audio_frame = NDIlib_audio_frame_v2_t::default();
+
+            // Capture audio if we have an audio state, otherwise pass null
+            let audio_ptr = if state.audio_state.is_some() {
+                &mut audio_frame as *mut _
+            } else {
+                std::ptr::null_mut()
+            };
 
             let frame_type = unsafe {
                 NDIlib_recv_capture_v2(
                     receiver,
                     &mut video_frame,
-                    std::ptr::null_mut(), // No audio
+                    audio_ptr,
                     std::ptr::null_mut(), // No metadata
                     100, // 100ms timeout
                 )
@@ -354,6 +381,33 @@ impl NdiReceiver {
 
                     // Free NDI's buffer
                     unsafe { NDIlib_recv_free_video_v2(receiver, &video_frame) };
+                }
+                NDIlib_frame_type_e::Audio => {
+                    // Process audio frame if we have an audio state
+                    if let Some(ref audio_state) = state.audio_state {
+                        if !audio_frame.p_data.is_null() && audio_frame.no_samples > 0 {
+                            let sample_rate = audio_frame.sample_rate as u32;
+                            let channels = audio_frame.no_channels as u32;
+                            let samples_per_channel = audio_frame.no_samples as usize;
+                            // Channel stride in samples (bytes / 4 for f32)
+                            let channel_stride_samples = if audio_frame.channel_stride_in_bytes > 0 {
+                                audio_frame.channel_stride_in_bytes as usize / 4
+                            } else {
+                                samples_per_channel
+                            };
+
+                            push_ndi_audio_to_state(
+                                audio_state,
+                                audio_frame.p_data,
+                                sample_rate,
+                                channels,
+                                samples_per_channel,
+                                channel_stride_samples,
+                            );
+                        }
+                    }
+                    // Free NDI's audio buffer
+                    unsafe { NDIlib_recv_free_audio_v2(receiver, &audio_frame) };
                 }
                 NDIlib_frame_type_e::Error => {
                     if state.connected.swap(false, Ordering::AcqRel) {

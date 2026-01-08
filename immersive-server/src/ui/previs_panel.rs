@@ -4,6 +4,8 @@
 //! configurable surfaces (circle, walls, dome).
 
 use crate::previs::{PrevisRenderer, PrevisSettings, SurfaceType};
+use crate::ui::{draw_texture, draw_texture_placeholder};
+use egui::PointerButton;
 
 /// Which wall is being modified
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,27 +195,10 @@ impl PrevisPanel {
 
         // Draw the 3D rendered texture or placeholder
         if let Some(tex_id) = self.texture_id {
-            ui.painter().image(
-                tex_id,
-                rect,
-                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                egui::Color32::WHITE,
-            );
+            draw_texture(ui, tex_id, rect);
         } else {
-            // Placeholder if texture not ready
-            ui.painter()
-                .rect_filled(rect, 4.0, egui::Color32::from_gray(30));
-            ui.painter().text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                if settings.enabled {
-                    "3D Preview"
-                } else {
-                    "Preview Disabled"
-                },
-                egui::FontId::default(),
-                egui::Color32::GRAY,
-            );
+            let msg = if settings.enabled { "3D Preview" } else { "Preview Disabled" };
+            draw_texture_placeholder(ui, rect, msg);
         }
 
         // Draw border around viewport
@@ -244,24 +229,20 @@ impl PrevisPanel {
         if response.changed() {
             actions.push(PrevisAction::SetCircleRadius(radius));
         }
-        response.context_menu(|ui| {
-            if ui.button("Reset to 5.0").clicked() {
-                actions.push(PrevisAction::SetCircleRadius(5.0));
-                ui.close_menu();
-            }
-        });
+        // Right-click instantly resets to 5.0
+        if response.clicked_by(PointerButton::Secondary) {
+            actions.push(PrevisAction::SetCircleRadius(5.0));
+        }
 
         let mut segments = settings.circle_segments;
         let response = ui.add(egui::Slider::new(&mut segments, 8..=64).text("Segments"));
         if response.changed() {
             actions.push(PrevisAction::SetCircleSegments(segments));
         }
-        response.context_menu(|ui| {
-            if ui.button("Reset to 32").clicked() {
-                actions.push(PrevisAction::SetCircleSegments(32));
-                ui.close_menu();
-            }
-        });
+        // Right-click instantly resets to 32
+        if response.clicked_by(PointerButton::Secondary) {
+            actions.push(PrevisAction::SetCircleSegments(32));
+        }
     }
 
     fn render_walls_params(
@@ -296,24 +277,20 @@ impl PrevisPanel {
                         if response.changed() {
                             actions.push(PrevisAction::SetWallWidth(wall_id, w));
                         }
-                        response.context_menu(|ui| {
-                            if ui.button("Reset to 4.0").clicked() {
-                                actions.push(PrevisAction::SetWallWidth(wall_id, 4.0));
-                                ui.close_menu();
-                            }
-                        });
+                        // Right-click instantly resets to 4.0
+                        if response.clicked_by(PointerButton::Secondary) {
+                            actions.push(PrevisAction::SetWallWidth(wall_id, 4.0));
+                        }
 
                         let mut h = height;
                         let response = ui.add(egui::Slider::new(&mut h, 1.0..=10.0).text("Height"));
                         if response.changed() {
                             actions.push(PrevisAction::SetWallHeight(wall_id, h));
                         }
-                        response.context_menu(|ui| {
-                            if ui.button("Reset to 3.0").clicked() {
-                                actions.push(PrevisAction::SetWallHeight(wall_id, 3.0));
-                                ui.close_menu();
-                            }
-                        });
+                        // Right-click instantly resets to 3.0
+                        if response.clicked_by(PointerButton::Secondary) {
+                            actions.push(PrevisAction::SetWallHeight(wall_id, 3.0));
+                        }
                     });
                 });
         };
@@ -395,36 +372,30 @@ impl PrevisPanel {
         if response.changed() {
             actions.push(PrevisAction::SetDomeRadius(radius));
         }
-        response.context_menu(|ui| {
-            if ui.button("Reset to 5.0").clicked() {
-                actions.push(PrevisAction::SetDomeRadius(5.0));
-                ui.close_menu();
-            }
-        });
+        // Right-click instantly resets to 5.0
+        if response.clicked_by(PointerButton::Secondary) {
+            actions.push(PrevisAction::SetDomeRadius(5.0));
+        }
 
         let mut h_seg = settings.dome_segments_horizontal;
         let response = ui.add(egui::Slider::new(&mut h_seg, 8..=64).text("H Segments"));
         if response.changed() {
             actions.push(PrevisAction::SetDomeSegmentsH(h_seg));
         }
-        response.context_menu(|ui| {
-            if ui.button("Reset to 32").clicked() {
-                actions.push(PrevisAction::SetDomeSegmentsH(32));
-                ui.close_menu();
-            }
-        });
+        // Right-click instantly resets to 32
+        if response.clicked_by(PointerButton::Secondary) {
+            actions.push(PrevisAction::SetDomeSegmentsH(32));
+        }
 
         let mut v_seg = settings.dome_segments_vertical;
         let response = ui.add(egui::Slider::new(&mut v_seg, 4..=32).text("V Segments"));
         if response.changed() {
             actions.push(PrevisAction::SetDomeSegmentsV(v_seg));
         }
-        response.context_menu(|ui| {
-            if ui.button("Reset to 16").clicked() {
-                actions.push(PrevisAction::SetDomeSegmentsV(16));
-                ui.close_menu();
-            }
-        });
+        // Right-click instantly resets to 16
+        if response.clicked_by(PointerButton::Secondary) {
+            actions.push(PrevisAction::SetDomeSegmentsV(16));
+        }
     }
 
     /// Get the desired viewport size for render target sizing

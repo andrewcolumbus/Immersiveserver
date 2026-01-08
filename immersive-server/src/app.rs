@@ -20,6 +20,7 @@ use crate::layer_runtime::{LayerRuntime, TextureUpdateResult};
 use crate::settings::EnvironmentSettings;
 use crate::ui::MenuBar;
 use crate::ui::viewport_widget::{self, ViewportConfig};
+use crate::ui::{register_egui_texture, register_egui_texture_ptr, free_egui_texture};
 use crate::video::{LayerParams, VideoParams, VideoPlayer, VideoRenderer, VideoTexture};
 
 /// Helper function to render egui pass
@@ -609,11 +610,16 @@ impl App {
                     "Files",
                     crate::ui::DockZone::Left,
                 ));
-                dm.register_panel(crate::ui::DockablePanel::new(
-                    crate::ui::dock::panel_ids::PREVIEW_MONITOR,
-                    "Preview Monitor",
-                    crate::ui::DockZone::Floating,
-                ));
+                dm.register_panel({
+                    let mut panel = crate::ui::DockablePanel::new(
+                        crate::ui::dock::panel_ids::PREVIEW_MONITOR,
+                        "Preview Monitor",
+                        crate::ui::DockZone::Floating,
+                    );
+                    panel.floating_geometry.size = (1000.0, 500.0);
+                    panel.floating_size = Some((1000.0, 500.0));
+                    panel
+                });
                 dm.register_panel(crate::ui::DockablePanel::new(
                     crate::ui::dock::panel_ids::PREVIS,
                     "3D Previs",
@@ -1664,17 +1670,18 @@ impl App {
 
     /// Ensure output manager exists with a default screen and return a mutable reference
     pub fn ensure_output_manager(&mut self) -> &mut crate::output::OutputManager {
+        let env_dims = (self.environment.width(), self.environment.height());
         if self.output_manager.is_none() {
             let format = self.config.format;
             let mut manager = crate::output::OutputManager::new(format);
             // Always create a default screen
-            manager.add_screen(&self.device, "Screen 1");
+            manager.add_screen(&self.device, "Screen 1", env_dims);
             self.output_manager = Some(manager);
         }
         // Ensure there's always at least one screen
         if self.output_manager.as_ref().map(|m| m.screen_count()).unwrap_or(0) == 0 {
             if let Some(manager) = self.output_manager.as_mut() {
-                manager.add_screen(&self.device, "Screen 1");
+                manager.add_screen(&self.device, "Screen 1", env_dims);
             }
         }
         self.output_manager.as_mut().unwrap()
@@ -1918,33 +1925,25 @@ impl App {
                             // 5. Update egui texture to use effect output
                             if let Some(preview_runtime) = self.effect_manager.get_preview_runtime() {
                                 if let Some(output_view) = preview_runtime.output_view(active_effect_count) {
-                                    // Free old texture if exists
-                                    if let Some(old_id) = self.preview_player.egui_texture_id.take() {
-                                        self.egui_renderer.free_texture(&old_id);
-                                    }
-                                    // Register effect output
-                                    let texture_id = self.egui_renderer.register_native_texture(
+                                    register_egui_texture(
+                                        &mut self.egui_renderer,
                                         &self.device,
                                         output_view,
-                                        wgpu::FilterMode::Linear,
+                                        &mut self.preview_player.egui_texture_id,
                                     );
-                                    self.preview_player.egui_texture_id = Some(texture_id);
                                 }
                             }
                         } else {
                             // No active effects - show raw source texture
                             if let Some(view_ptr) = input_view_ptr {
-                                if let Some(old_id) = self.preview_player.egui_texture_id.take() {
-                                    self.egui_renderer.free_texture(&old_id);
-                                }
-                                let texture_id = unsafe {
-                                    self.egui_renderer.register_native_texture(
+                                unsafe {
+                                    register_egui_texture_ptr(
+                                        &mut self.egui_renderer,
                                         &self.device,
-                                        &*view_ptr,
-                                        wgpu::FilterMode::Linear,
-                                    )
-                                };
-                                self.preview_player.egui_texture_id = Some(texture_id);
+                                        view_ptr,
+                                        &mut self.preview_player.egui_texture_id,
+                                    );
+                                }
                             }
                         }
                     }
@@ -2065,15 +2064,12 @@ impl App {
                                 // Register effect output with egui
                                 if let Some(preview_runtime) = self.effect_manager.get_preview_runtime() {
                                     if let Some(output_view) = preview_runtime.output_view(combined_effect_count) {
-                                        if let Some(old_id) = self.preview_player.egui_texture_id.take() {
-                                            self.egui_renderer.free_texture(&old_id);
-                                        }
-                                        let texture_id = self.egui_renderer.register_native_texture(
+                                        register_egui_texture(
+                                            &mut self.egui_renderer,
                                             &self.device,
                                             output_view,
-                                            wgpu::FilterMode::Linear,
+                                            &mut self.preview_player.egui_texture_id,
                                         );
-                                        self.preview_player.egui_texture_id = Some(texture_id);
                                         use_raw_texture = false;
                                     }
                                 }
@@ -2083,17 +2079,14 @@ impl App {
                         // No effects - register raw layer texture
                         if use_raw_texture {
                             let texture_view_ptr = texture.view() as *const wgpu::TextureView;
-                            if let Some(old_id) = self.preview_player.egui_texture_id.take() {
-                                self.egui_renderer.free_texture(&old_id);
-                            }
-                            let texture_id = unsafe {
-                                self.egui_renderer.register_native_texture(
+                            unsafe {
+                                register_egui_texture_ptr(
+                                    &mut self.egui_renderer,
                                     &self.device,
-                                    &*texture_view_ptr,
-                                    wgpu::FilterMode::Linear,
-                                )
-                            };
-                            self.preview_player.egui_texture_id = Some(texture_id);
+                                    texture_view_ptr,
+                                    &mut self.preview_player.egui_texture_id,
+                                );
+                            }
                         }
                     }
                 }
@@ -2107,17 +2100,14 @@ impl App {
         if self.preview_source_has_frame && self.preview_monitor_panel.current_source().is_some() {
             if let Some(output_view) = &self.preview_source_output_view {
                 let output_view_ptr = output_view as *const wgpu::TextureView;
-                if let Some(old_id) = self.preview_player.egui_texture_id.take() {
-                    self.egui_renderer.free_texture(&old_id);
-                }
-                let texture_id = unsafe {
-                    self.egui_renderer.register_native_texture(
+                unsafe {
+                    register_egui_texture_ptr(
+                        &mut self.egui_renderer,
                         &self.device,
-                        &*output_view_ptr,
-                        wgpu::FilterMode::Linear,
-                    )
-                };
-                self.preview_player.egui_texture_id = Some(texture_id);
+                        output_view_ptr,
+                        &mut self.preview_player.egui_texture_id,
+                    );
+                }
             }
         }
 
@@ -2292,6 +2282,7 @@ impl App {
         // Render Preferences window
         let omt_discovery_active = self.omt_discovery.as_ref().map(|d| d.is_running()).unwrap_or(false);
         let ndi_discovery_active = self.sources_panel.is_ndi_discovery_enabled();
+        let discovered_sources = self.sources_panel.all_discovered_sources();
         let pref_actions = self.preferences_window.render(
             &self.egui_ctx,
             &self.environment,
@@ -2302,6 +2293,8 @@ impl App {
             self.api_server_running,
             omt_discovery_active,
             ndi_discovery_active,
+            Some(&self.audio_manager),
+            &discovered_sources,
         );
         for action in pref_actions {
             self.handle_properties_action(action);
@@ -2772,9 +2765,13 @@ impl App {
                     (self.environment.width(), self.environment.height())
                 });
 
-                // Get source dimensions for source preview mode
-                let source_dimensions = self.preview_source_texture.as_ref()
-                    .map(|t| (t.width(), t.height()));
+                // Get source dimensions from receiver (available immediately after first frame)
+                // rather than texture (which may not exist yet)
+                let source_dimensions = self.preview_source_receiver.as_ref()
+                    .and_then(|r| {
+                        let (w, h) = (r.width(), r.height());
+                        if w > 0 && h > 0 { Some((w, h)) } else { None }
+                    });
 
                 let window_response = egui::Window::new("Preview Monitor")
                     .id(egui::Id::new("preview_monitor_window"))
@@ -3448,6 +3445,8 @@ impl App {
         }
 
         // Register Advanced Output textures with egui (if window is open)
+        // NOTE: These registrations happen AFTER the egui pass, so we must NOT free old textures
+        // here - the paint jobs already reference them. Just re-register (egui_wgpu handles this).
         if self.advanced_output_window.open {
             // Register environment texture for Screens tab
             let env_texture_id = self.egui_renderer.register_native_texture(
@@ -3558,6 +3557,7 @@ impl App {
                         );
 
                         // Register the rendered texture with egui for display
+                        // NOTE: This happens after egui pass, so don't free old texture
                         if let Some(texture) = renderer.texture() {
                             let texture_id = self.egui_renderer.register_native_texture(
                                 &self.device,
@@ -6295,9 +6295,7 @@ impl App {
                         });
 
                         // Free old preview texture from egui before loading new one
-                        if let Some(old_texture_id) = self.preview_player.egui_texture_id.take() {
-                            self.egui_renderer.free_texture(&old_texture_id);
-                        }
+                        free_egui_texture(&mut self.egui_renderer, &mut self.preview_player.egui_texture_id);
 
                         // Load the clip into the preview player
                         match &clip.source {
@@ -6307,13 +6305,18 @@ impl App {
                                     self.menu_bar.set_status(format!("Preview failed: {}", e));
                                 } else {
                                     // Register the preview texture with egui for display
-                                    if let Some(texture_view) = self.preview_player.texture_view() {
-                                        let texture_id = self.egui_renderer.register_native_texture(
-                                            &self.device,
-                                            texture_view,
-                                            wgpu::FilterMode::Linear,
-                                        );
-                                        self.preview_player.egui_texture_id = Some(texture_id);
+                                    // Use ptr to avoid borrowing self.preview_player during texture registration
+                                    let texture_view_ptr = self.preview_player.texture_view()
+                                        .map(|v| v as *const wgpu::TextureView);
+                                    if let Some(view_ptr) = texture_view_ptr {
+                                        unsafe {
+                                            register_egui_texture_ptr(
+                                                &mut self.egui_renderer,
+                                                &self.device,
+                                                view_ptr,
+                                                &mut self.preview_player.egui_texture_id,
+                                            );
+                                        }
                                         tracing::info!("Preview texture registered with egui");
                                     }
                                 }
@@ -6372,9 +6375,7 @@ impl App {
                     self.preview_player.clear();
 
                     // Free old preview texture from egui
-                    if let Some(old_texture_id) = self.preview_player.egui_texture_id.take() {
-                        self.egui_renderer.free_texture(&old_texture_id);
-                    }
+                    free_egui_texture(&mut self.egui_renderer, &mut self.preview_player.egui_texture_id);
 
                     // Open preview monitor panel
                     if let Some(p) = self.dock_manager.get_panel_mut(crate::ui::dock::panel_ids::PREVIEW_MONITOR) {
@@ -6860,6 +6861,60 @@ impl App {
                     }
                 }
             }
+            PropertiesAction::SetAudioSource { source_type } => {
+                use crate::settings::AudioSourceType;
+
+                // Update settings
+                self.settings.audio_source = source_type.clone();
+
+                // Clear existing audio sources
+                self.audio_manager.clear_sources();
+
+                // Initialize new audio source based on type
+                match source_type {
+                    AudioSourceType::None => {
+                        tracing::info!("Audio source disabled");
+                        self.menu_bar.set_status("Audio source disabled");
+                    }
+                    AudioSourceType::SystemDefault => {
+                        match self.audio_manager.init_system_audio() {
+                            Ok(()) => {
+                                self.menu_bar.set_status("Audio: System default");
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to init system audio: {}", e);
+                                self.menu_bar.set_status("Audio: Failed to initialize");
+                            }
+                        }
+                    }
+                    AudioSourceType::SystemDevice(ref device_name) => {
+                        match self.audio_manager.init_system_audio_device(Some(device_name)) {
+                            Ok(()) => {
+                                self.menu_bar.set_status(format!("Audio: {}", device_name));
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to init device '{}': {}", device_name, e);
+                                self.menu_bar.set_status("Audio: Device failed");
+                            }
+                        }
+                    }
+                    AudioSourceType::Ndi(ref ndi_name) => {
+                        // For NDI audio, we need to store the audio state and pass it when
+                        // creating NDI receivers. For now, just create the audio source.
+                        let _audio_state = self.audio_manager.add_ndi_source(ndi_name);
+                        // Note: The audio state needs to be passed to NDI receivers when
+                        // they are created/connected. This is stored in the manager.
+                        self.menu_bar.set_status(format!("Audio: NDI {}", ndi_name));
+                        tracing::info!("NDI audio source added: {}", ndi_name);
+                    }
+                    AudioSourceType::Omt(ref address) => {
+                        // For OMT audio, similar to NDI
+                        let _audio_state = self.audio_manager.add_omt_source(address);
+                        self.menu_bar.set_status(format!("Audio: OMT {}", address));
+                        tracing::info!("OMT audio source added: {}", address);
+                    }
+                }
+            }
         }
     }
 
@@ -6875,8 +6930,9 @@ impl App {
                 let screen_num = self.output_manager.as_ref().map(|m| m.screen_count() + 1).unwrap_or(1);
                 let screen_name = format!("Screen {}", screen_num);
                 // Add screen (borrows device and manager separately)
+                let env_dims = (self.environment.width(), self.environment.height());
                 if let Some(manager) = self.output_manager.as_mut() {
-                    let screen_id = manager.add_screen(&self.device, &screen_name);
+                    let screen_id = manager.add_screen(&self.device, &screen_name, env_dims);
                     // Auto-select the newly added screen
                     self.advanced_output_window.select_screen(screen_id, &screen_name, 1920, 1080);
                     self.advanced_output_window.mark_dirty();
@@ -6906,6 +6962,38 @@ impl App {
                     manager.remove_slice(screen_id, slice_id);
                     self.advanced_output_window.mark_dirty();
                     self.menu_bar.set_status("Removed slice");
+                }
+            }
+            AdvancedOutputAction::MoveSliceUp { screen_id, slice_id } => {
+                if let Some(manager) = self.output_manager.as_mut() {
+                    if let Some(screen) = manager.get_screen_mut(screen_id) {
+                        if let Some(idx) = screen.slices.iter().position(|s| s.id == slice_id) {
+                            if idx > 0 {
+                                screen.slices.swap(idx, idx - 1);
+                            }
+                        }
+                    }
+                    self.advanced_output_window.mark_dirty();
+                    // Sync runtime to pick up changes
+                    let target_fps = self.settings.target_fps as f32;
+                    let tokio_handle = self.tokio_runtime.as_ref().map(|rt| rt.handle());
+                    manager.sync_runtime(&self.device, screen_id, target_fps, tokio_handle);
+                }
+            }
+            AdvancedOutputAction::MoveSliceDown { screen_id, slice_id } => {
+                if let Some(manager) = self.output_manager.as_mut() {
+                    if let Some(screen) = manager.get_screen_mut(screen_id) {
+                        if let Some(idx) = screen.slices.iter().position(|s| s.id == slice_id) {
+                            if idx < screen.slices.len() - 1 {
+                                screen.slices.swap(idx, idx + 1);
+                            }
+                        }
+                    }
+                    self.advanced_output_window.mark_dirty();
+                    // Sync runtime to pick up changes
+                    let target_fps = self.settings.target_fps as f32;
+                    let tokio_handle = self.tokio_runtime.as_ref().map(|rt| rt.handle());
+                    manager.sync_runtime(&self.device, screen_id, target_fps, tokio_handle);
                 }
             }
             AdvancedOutputAction::UpdateSlice { screen_id, slice_id, slice } => {
@@ -6946,14 +7034,32 @@ impl App {
                 }
             }
             AdvancedOutputAction::UpdateScreenInputRect { screen_id, input_rect } => {
-                // Update transform rect (output.rect) on all slices of this screen
+                // Update input_rect on all slices of this screen
                 if let Some(manager) = self.output_manager.as_mut() {
                     if let Some(screen) = manager.get_screen_mut(screen_id) {
                         for slice in &mut screen.slices {
-                            slice.output.rect.x = input_rect.x;
-                            slice.output.rect.y = input_rect.y;
-                            slice.output.rect.width = input_rect.width;
-                            slice.output.rect.height = input_rect.height;
+                            slice.input_rect.x = input_rect.x;
+                            slice.input_rect.y = input_rect.y;
+                            slice.input_rect.width = input_rect.width;
+                            slice.input_rect.height = input_rect.height;
+                        }
+                    }
+                    self.advanced_output_window.mark_dirty();
+                    // Sync runtime to pick up changes
+                    let target_fps = self.settings.target_fps as f32;
+                    let tokio_handle = self.tokio_runtime.as_ref().map(|rt| rt.handle());
+                    manager.sync_runtime(&self.device, screen_id, target_fps, tokio_handle);
+                }
+            }
+            AdvancedOutputAction::UpdateSliceInputRect { screen_id, slice_id, input_rect } => {
+                // Update input_rect on a specific slice
+                if let Some(manager) = self.output_manager.as_mut() {
+                    if let Some(screen) = manager.get_screen_mut(screen_id) {
+                        if let Some(slice) = screen.slices.iter_mut().find(|s| s.id == slice_id) {
+                            slice.input_rect.x = input_rect.x;
+                            slice.input_rect.y = input_rect.y;
+                            slice.input_rect.width = input_rect.width;
+                            slice.input_rect.height = input_rect.height;
                         }
                     }
                     self.advanced_output_window.mark_dirty();
@@ -7048,6 +7154,7 @@ impl App {
         // Ensure output manager exists
         let _ = self.ensure_output_manager();
 
+        let env_dims = (self.environment.width(), self.environment.height());
         if let Some(manager) = self.output_manager.as_mut() {
             // Clear existing screens
             let existing_ids: Vec<_> = manager.screens().map(|s| s.id).collect();
@@ -7057,7 +7164,7 @@ impl App {
 
             // Add new screens from preset
             for screen in screens {
-                manager.add_screen_from_data(&self.device, screen);
+                manager.add_screen_from_data(&self.device, screen, env_dims);
             }
 
             // Sync all screen runtimes
@@ -7117,9 +7224,7 @@ impl App {
         self.preview_source_has_frame = false;
 
         // Free old preview texture from egui
-        if let Some(texture_id) = self.preview_player.egui_texture_id.take() {
-            self.egui_renderer.free_texture(&texture_id);
-        }
+        free_egui_texture(&mut self.egui_renderer, &mut self.preview_player.egui_texture_id);
 
         match &source {
             DraggableSource::Ndi { ndi_name, display_name, url_address } => {

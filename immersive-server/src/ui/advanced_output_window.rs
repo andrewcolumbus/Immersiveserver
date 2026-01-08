@@ -3,10 +3,26 @@
 //! A modal window for configuring multi-screen outputs with slice-based input selection.
 //! Accessible via View → Advanced Output.
 
+use std::collections::HashSet;
+
 use crate::compositor::Viewport;
 use crate::output::{DisplayInfo, EdgeBlendConfig, MaskShape, OutputDevice, OutputManager, OutputPresetManager, Point2D as MaskPoint2D, Screen, ScreenId, Slice, SliceId, SliceInput, SliceMask, WarpMesh};
 use crate::output::slice::{Point2D, Rect};
+use egui::PointerButton;
 use super::viewport_widget::{self, ViewportConfig};
+
+/// Color palette for screen/slice visualization - used across all preview modes
+/// Each screen gets a color from this palette (cycling if more than 6 screens)
+fn screen_colors() -> [egui::Color32; 6] {
+    [
+        egui::Color32::from_rgb(100, 149, 237), // Cornflower blue
+        egui::Color32::from_rgb(50, 205, 50),   // Lime green
+        egui::Color32::from_rgb(255, 165, 0),   // Orange
+        egui::Color32::from_rgb(186, 85, 211),  // Medium orchid
+        egui::Color32::from_rgb(255, 99, 71),   // Tomato
+        egui::Color32::from_rgb(64, 224, 208),  // Turquoise
+    ]
+}
 
 /// Tab selection for the Advanced Output window
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -35,6 +51,8 @@ pub enum RectHandle {
 pub struct InputRectDragState {
     /// Which screen is being dragged (if any)
     pub dragging_screen: Option<ScreenId>,
+    /// Which slice is being dragged (if any)
+    pub dragging_slice: Option<SliceId>,
     /// Which handle of the rect is being dragged
     pub dragging_handle: Option<RectHandle>,
     /// Original rect when drag started (for computing delta)
@@ -80,6 +98,16 @@ pub enum AdvancedOutputAction {
         screen_id: ScreenId,
         slice_id: SliceId,
     },
+    /// Move a slice up (earlier in list, lower index)
+    MoveSliceUp {
+        screen_id: ScreenId,
+        slice_id: SliceId,
+    },
+    /// Move a slice down (later in list, higher index)
+    MoveSliceDown {
+        screen_id: ScreenId,
+        slice_id: SliceId,
+    },
     /// Update slice properties
     UpdateSlice {
         screen_id: ScreenId,
@@ -90,6 +118,8 @@ pub enum AdvancedOutputAction {
     UpdateScreen { screen_id: ScreenId, screen: Screen },
     /// Update the input_rect for all slices of a screen (from environment view drag)
     UpdateScreenInputRect { screen_id: ScreenId, input_rect: Rect },
+    /// Update the input_rect for a specific slice (from environment view drag)
+    UpdateSliceInputRect { screen_id: ScreenId, slice_id: SliceId, input_rect: Rect },
     /// Save the composition (triggered when window is closed)
     SaveComposition,
     /// Load an output preset by name
@@ -168,6 +198,8 @@ pub struct AdvancedOutputWindow {
     pending_action: Option<PendingPresetAction>,
     /// Preset name to save (set by dialog, processed outside nested closures)
     save_requested: Option<String>,
+    /// Set of screens that are expanded to show their slices in the Screens tab
+    expanded_screens: HashSet<ScreenId>,
 }
 
 impl Default for AdvancedOutputWindow {
@@ -208,6 +240,7 @@ impl AdvancedOutputWindow {
             save_dialog_name: String::new(),
             pending_action: None,
             save_requested: None,
+            expanded_screens: HashSet::new(),
         }
     }
 
@@ -249,6 +282,67 @@ impl AdvancedOutputWindow {
     /// Check if there are unsaved changes
     pub fn has_unsaved_changes(&self) -> bool {
         self.is_dirty
+    }
+
+    // ========== Shared Slice Visualization Helpers ==========
+
+    /// Get the color for a screen by index (cycles through palette)
+    fn screen_color(screen_idx: usize) -> egui::Color32 {
+        screen_colors()[screen_idx % screen_colors().len()]
+    }
+
+    /// Format a slice label like "1.A", "2.B", etc.
+    fn slice_label(screen_idx: usize, slice_idx: usize) -> String {
+        let slice_char = (b'A' + slice_idx as u8) as char;
+        format!("{}.{}", screen_idx + 1, slice_char)
+    }
+
+    /// Draw a slice rectangle with label overlay
+    /// Used by both Screens tab (input_rect) and Output Transformation tab (output_rect)
+    fn draw_slice_overlay(
+        painter: &egui::Painter,
+        rect: egui::Rect,
+        screen_idx: usize,
+        slice_idx: usize,
+        is_selected: bool,
+        zoom: f32,
+    ) {
+        let base_color = Self::screen_color(screen_idx);
+
+        // Stroke styling based on selection
+        let stroke_width = if is_selected { 3.0 } else { 1.5 };
+        let alpha = if is_selected { 255 } else { 150 };
+        let stroke_color = egui::Color32::from_rgba_unmultiplied(
+            base_color.r(), base_color.g(), base_color.b(), alpha
+        );
+
+        // Draw rectangle outline
+        painter.rect_stroke(
+            rect,
+            2.0,
+            egui::Stroke::new(stroke_width, stroke_color),
+            egui::StrokeKind::Outside,
+        );
+
+        // Draw slice label in center
+        let text_pos = rect.center();
+        let label_text = Self::slice_label(screen_idx, slice_idx);
+        let font_size = (16.0 * zoom).clamp(10.0, 32.0);
+        let font_id = egui::FontId::proportional(font_size);
+
+        // Background pill
+        let galley = painter.layout_no_wrap(label_text.clone(), font_id.clone(), egui::Color32::WHITE);
+        let text_size = galley.size();
+        let padding = egui::vec2(6.0, 3.0);
+        let bg_rect = egui::Rect::from_center_size(text_pos, text_size + padding * 2.0);
+
+        let bg_color = if is_selected {
+            base_color
+        } else {
+            egui::Color32::from_rgba_unmultiplied(base_color.r(), base_color.g(), base_color.b(), 180)
+        };
+        painter.rect_filled(bg_rect, 4.0, bg_color);
+        painter.text(text_pos, egui::Align2::CENTER_CENTER, &label_text, font_id, egui::Color32::WHITE);
     }
 
     /// Render the preset selector bar at the top of the window
@@ -608,6 +702,148 @@ impl AdvancedOutputWindow {
         }
     }
 
+    /// Render the hierarchical screen/slice list with expand/collapse and +/- buttons
+    /// Used by both Screens tab and Output Transformation tab
+    fn render_screen_slice_list(
+        &mut self,
+        ui: &mut egui::Ui,
+        screens: &[&Screen],
+        actions: &mut Vec<AdvancedOutputAction>,
+        id_salt: &str,
+    ) {
+        ui.heading("Screens");
+        ui.add_space(4.0);
+
+        egui::ScrollArea::vertical()
+            .id_salt(format!("{}_screens", id_salt))
+            .max_height(300.0)
+            .show(ui, |ui| {
+                for (index, screen) in screens.iter().enumerate() {
+                    let is_expanded = self.expanded_screens.contains(&screen.id);
+                    let is_screen_selected = self.selected_screen == Some(screen.id)
+                        && self.selected_slice.is_none();
+
+                    // Screen row with expand toggle
+                    ui.horizontal(|ui| {
+                        let arrow = if is_expanded { "▼" } else { "▶" };
+                        if ui.small_button(arrow).clicked() {
+                            if is_expanded {
+                                self.expanded_screens.remove(&screen.id);
+                            } else {
+                                self.expanded_screens.insert(screen.id);
+                            }
+                        }
+
+                        let response = ui.selectable_label(
+                            is_screen_selected,
+                            format!("{}. {} ({}x{})", index + 1, screen.name, screen.width, screen.height),
+                        );
+                        if response.clicked() {
+                            self.selected_screen = Some(screen.id);
+                            self.selected_slice = None;
+                            self.temp_screen_name = screen.name.clone();
+                            self.temp_width = screen.width.to_string();
+                            self.temp_height = screen.height.to_string();
+                        }
+                    });
+
+                    // Show slices if expanded
+                    if is_expanded {
+                        let slice_count = screen.slices.len();
+                        for (slice_idx, slice) in screen.slices.iter().enumerate() {
+                            let is_slice_selected = self.selected_screen == Some(screen.id)
+                                && self.selected_slice == Some(slice.id);
+
+                            ui.indent(format!("{}_{}", id_salt, slice.id.0), |ui| {
+                                ui.horizontal(|ui| {
+                                    // Up/down reorder buttons
+                                    let can_move_up = slice_idx > 0;
+                                    let can_move_down = slice_idx < slice_count - 1;
+
+                                    if ui.add_enabled(can_move_up, egui::Button::new("▲").small())
+                                        .on_hover_text("Move up")
+                                        .clicked()
+                                    {
+                                        actions.push(AdvancedOutputAction::MoveSliceUp {
+                                            screen_id: screen.id,
+                                            slice_id: slice.id,
+                                        });
+                                    }
+                                    if ui.add_enabled(can_move_down, egui::Button::new("▼").small())
+                                        .on_hover_text("Move down")
+                                        .clicked()
+                                    {
+                                        actions.push(AdvancedOutputAction::MoveSliceDown {
+                                            screen_id: screen.id,
+                                            slice_id: slice.id,
+                                        });
+                                    }
+
+                                    // Slice label (selectable)
+                                    let slice_label_text = Self::slice_label(index, slice_idx);
+                                    let label_with_name = format!("{} {}", slice_label_text, slice.name);
+                                    let response = ui.selectable_label(is_slice_selected, label_with_name);
+                                    if response.clicked() {
+                                        self.selected_screen = Some(screen.id);
+                                        self.selected_slice = Some(slice.id);
+                                        self.temp_slice_name = slice.name.clone();
+                                    }
+                                });
+                            });
+                        }
+
+                        // Slice +/- buttons (indented)
+                        ui.indent(format!("{}_slice_btns_{}", id_salt, screen.id.0), |ui| {
+                            ui.horizontal(|ui| {
+                                if ui.small_button("+").on_hover_text("Add slice").clicked() {
+                                    actions.push(AdvancedOutputAction::AddSlice {
+                                        screen_id: screen.id
+                                    });
+                                }
+                                let can_remove = self.selected_screen == Some(screen.id)
+                                    && self.selected_slice.is_some()
+                                    && screen.slices.len() > 1;
+                                if ui
+                                    .add_enabled(can_remove, egui::Button::new("-").small())
+                                    .on_hover_text("Remove selected slice")
+                                    .clicked()
+                                {
+                                    if let Some(slice_id) = self.selected_slice {
+                                        actions.push(AdvancedOutputAction::RemoveSlice {
+                                            screen_id: screen.id,
+                                            slice_id,
+                                        });
+                                        self.selected_slice = None;
+                                    }
+                                }
+                            });
+                        });
+                    }
+                }
+            });
+
+        // Screen +/- buttons
+        ui.horizontal(|ui| {
+            if ui.small_button("+").on_hover_text("Add screen").clicked() {
+                actions.push(AdvancedOutputAction::AddScreen);
+            }
+            if ui
+                .add_enabled(
+                    self.selected_screen.is_some() && screens.len() > 1,
+                    egui::Button::new("-").small(),
+                )
+                .on_hover_text("Remove selected screen")
+                .clicked()
+            {
+                if let Some(screen_id) = self.selected_screen {
+                    actions.push(AdvancedOutputAction::RemoveScreen { screen_id });
+                    self.selected_screen = None;
+                    self.selected_slice = None;
+                }
+            }
+        });
+    }
+
     /// Render the Screens tab with environment preview and input_rect editing
     fn render_screens_tab(
         &mut self,
@@ -623,52 +859,11 @@ impl AdvancedOutputWindow {
             available,
             egui::Layout::left_to_right(egui::Align::TOP),
             |ui| {
-            // LEFT COLUMN: Screens list only (no slices in this tab)
+            // LEFT COLUMN: Screens list with expandable slices
             ui.vertical(|ui| {
                 ui.set_min_width(150.0);
                 ui.set_max_width(180.0);
-
-                ui.heading("Screens");
-                ui.add_space(4.0);
-
-                egui::ScrollArea::vertical()
-                    .id_salt("screens_list_tab")
-                    .max_height(300.0)
-                    .show(ui, |ui| {
-                        for (index, screen) in screens.iter().enumerate() {
-                            let is_selected = self.selected_screen == Some(screen.id);
-                            let response = ui.selectable_label(
-                                is_selected,
-                                format!("{}. {} ({}x{})", index + 1, screen.name, screen.width, screen.height),
-                            );
-                            if response.clicked() {
-                                self.selected_screen = Some(screen.id);
-                                self.selected_slice = None;
-                                self.temp_screen_name = screen.name.clone();
-                                self.temp_width = screen.width.to_string();
-                                self.temp_height = screen.height.to_string();
-                            }
-                        }
-                    });
-
-                ui.horizontal(|ui| {
-                    if ui.small_button("+").clicked() {
-                        actions.push(AdvancedOutputAction::AddScreen);
-                    }
-                    if ui
-                        .add_enabled(
-                            self.selected_screen.is_some() && screens.len() > 1,
-                            egui::Button::new("-").small(),
-                        )
-                        .clicked()
-                    {
-                        if let Some(screen_id) = self.selected_screen {
-                            actions.push(AdvancedOutputAction::RemoveScreen { screen_id });
-                            self.selected_screen = None;
-                            self.selected_slice = None;
-                        }
-                    }
-                });
+                self.render_screen_slice_list(ui, screens, actions, "screens_tab");
             });
 
             ui.separator();
@@ -712,13 +907,47 @@ impl AdvancedOutputWindow {
             ui.heading("Environment");
             ui.add_space(4.0);
 
-            // Calculate preview size using actual environment aspect ratio
+            // DEBUG: Log available space to diagnose window growth
+            let raw_available_width = ui.available_width();
+            let raw_available_height = ui.available_height();
+            let clip_rect = ui.clip_rect();
+            let ctx_screen_rect = ui.ctx().screen_rect();
+            tracing::debug!(
+                "AdvOutput: env={}x{}, available={}x{}, clip={:?}, screen={:?}",
+                env_dimensions.0, env_dimensions.1,
+                raw_available_width, raw_available_height,
+                clip_rect,
+                ctx_screen_rect
+            );
+
+            // Calculate preview size to fit available space while maintaining aspect ratio
             let env_aspect = env_dimensions.0 as f32 / env_dimensions.1 as f32;
-            let available_height = (ui.available_height() - 50.0).max(100.0).min(500.0);
-            let available_width = ui.available_width();
-            // Fit to available space while maintaining aspect ratio
-            let preview_width = (available_height * env_aspect).min(available_width);
-            let preview_height = preview_width / env_aspect;
+
+            // Use the smaller of available_width or a reasonable fraction of screen width
+            // to prevent unbounded growth
+            let screen_based_max = ctx_screen_rect.width() * 0.5; // Max 50% of screen width
+            let max_width = raw_available_width.min(screen_based_max);
+            let max_height = (raw_available_height - 50.0).max(100.0).min(500.0);
+
+            tracing::debug!(
+                "AdvOutput: aspect={:.2}, screen_max={}, max_w={}, max_h={}",
+                env_aspect, screen_based_max, max_width, max_height
+            );
+
+            // Fit to whichever constraint is tighter while maintaining aspect ratio
+            let (preview_width, preview_height) = if max_height * env_aspect <= max_width {
+                // Height is the limiting factor
+                (max_height * env_aspect, max_height)
+            } else {
+                // Width is the limiting factor
+                (max_width, max_width / env_aspect)
+            };
+
+            tracing::debug!(
+                "AdvOutput: final preview={}x{}",
+                preview_width, preview_height
+            );
+
             let preview_size = egui::vec2(preview_width, preview_height);
 
             let (rect, response) = ui.allocate_exact_size(preview_size, egui::Sense::click_and_drag());
@@ -806,74 +1035,48 @@ impl AdvancedOutputWindow {
     ) {
         // Create a clipped painter that only draws within preview_rect
         let painter = ui.painter().with_clip_rect(preview_rect);
-
-        let outline_color = egui::Color32::from_rgb(100, 149, 237); // Cornflower blue
         let zoom = self.env_viewport.zoom();
 
-        for (index, screen) in screens.iter().enumerate() {
-            // Get the input rect for this screen (which part of environment it captures)
-            let transform_rect = screen.slices.first()
-                .map(|s| s.input_rect)
-                .unwrap_or_else(Rect::full);
-
-            // Convert normalized rect to screen coordinates using viewport transform
-            let screen_rect = self.transform_rect_to_screen(
-                &self.env_viewport,
-                &transform_rect,
-                preview_rect,
-                preview_size,
-                content_size,
-            );
-
-            // Skip if completely outside preview area
-            if !screen_rect.intersects(preview_rect) {
-                continue;
-            }
-
-            let is_selected = self.selected_screen == Some(screen.id);
-            let stroke_width = if is_selected { 3.0 } else { 2.0 };
-            let alpha = if is_selected { 255 } else { 180 };
-            let stroke_color = egui::Color32::from_rgba_unmultiplied(
-                outline_color.r(), outline_color.g(), outline_color.b(), alpha
-            );
-
-            // Draw rectangle outline (clipped to preview)
-            painter.rect_stroke(
-                screen_rect,
-                2.0,
-                egui::Stroke::new(stroke_width, stroke_color),
-                egui::StrokeKind::Outside,
-            );
-
-            // Draw screen number in center (circle with number) - scale with zoom
-            let text_pos = screen_rect.center();
-
-            // Only draw label if center is within preview
-            if preview_rect.contains(text_pos) {
-                let number_text = format!("{}", index + 1);
-                let font_size = (20.0 * zoom).clamp(10.0, 40.0);
-                let font_id = egui::FontId::proportional(font_size);
-                let circle_radius = (14.0 * zoom).clamp(8.0, 28.0);
-
-                // Draw background circle
-                let circle_color = if is_selected {
-                    egui::Color32::from_rgb(100, 149, 237)
-                } else {
-                    egui::Color32::from_rgba_unmultiplied(100, 149, 237, 150)
-                };
-                painter.circle_filled(text_pos, circle_radius, circle_color);
-                painter.text(
-                    text_pos,
-                    egui::Align2::CENTER_CENTER,
-                    &number_text,
-                    font_id,
-                    egui::Color32::WHITE,
+        for (screen_idx, screen) in screens.iter().enumerate() {
+            for (slice_idx, slice) in screen.slices.iter().enumerate() {
+                // Convert normalized input_rect to screen coordinates using viewport transform
+                let screen_rect = self.transform_rect_to_screen(
+                    &self.env_viewport,
+                    &slice.input_rect,
+                    preview_rect,
+                    preview_size,
+                    content_size,
                 );
-            }
 
-            // Draw corner/edge handles for selected screen (clipped)
-            if is_selected {
-                self.draw_rect_handles(&painter, screen_rect, zoom);
+                // Skip if completely outside preview area
+                if !screen_rect.intersects(preview_rect) {
+                    continue;
+                }
+
+                let is_selected = self.selected_screen == Some(screen.id)
+                    && self.selected_slice == Some(slice.id);
+
+                // Only draw full overlay (with label) if center is within preview
+                if preview_rect.contains(screen_rect.center()) {
+                    Self::draw_slice_overlay(&painter, screen_rect, screen_idx, slice_idx, is_selected, zoom);
+                } else {
+                    // Just draw rectangle outline if label would be clipped
+                    let base_color = Self::screen_color(screen_idx);
+                    let stroke_width = if is_selected { 3.0 } else { 1.5 };
+                    let alpha = if is_selected { 255 } else { 150 };
+                    painter.rect_stroke(
+                        screen_rect,
+                        2.0,
+                        egui::Stroke::new(stroke_width,
+                            egui::Color32::from_rgba_unmultiplied(base_color.r(), base_color.g(), base_color.b(), alpha)),
+                        egui::StrokeKind::Outside,
+                    );
+                }
+
+                // Draw corner/edge handles for selected slice
+                if is_selected {
+                    self.draw_rect_handles(&painter, screen_rect, zoom);
+                }
             }
         }
     }
@@ -1159,23 +1362,42 @@ impl AdvancedOutputWindow {
             return;
         }
 
-        // Helper to find screen at position (using viewport transform)
-        let find_screen_at = |this: &Self, pos: egui::Pos2| -> Option<(ScreenId, Rect, egui::Rect)> {
+        // Helper to find slice at position (using viewport transform)
+        // Returns (screen_id, slice_id, input_rect, screen_rect)
+        // Iterates in reverse so topmost (last drawn) wins on overlap
+        let find_slice_at = |this: &Self, pos: egui::Pos2| -> Option<(ScreenId, SliceId, Rect, egui::Rect)> {
             for screen in screens.iter().rev() {
-                let transform_rect = screen.slices.first()
-                    .map(|s| s.input_rect)
-                    .unwrap_or_else(Rect::full);
+                for slice in screen.slices.iter().rev() {
+                    let screen_rect = this.transform_rect_to_screen(
+                        &this.env_viewport,
+                        &slice.input_rect,
+                        preview_rect,
+                        preview_size,
+                        content_size,
+                    );
 
-                let screen_rect = this.transform_rect_to_screen(
-                    &this.env_viewport,
-                    &transform_rect,
-                    preview_rect,
-                    preview_size,
-                    content_size,
-                );
+                    if screen_rect.contains(pos) {
+                        return Some((screen.id, slice.id, slice.input_rect, screen_rect));
+                    }
+                }
+            }
+            None
+        };
 
-                if screen_rect.contains(pos) {
-                    return Some((screen.id, transform_rect, screen_rect));
+        // Get the currently selected slice's rect for handle detection
+        let get_selected_slice_rect = |this: &Self| -> Option<(Rect, egui::Rect)> {
+            if let (Some(screen_id), Some(slice_id)) = (this.selected_screen, this.selected_slice) {
+                if let Some(screen) = screens.iter().find(|s| s.id == screen_id) {
+                    if let Some(slice) = screen.slices.iter().find(|sl| sl.id == slice_id) {
+                        let screen_rect = this.transform_rect_to_screen(
+                            &this.env_viewport,
+                            &slice.input_rect,
+                            preview_rect,
+                            preview_size,
+                            content_size,
+                        );
+                        return Some((slice.input_rect, screen_rect));
+                    }
                 }
             }
             None
@@ -1198,51 +1420,37 @@ impl AdvancedOutputWindow {
                 }
             }
 
-            // Check hover over selected screen's handles
+            // Check hover over selected slice's handles
             if !cursor_set {
-                if let Some(screen_id) = self.selected_screen {
-                    if let Some(screen) = screens.iter().find(|s| s.id == screen_id) {
-                        let transform_rect = screen.slices.first()
-                            .map(|s| Rect {
-                                x: s.output.rect.x,
-                                y: s.output.rect.y,
-                                width: s.output.rect.width,
-                                height: s.output.rect.height,
-                            })
-                            .unwrap_or_else(Rect::full);
-
-                        let screen_rect = self.transform_rect_to_screen(
-                            &self.env_viewport,
-                            &transform_rect,
-                            preview_rect,
-                            preview_size,
-                            content_size,
-                        );
-
-                        if let Some(handle) = self.hit_test_rect_handle(pointer_pos, screen_rect) {
-                            ui.ctx().set_cursor_icon(Self::cursor_for_handle(handle));
-                            cursor_set = true;
-                        }
+                if let Some((_, screen_rect)) = get_selected_slice_rect(self) {
+                    if let Some(handle) = self.hit_test_rect_handle(pointer_pos, screen_rect) {
+                        ui.ctx().set_cursor_icon(Self::cursor_for_handle(handle));
+                        cursor_set = true;
                     }
                 }
             }
 
-            // Check hover over any screen (for potential selection)
+            // Check hover over any slice (for potential selection)
             if !cursor_set {
-                if find_screen_at(self, pointer_pos).is_some() {
+                if find_slice_at(self, pointer_pos).is_some() {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                 }
             }
         }
 
         // Handle click to select (fires on mouse release without drag)
-        // Skip if we're in an active drag to prevent focus switch when dragging over other screens
+        // Skip if we're in an active drag to prevent focus switch when dragging over other slices
         if response.clicked() && self.input_rect_drag.dragging_screen.is_none() {
             if let Some(pointer_pos) = response.interact_pointer_pos() {
-                if let Some((screen_id, _, _)) = find_screen_at(self, pointer_pos) {
+                if let Some((screen_id, slice_id, _, _)) = find_slice_at(self, pointer_pos) {
                     self.selected_screen = Some(screen_id);
-                    self.selected_slice = None;
+                    self.selected_slice = Some(slice_id);
+                    // Expand the screen to show slices
+                    self.expanded_screens.insert(screen_id);
                     if let Some(screen) = screens.iter().find(|s| s.id == screen_id) {
+                        if let Some(slice) = screen.slices.iter().find(|sl| sl.id == slice_id) {
+                            self.temp_slice_name = slice.name.clone();
+                        }
                         self.temp_screen_name = screen.name.clone();
                         self.temp_width = screen.width.to_string();
                         self.temp_height = screen.height.to_string();
@@ -1251,22 +1459,26 @@ impl AdvancedOutputWindow {
             }
         }
 
-        // Handle drag start - also select the screen if clicking on one
+        // Handle drag start - also select the slice if clicking on one
         // Only for left-click drags (primary button)
         if response.drag_started_by(egui::PointerButton::Primary) {
             if let Some(pointer_pos) = response.interact_pointer_pos() {
-                // First, try to find a screen under the pointer
-                if let Some((screen_id, transform_rect, screen_rect)) = find_screen_at(self, pointer_pos) {
-                    // Select this screen
+                // First, try to find a slice under the pointer
+                if let Some((screen_id, slice_id, input_rect, screen_rect)) = find_slice_at(self, pointer_pos) {
+                    // Select this slice
                     self.selected_screen = Some(screen_id);
-                    self.selected_slice = None;
+                    self.selected_slice = Some(slice_id);
+                    self.expanded_screens.insert(screen_id);
                     if let Some(screen) = screens.iter().find(|s| s.id == screen_id) {
+                        if let Some(slice) = screen.slices.iter().find(|sl| sl.id == slice_id) {
+                            self.temp_slice_name = slice.name.clone();
+                        }
                         self.temp_screen_name = screen.name.clone();
                         self.temp_width = screen.width.to_string();
                         self.temp_height = screen.height.to_string();
                     }
 
-                    // Check if we're on a handle of this screen
+                    // Check if we're on a handle of this slice
                     if let Some(handle) = self.hit_test_rect_handle(pointer_pos, screen_rect) {
                         // Store starting position (normalized, using viewport inverse transform)
                         let (start_norm_x, start_norm_y) = self.transform_point_from_screen(
@@ -1279,48 +1491,31 @@ impl AdvancedOutputWindow {
 
                         self.input_rect_drag = InputRectDragState {
                             dragging_screen: Some(screen_id),
+                            dragging_slice: Some(slice_id),
                             dragging_handle: Some(handle),
-                            original_rect: Some(transform_rect),
+                            original_rect: Some(input_rect),
                             start_pos: Some([start_norm_x, start_norm_y]),
                         };
                     }
-                } else if let Some(screen_id) = self.selected_screen {
-                    // No screen under pointer, but we have a selected screen
+                } else if let Some((input_rect, screen_rect)) = get_selected_slice_rect(self) {
+                    // No slice under pointer, but we have a selected slice
                     // Check if we're on its handles
-                    if let Some(screen) = screens.iter().find(|s| s.id == screen_id) {
-                        let transform_rect = screen.slices.first()
-                            .map(|s| Rect {
-                                x: s.output.rect.x,
-                                y: s.output.rect.y,
-                                width: s.output.rect.width,
-                                height: s.output.rect.height,
-                            })
-                            .unwrap_or_else(Rect::full);
-
-                        let screen_rect = self.transform_rect_to_screen(
+                    if let Some(handle) = self.hit_test_rect_handle(pointer_pos, screen_rect) {
+                        let (start_norm_x, start_norm_y) = self.transform_point_from_screen(
                             &self.env_viewport,
-                            &transform_rect,
+                            pointer_pos,
                             preview_rect,
                             preview_size,
                             content_size,
                         );
 
-                        if let Some(handle) = self.hit_test_rect_handle(pointer_pos, screen_rect) {
-                            let (start_norm_x, start_norm_y) = self.transform_point_from_screen(
-                                &self.env_viewport,
-                                pointer_pos,
-                                preview_rect,
-                                preview_size,
-                                content_size,
-                            );
-
-                            self.input_rect_drag = InputRectDragState {
-                                dragging_screen: Some(screen_id),
-                                dragging_handle: Some(handle),
-                                original_rect: Some(transform_rect),
-                                start_pos: Some([start_norm_x, start_norm_y]),
-                            };
-                        }
+                        self.input_rect_drag = InputRectDragState {
+                            dragging_screen: self.selected_screen,
+                            dragging_slice: self.selected_slice,
+                            dragging_handle: Some(handle),
+                            original_rect: Some(input_rect),
+                            start_pos: Some([start_norm_x, start_norm_y]),
+                        };
                     }
                 }
             }
@@ -1328,7 +1523,7 @@ impl AdvancedOutputWindow {
 
         // Handle drag (left-click only)
         if response.dragged_by(egui::PointerButton::Primary) {
-            if let Some(screen_id) = self.input_rect_drag.dragging_screen {
+            if let (Some(screen_id), Some(slice_id)) = (self.input_rect_drag.dragging_screen, self.input_rect_drag.dragging_slice) {
                 if let Some(handle) = self.input_rect_drag.dragging_handle {
                     if let Some(original_rect) = self.input_rect_drag.original_rect {
                         if let Some(start_pos) = self.input_rect_drag.start_pos {
@@ -1344,8 +1539,9 @@ impl AdvancedOutputWindow {
                                     false, // use env_viewport
                                 );
 
-                                actions.push(AdvancedOutputAction::UpdateScreenInputRect {
+                                actions.push(AdvancedOutputAction::UpdateSliceInputRect {
                                     screen_id,
+                                    slice_id,
                                     input_rect: new_rect,
                                 });
                             }
@@ -1360,34 +1556,17 @@ impl AdvancedOutputWindow {
             self.input_rect_drag = InputRectDragState::default();
         }
 
-        // Handle right-click to reset screen input_rect to full
+        // Handle right-click to reset slice input_rect to full
         if response.clicked_by(egui::PointerButton::Secondary) {
             if let Some(pointer_pos) = response.interact_pointer_pos() {
-                // Check each screen's handles
-                for screen in screens.iter() {
-                    let transform_rect = screen.slices.first()
-                        .map(|s| Rect {
-                            x: s.output.rect.x,
-                            y: s.output.rect.y,
-                            width: s.output.rect.width,
-                            height: s.output.rect.height,
-                        })
-                        .unwrap_or_else(Rect::full);
-
-                    let screen_rect = self.transform_rect_to_screen(
-                        &self.env_viewport,
-                        &transform_rect,
-                        preview_rect,
-                        preview_size,
-                        content_size,
-                    );
-
+                // Check if clicking on a slice
+                if let Some((screen_id, slice_id, _, screen_rect)) = find_slice_at(self, pointer_pos) {
                     if self.hit_test_rect_handle(pointer_pos, screen_rect).is_some() {
-                        actions.push(AdvancedOutputAction::UpdateScreenInputRect {
-                            screen_id: screen.id,
+                        actions.push(AdvancedOutputAction::UpdateSliceInputRect {
+                            screen_id,
+                            slice_id,
                             input_rect: Rect::full(),
                         });
-                        break;
                     }
                 }
             }
@@ -1818,14 +1997,9 @@ impl AdvancedOutputWindow {
         });
         ui.add_space(4.0);
 
-        // Show current transform rect (from first slice's output.rect), converted to pixels
+        // Show current input_rect (which part of environment to capture), converted to pixels
         let transform_rect = screen.slices.first()
-            .map(|s| Rect {
-                x: s.output.rect.x,
-                y: s.output.rect.y,
-                width: s.output.rect.width,
-                height: s.output.rect.height,
-            })
+            .map(|s| s.input_rect)
             .unwrap_or_else(Rect::full);
 
         // Convert normalized values to pixels for display (allow negative for overscan)
@@ -1903,13 +2077,11 @@ impl AdvancedOutputWindow {
                 screen_copy.delay_ms = delay_val.max(0) as u32;
                 changed = true;
             }
-            response.context_menu(|ui| {
-                if ui.button("Reset to 0").clicked() {
-                    screen_copy.delay_ms = 0;
-                    changed = true;
-                    ui.close_menu();
-                }
-            });
+            // Right-click instantly resets to 0
+            if response.clicked_by(PointerButton::Secondary) {
+                screen_copy.delay_ms = 0;
+                changed = true;
+            }
 
             // Show frame count at 60fps as reference
             let frames_at_60 = (screen_copy.delay_ms as f32 * 60.0 / 1000.0).round() as u32;
@@ -1946,13 +2118,11 @@ impl AdvancedOutputWindow {
             if response.changed() {
                 changed = true;
             }
-            response.context_menu(|ui| {
-                if ui.button("Reset to 0").clicked() {
-                    screen_copy.color.brightness = 0.0;
-                    changed = true;
-                    ui.close_menu();
-                }
-            });
+            // Right-click instantly resets to 0
+            if response.clicked_by(PointerButton::Secondary) {
+                screen_copy.color.brightness = 0.0;
+                changed = true;
+            }
         });
 
         // Contrast slider
@@ -1962,13 +2132,11 @@ impl AdvancedOutputWindow {
             if response.changed() {
                 changed = true;
             }
-            response.context_menu(|ui| {
-                if ui.button("Reset to 1").clicked() {
-                    screen_copy.color.contrast = 1.0;
-                    changed = true;
-                    ui.close_menu();
-                }
-            });
+            // Right-click instantly resets to 1
+            if response.clicked_by(PointerButton::Secondary) {
+                screen_copy.color.contrast = 1.0;
+                changed = true;
+            }
         });
 
         // Gamma slider
@@ -1978,13 +2146,11 @@ impl AdvancedOutputWindow {
             if response.changed() {
                 changed = true;
             }
-            response.context_menu(|ui| {
-                if ui.button("Reset to 1").clicked() {
-                    screen_copy.color.gamma = 1.0;
-                    changed = true;
-                    ui.close_menu();
-                }
-            });
+            // Right-click instantly resets to 1
+            if response.clicked_by(PointerButton::Secondary) {
+                screen_copy.color.gamma = 1.0;
+                changed = true;
+            }
         });
 
         // Saturation slider
@@ -1994,13 +2160,11 @@ impl AdvancedOutputWindow {
             if response.changed() {
                 changed = true;
             }
-            response.context_menu(|ui| {
-                if ui.button("Reset to 1").clicked() {
-                    screen_copy.color.saturation = 1.0;
-                    changed = true;
-                    ui.close_menu();
-                }
-            });
+            // Right-click instantly resets to 1
+            if response.clicked_by(PointerButton::Secondary) {
+                screen_copy.color.saturation = 1.0;
+                changed = true;
+            }
         });
 
         // RGB Channels (collapsing section)
@@ -2011,13 +2175,11 @@ impl AdvancedOutputWindow {
                 if response.changed() {
                     changed = true;
                 }
-                response.context_menu(|ui| {
-                    if ui.button("Reset to 1").clicked() {
-                        screen_copy.color.red = 1.0;
-                        changed = true;
-                        ui.close_menu();
-                    }
-                });
+                // Right-click instantly resets to 1
+                if response.clicked_by(PointerButton::Secondary) {
+                    screen_copy.color.red = 1.0;
+                    changed = true;
+                }
             });
             ui.horizontal(|ui| {
                 ui.label("Green:");
@@ -2025,13 +2187,11 @@ impl AdvancedOutputWindow {
                 if response.changed() {
                     changed = true;
                 }
-                response.context_menu(|ui| {
-                    if ui.button("Reset to 1").clicked() {
-                        screen_copy.color.green = 1.0;
-                        changed = true;
-                        ui.close_menu();
-                    }
-                });
+                // Right-click instantly resets to 1
+                if response.clicked_by(PointerButton::Secondary) {
+                    screen_copy.color.green = 1.0;
+                    changed = true;
+                }
             });
             ui.horizontal(|ui| {
                 ui.label("Blue:");
@@ -2039,13 +2199,11 @@ impl AdvancedOutputWindow {
                 if response.changed() {
                     changed = true;
                 }
-                response.context_menu(|ui| {
-                    if ui.button("Reset to 1").clicked() {
-                        screen_copy.color.blue = 1.0;
-                        changed = true;
-                        ui.close_menu();
-                    }
-                });
+                // Right-click instantly resets to 1
+                if response.clicked_by(PointerButton::Secondary) {
+                    screen_copy.color.blue = 1.0;
+                    changed = true;
+                }
             });
         });
 
@@ -2191,16 +2349,14 @@ impl AdvancedOutputWindow {
                         edge.bottom.gamma = gamma;
                         blend_changed = true;
                     }
-                    response.context_menu(|ui| {
-                        if ui.button("Reset to 2.2").clicked() {
-                            edge.left.gamma = 2.2;
-                            edge.right.gamma = 2.2;
-                            edge.top.gamma = 2.2;
-                            edge.bottom.gamma = 2.2;
-                            blend_changed = true;
-                            ui.close_menu();
-                        }
-                    });
+                    // Right-click instantly resets to 2.2
+                    if response.clicked_by(PointerButton::Secondary) {
+                        edge.left.gamma = 2.2;
+                        edge.right.gamma = 2.2;
+                        edge.top.gamma = 2.2;
+                        edge.bottom.gamma = 2.2;
+                        blend_changed = true;
+                    }
                 });
 
                 // Luminance slider
@@ -2214,16 +2370,14 @@ impl AdvancedOutputWindow {
                         edge.bottom.black_level = luminance;
                         blend_changed = true;
                     }
-                    response.context_menu(|ui| {
-                        if ui.button("Reset to 0").clicked() {
-                            edge.left.black_level = 0.0;
-                            edge.right.black_level = 0.0;
-                            edge.top.black_level = 0.0;
-                            edge.bottom.black_level = 0.0;
-                            blend_changed = true;
-                            ui.close_menu();
-                        }
-                    });
+                    // Right-click instantly resets to 0
+                    if response.clicked_by(PointerButton::Secondary) {
+                        edge.left.black_level = 0.0;
+                        edge.right.black_level = 0.0;
+                        edge.top.black_level = 0.0;
+                        edge.bottom.black_level = 0.0;
+                        blend_changed = true;
+                    }
                 });
 
                 // Power slider (blend width)
@@ -2237,16 +2391,14 @@ impl AdvancedOutputWindow {
                         edge.bottom.width = power;
                         blend_changed = true;
                     }
-                    response.context_menu(|ui| {
-                        if ui.button("Reset to 0.15").clicked() {
-                            edge.left.width = 0.15;
-                            edge.right.width = 0.15;
-                            edge.top.width = 0.15;
-                            edge.bottom.width = 0.15;
-                            blend_changed = true;
-                            ui.close_menu();
-                        }
-                    });
+                    // Right-click instantly resets to 0.15
+                    if response.clicked_by(PointerButton::Secondary) {
+                        edge.left.width = 0.15;
+                        edge.right.width = 0.15;
+                        edge.top.width = 0.15;
+                        edge.bottom.width = 0.15;
+                        blend_changed = true;
+                    }
                 });
             }
 
@@ -2293,118 +2445,11 @@ impl AdvancedOutputWindow {
             available,
             egui::Layout::left_to_right(egui::Align::TOP),
             |ui| {
-            // LEFT COLUMN: Screens and Slices list
+            // LEFT COLUMN: Screens and Slices list (hierarchical)
             ui.vertical(|ui| {
                 ui.set_min_width(150.0);
                 ui.set_max_width(180.0);
-
-                // Screens section
-                ui.heading("Screens");
-                ui.add_space(4.0);
-
-                egui::ScrollArea::vertical()
-                    .id_salt("screens_list")
-                    .max_height(200.0)
-                    .show(ui, |ui| {
-                        for screen in screens {
-                            let is_selected = self.selected_screen == Some(screen.id);
-                            let response = ui.selectable_label(
-                                is_selected,
-                                format!(
-                                    "{} ({}x{})",
-                                    screen.name, screen.width, screen.height
-                                ),
-                            );
-                            if response.clicked() {
-                                self.selected_screen = Some(screen.id);
-                                self.selected_slice = None;
-                                self.temp_screen_name = screen.name.clone();
-                                self.temp_width = screen.width.to_string();
-                                self.temp_height = screen.height.to_string();
-                            }
-                        }
-                    });
-
-                ui.horizontal(|ui| {
-                    if ui.small_button("+").clicked() {
-                        actions.push(AdvancedOutputAction::AddScreen);
-                    }
-                    if ui
-                        .add_enabled(
-                            self.selected_screen.is_some() && screens.len() > 1,
-                            egui::Button::new("-").small(),
-                        )
-                        .clicked()
-                    {
-                        if let Some(screen_id) = self.selected_screen {
-                            actions.push(AdvancedOutputAction::RemoveScreen { screen_id });
-                            self.selected_screen = None;
-                            self.selected_slice = None;
-                        }
-                    }
-                });
-
-                ui.add_space(16.0);
-                ui.separator();
-                ui.add_space(8.0);
-
-                // Slices section (for selected screen)
-                ui.heading("Slices");
-                ui.add_space(4.0);
-
-                if let Some(screen_id) = self.selected_screen {
-                    if let Some(screen) = screens.iter().find(|s| s.id == screen_id) {
-                        egui::ScrollArea::vertical()
-                            .id_salt("slices_list")
-                            .max_height(200.0)
-                            .show(ui, |ui| {
-                                for slice in &screen.slices {
-                                    let is_selected = self.selected_slice == Some(slice.id);
-                                    let input_label = match &slice.input {
-                                        SliceInput::Composition => "Comp".to_string(),
-                                        SliceInput::Layer { layer_id } => {
-                                            format!("L{}", layer_id)
-                                        }
-                                    };
-                                    let response = ui.selectable_label(
-                                        is_selected,
-                                        format!("{} [{}]", slice.name, input_label),
-                                    );
-                                    if response.clicked() {
-                                        self.selected_slice = Some(slice.id);
-                                        self.temp_slice_name = slice.name.clone();
-                                    }
-                                }
-                            });
-
-                        ui.horizontal(|ui| {
-                            if ui.small_button("+").clicked() {
-                                actions.push(AdvancedOutputAction::AddSlice { screen_id });
-                            }
-                            if ui
-                                .add_enabled(
-                                    self.selected_slice.is_some(),
-                                    egui::Button::new("-").small(),
-                                )
-                                .clicked()
-                            {
-                                if let Some(slice_id) = self.selected_slice {
-                                    actions.push(AdvancedOutputAction::RemoveSlice {
-                                        screen_id,
-                                        slice_id,
-                                    });
-                                    self.selected_slice = None;
-                                }
-                            }
-                        });
-                    }
-                } else {
-                    ui.label(
-                        egui::RichText::new("Select a screen")
-                            .weak()
-                            .italics(),
-                    );
-                }
+                self.render_screen_slice_list(ui, screens, actions, "output_tab");
             });
 
             ui.separator();
@@ -2531,12 +2576,15 @@ impl AdvancedOutputWindow {
                             );
                         }
 
-                        // Draw slice rectangles overlay (semi-transparent outlines)
-                        // Convert slice output.rect to Rect type for transform
-                        for slice in &screen.slices {
+                        // Draw slice rectangles overlay with labels (using shared visualization)
+                        // Find screen index for color assignment
+                        let screen_idx = screens.iter().position(|s| s.id == screen.id).unwrap_or(0);
+                        let zoom = self.output_viewport.zoom();
+
+                        for (slice_idx, slice) in screen.slices.iter().enumerate() {
                             if slice.enabled {
-                                // Convert slice.output.rect (Point2D-based Rect) to our Rect for transform
-                                let slice_input_rect = Rect {
+                                // Convert slice.output.rect to our Rect for transform
+                                let slice_output_rect = Rect {
                                     x: slice.output.rect.x,
                                     y: slice.output.rect.y,
                                     width: slice.output.rect.width,
@@ -2544,32 +2592,19 @@ impl AdvancedOutputWindow {
                                 };
                                 let slice_rect = self.transform_rect_to_screen(
                                     &self.output_viewport,
-                                    &slice_input_rect,
+                                    &slice_output_rect,
                                     rect,
                                     preview_size,
                                     output_content_size,
                                 );
 
                                 let is_selected = self.selected_slice == Some(slice.id);
-                                let stroke_color = if is_selected {
-                                    egui::Color32::from_rgb(100, 149, 237) // Cornflower blue
-                                } else {
-                                    egui::Color32::from_rgba_unmultiplied(120, 120, 120, 100)
-                                };
 
-                                painter.rect_stroke(
-                                    slice_rect,
-                                    0.0,
-                                    egui::Stroke::new(
-                                        if is_selected { 2.0 } else { 1.0 },
-                                        stroke_color,
-                                    ),
-                                    egui::StrokeKind::Inside,
-                                );
+                                // Use shared slice overlay drawing (consistent colors and labels)
+                                Self::draw_slice_overlay(&painter, slice_rect, screen_idx, slice_idx, is_selected, zoom);
 
                                 // Draw corner/edge handles for selected slice's output rect (only in Resize mode)
                                 if is_selected && self.output_edit_mode == OutputEditMode::Resize {
-                                    let zoom = self.output_viewport.zoom();
                                     self.draw_rect_handles(&painter, slice_rect, zoom);
                                 }
 
@@ -3607,13 +3642,11 @@ impl AdvancedOutputWindow {
                 if response.changed() {
                     changed = true;
                 }
-                response.context_menu(|ui| {
-                    if ui.button("Reset to 0").clicked() {
-                        mask.feather = 0.0;
-                        changed = true;
-                        ui.close_menu();
-                    }
-                });
+                // Right-click instantly resets to 0
+                if response.clicked_by(PointerButton::Secondary) {
+                    mask.feather = 0.0;
+                    changed = true;
+                }
             });
 
             ui.add_space(4.0);
@@ -3628,25 +3661,21 @@ impl AdvancedOutputWindow {
                         if response.changed() {
                             changed = true;
                         }
-                        response.context_menu(|ui| {
-                            if ui.button("Reset to 0.25").clicked() {
-                                *x = 0.25;
-                                changed = true;
-                                ui.close_menu();
-                            }
-                        });
+                        // Right-click instantly resets to 0.25
+                        if response.clicked_by(PointerButton::Secondary) {
+                            *x = 0.25;
+                            changed = true;
+                        }
                         ui.label("Y:");
                         let response = ui.add(egui::DragValue::new(y).range(0.0..=1.0).speed(0.01));
                         if response.changed() {
                             changed = true;
                         }
-                        response.context_menu(|ui| {
-                            if ui.button("Reset to 0.25").clicked() {
-                                *y = 0.25;
-                                changed = true;
-                                ui.close_menu();
-                            }
-                        });
+                        // Right-click instantly resets to 0.25
+                        if response.clicked_by(PointerButton::Secondary) {
+                            *y = 0.25;
+                            changed = true;
+                        }
                     });
                     ui.horizontal(|ui| {
                         ui.label("W:");
@@ -3654,25 +3683,21 @@ impl AdvancedOutputWindow {
                         if response.changed() {
                             changed = true;
                         }
-                        response.context_menu(|ui| {
-                            if ui.button("Reset to 0.5").clicked() {
-                                *width = 0.5;
-                                changed = true;
-                                ui.close_menu();
-                            }
-                        });
+                        // Right-click instantly resets to 0.5
+                        if response.clicked_by(PointerButton::Secondary) {
+                            *width = 0.5;
+                            changed = true;
+                        }
                         ui.label("H:");
                         let response = ui.add(egui::DragValue::new(height).range(0.0..=1.0).speed(0.01));
                         if response.changed() {
                             changed = true;
                         }
-                        response.context_menu(|ui| {
-                            if ui.button("Reset to 0.5").clicked() {
-                                *height = 0.5;
-                                changed = true;
-                                ui.close_menu();
-                            }
-                        });
+                        // Right-click instantly resets to 0.5
+                        if response.clicked_by(PointerButton::Secondary) {
+                            *height = 0.5;
+                            changed = true;
+                        }
                     });
                 }
                 MaskShape::Ellipse { center, radius_x, radius_y } => {
@@ -3683,25 +3708,21 @@ impl AdvancedOutputWindow {
                         if response.changed() {
                             changed = true;
                         }
-                        response.context_menu(|ui| {
-                            if ui.button("Reset to 0.5").clicked() {
-                                center.x = 0.5;
-                                changed = true;
-                                ui.close_menu();
-                            }
-                        });
+                        // Right-click instantly resets to 0.5
+                        if response.clicked_by(PointerButton::Secondary) {
+                            center.x = 0.5;
+                            changed = true;
+                        }
                         ui.label("Y:");
                         let response = ui.add(egui::DragValue::new(&mut center.y).range(0.0..=1.0).speed(0.01));
                         if response.changed() {
                             changed = true;
                         }
-                        response.context_menu(|ui| {
-                            if ui.button("Reset to 0.5").clicked() {
-                                center.y = 0.5;
-                                changed = true;
-                                ui.close_menu();
-                            }
-                        });
+                        // Right-click instantly resets to 0.5
+                        if response.clicked_by(PointerButton::Secondary) {
+                            center.y = 0.5;
+                            changed = true;
+                        }
                     });
                     ui.horizontal(|ui| {
                         ui.label("Radius X:");
@@ -3709,25 +3730,21 @@ impl AdvancedOutputWindow {
                         if response.changed() {
                             changed = true;
                         }
-                        response.context_menu(|ui| {
-                            if ui.button("Reset to 0.25").clicked() {
-                                *radius_x = 0.25;
-                                changed = true;
-                                ui.close_menu();
-                            }
-                        });
+                        // Right-click instantly resets to 0.25
+                        if response.clicked_by(PointerButton::Secondary) {
+                            *radius_x = 0.25;
+                            changed = true;
+                        }
                         ui.label("Y:");
                         let response = ui.add(egui::DragValue::new(radius_y).range(0.0..=1.0).speed(0.01));
                         if response.changed() {
                             changed = true;
                         }
-                        response.context_menu(|ui| {
-                            if ui.button("Reset to 0.25").clicked() {
-                                *radius_y = 0.25;
-                                changed = true;
-                                ui.close_menu();
-                            }
-                        });
+                        // Right-click instantly resets to 0.25
+                        if response.clicked_by(PointerButton::Secondary) {
+                            *radius_y = 0.25;
+                            changed = true;
+                        }
                     });
                 }
                 MaskShape::Polygon { points } => {
@@ -3775,13 +3792,11 @@ impl AdvancedOutputWindow {
             if response.changed() {
                 changed = true;
             }
-            response.context_menu(|ui| {
-                if ui.button("Reset to 1").clicked() {
-                    slice_copy.color.opacity = 1.0;
-                    changed = true;
-                    ui.close_menu();
-                }
-            });
+            // Right-click instantly resets to 1
+            if response.clicked_by(PointerButton::Secondary) {
+                slice_copy.color.opacity = 1.0;
+                changed = true;
+            }
         });
 
         // Brightness slider
@@ -3791,13 +3806,11 @@ impl AdvancedOutputWindow {
             if response.changed() {
                 changed = true;
             }
-            response.context_menu(|ui| {
-                if ui.button("Reset to 0").clicked() {
-                    slice_copy.color.brightness = 0.0;
-                    changed = true;
-                    ui.close_menu();
-                }
-            });
+            // Right-click instantly resets to 0
+            if response.clicked_by(PointerButton::Secondary) {
+                slice_copy.color.brightness = 0.0;
+                changed = true;
+            }
         });
 
         // Contrast slider
@@ -3807,13 +3820,11 @@ impl AdvancedOutputWindow {
             if response.changed() {
                 changed = true;
             }
-            response.context_menu(|ui| {
-                if ui.button("Reset to 1").clicked() {
-                    slice_copy.color.contrast = 1.0;
-                    changed = true;
-                    ui.close_menu();
-                }
-            });
+            // Right-click instantly resets to 1
+            if response.clicked_by(PointerButton::Secondary) {
+                slice_copy.color.contrast = 1.0;
+                changed = true;
+            }
         });
 
         // Gamma slider
@@ -3823,13 +3834,11 @@ impl AdvancedOutputWindow {
             if response.changed() {
                 changed = true;
             }
-            response.context_menu(|ui| {
-                if ui.button("Reset to 1").clicked() {
-                    slice_copy.color.gamma = 1.0;
-                    changed = true;
-                    ui.close_menu();
-                }
-            });
+            // Right-click instantly resets to 1
+            if response.clicked_by(PointerButton::Secondary) {
+                slice_copy.color.gamma = 1.0;
+                changed = true;
+            }
         });
 
         // RGB Channels (collapsing section for less common adjustments)
@@ -3840,13 +3849,11 @@ impl AdvancedOutputWindow {
                 if response.changed() {
                     changed = true;
                 }
-                response.context_menu(|ui| {
-                    if ui.button("Reset to 1").clicked() {
-                        slice_copy.color.red = 1.0;
-                        changed = true;
-                        ui.close_menu();
-                    }
-                });
+                // Right-click instantly resets to 1
+                if response.clicked_by(PointerButton::Secondary) {
+                    slice_copy.color.red = 1.0;
+                    changed = true;
+                }
             });
             ui.horizontal(|ui| {
                 ui.label("Green:");
@@ -3854,13 +3861,11 @@ impl AdvancedOutputWindow {
                 if response.changed() {
                     changed = true;
                 }
-                response.context_menu(|ui| {
-                    if ui.button("Reset to 1").clicked() {
-                        slice_copy.color.green = 1.0;
-                        changed = true;
-                        ui.close_menu();
-                    }
-                });
+                // Right-click instantly resets to 1
+                if response.clicked_by(PointerButton::Secondary) {
+                    slice_copy.color.green = 1.0;
+                    changed = true;
+                }
             });
             ui.horizontal(|ui| {
                 ui.label("Blue:");
@@ -3868,13 +3873,11 @@ impl AdvancedOutputWindow {
                 if response.changed() {
                     changed = true;
                 }
-                response.context_menu(|ui| {
-                    if ui.button("Reset to 1").clicked() {
-                        slice_copy.color.blue = 1.0;
-                        changed = true;
-                        ui.close_menu();
-                    }
-                });
+                // Right-click instantly resets to 1
+                if response.clicked_by(PointerButton::Secondary) {
+                    slice_copy.color.blue = 1.0;
+                    changed = true;
+                }
             });
         });
 

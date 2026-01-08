@@ -33,6 +33,40 @@ impl ThumbnailMode {
     }
 }
 
+/// Audio source type for FFT analysis
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum AudioSourceType {
+    /// No audio source (disabled)
+    #[default]
+    None,
+    /// System default audio input device
+    SystemDefault,
+    /// Specific system audio device by name
+    SystemDevice(String),
+    /// NDI source by name
+    Ndi(String),
+    /// OMT source by address
+    Omt(String),
+}
+
+impl AudioSourceType {
+    /// Get display name for UI
+    pub fn display_name(&self) -> String {
+        match self {
+            AudioSourceType::None => "Disabled".to_string(),
+            AudioSourceType::SystemDefault => "System Default".to_string(),
+            AudioSourceType::SystemDevice(name) => format!("Device: {}", name),
+            AudioSourceType::Ndi(name) => format!("NDI: {}", name),
+            AudioSourceType::Omt(addr) => format!("OMT: {}", addr),
+        }
+    }
+
+    /// Check if audio is enabled
+    pub fn is_enabled(&self) -> bool {
+        !matches!(self, AudioSourceType::None)
+    }
+}
+
 /// Deserialize a usize from a string, treating empty strings as the default value
 fn deserialize_usize_or_default<'de, D>(deserializer: D) -> Result<usize, D::Error>
 where
@@ -182,6 +216,10 @@ pub struct EnvironmentSettings {
     /// Requires restart to take effect.
     #[serde(rename = "bgraPipelineEnabled", default)]
     pub bgra_pipeline_enabled: bool,
+
+    /// Audio source for FFT analysis and audio-reactive effects
+    #[serde(rename = "audioSource", default)]
+    pub audio_source: AudioSourceType,
 }
 
 /// Default show BPM setting
@@ -257,6 +295,7 @@ impl Default for EnvironmentSettings {
             low_latency_mode: false, // Default to stability (2 frames in flight)
             test_pattern_enabled: false,
             bgra_pipeline_enabled: false, // Default to RGBA for compatibility
+            audio_source: AudioSourceType::default(),
         }
     }
 }

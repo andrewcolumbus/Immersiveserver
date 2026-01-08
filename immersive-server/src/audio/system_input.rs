@@ -34,24 +34,43 @@ impl SystemAudioInput {
 
     /// Create system input with specific device name (None = default)
     pub fn with_device(device_name: Option<&str>) -> Result<Self, String> {
-        let host = cpal::default_host();
+        use std::time::Instant;
+        let total_start = Instant::now();
+        tracing::debug!("[AUDIO] with_device() started, device_name={:?}", device_name);
 
+        let host_start = Instant::now();
+        let host = cpal::default_host();
+        tracing::debug!("[AUDIO] default_host() took {:?}", host_start.elapsed());
+
+        let device_start = Instant::now();
         let device = if let Some(name) = device_name {
-            host.input_devices()
-                .map_err(|e| format!("Failed to enumerate devices: {}", e))?
-                .find(|d| d.name().map(|n| n == name).unwrap_or(false))
-                .ok_or_else(|| format!("Device '{}' not found", name))?
+            let enum_start = Instant::now();
+            let devices = host.input_devices()
+                .map_err(|e| format!("Failed to enumerate devices: {}", e))?;
+            tracing::debug!("[AUDIO] input_devices() enumeration took {:?}", enum_start.elapsed());
+
+            let find_start = Instant::now();
+            let found = devices.find(|d| d.name().map(|n| n == name).unwrap_or(false))
+                .ok_or_else(|| format!("Device '{}' not found", name))?;
+            tracing::debug!("[AUDIO] find device by name took {:?}", find_start.elapsed());
+            found
         } else {
-            host.default_input_device()
-                .ok_or_else(|| "No default input device".to_string())?
+            let default_start = Instant::now();
+            let default = host.default_input_device()
+                .ok_or_else(|| "No default input device".to_string())?;
+            tracing::debug!("[AUDIO] default_input_device() took {:?}", default_start.elapsed());
+            default
         };
+        tracing::debug!("[AUDIO] device lookup total took {:?}", device_start.elapsed());
 
         let device_name = device.name().unwrap_or_else(|_| "Unknown".to_string());
 
         // Get default config
+        let config_start = Instant::now();
         let config = device
             .default_input_config()
             .map_err(|e| format!("Failed to get input config: {}", e))?;
+        tracing::debug!("[AUDIO] default_input_config() took {:?}", config_start.elapsed());
 
         let sample_rate = config.sample_rate().0;
         let channels = config.channels() as u32;
@@ -65,6 +84,8 @@ impl SystemAudioInput {
 
         let state = Arc::new(AudioSourceState::new(BUFFER_SIZE, sample_rate, channels));
 
+        tracing::debug!("[AUDIO] with_device() total took {:?}", total_start.elapsed());
+
         Ok(Self {
             id: AudioSourceId::SystemInput,
             state,
@@ -75,10 +96,22 @@ impl SystemAudioInput {
 
     /// List available input devices
     pub fn list_devices() -> Vec<String> {
+        use std::time::Instant;
+        let start = Instant::now();
+        tracing::debug!("[AUDIO] list_devices() started");
+
+        let host_start = Instant::now();
         let host = cpal::default_host();
-        host.input_devices()
+        tracing::debug!("[AUDIO] list_devices: default_host() took {:?}", host_start.elapsed());
+
+        let enum_start = Instant::now();
+        let result = host.input_devices()
             .map(|devices| devices.filter_map(|d| d.name().ok()).collect())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        tracing::debug!("[AUDIO] list_devices: input_devices() took {:?}", enum_start.elapsed());
+        tracing::debug!("[AUDIO] list_devices() total took {:?}, found {} devices", start.elapsed(), result.len());
+
+        result
     }
 
     /// Get the default input device name
@@ -90,14 +123,25 @@ impl SystemAudioInput {
 
     /// Build and start the audio stream
     fn build_stream(&mut self) -> Result<(), String> {
+        use std::time::Instant;
+        let total_start = Instant::now();
+        tracing::debug!("[AUDIO] build_stream() started");
+
+        let host_start = Instant::now();
         let host = cpal::default_host();
+        tracing::debug!("[AUDIO] build_stream: default_host() took {:?}", host_start.elapsed());
+
+        let device_start = Instant::now();
         let device = host
             .default_input_device()
             .ok_or_else(|| "No default input device".to_string())?;
+        tracing::debug!("[AUDIO] build_stream: default_input_device() took {:?}", device_start.elapsed());
 
+        let config_start = Instant::now();
         let config = device
             .default_input_config()
             .map_err(|e| format!("Failed to get input config: {}", e))?;
+        tracing::debug!("[AUDIO] build_stream: default_input_config() took {:?}", config_start.elapsed());
 
         let state = Arc::clone(&self.state);
 
@@ -109,6 +153,7 @@ impl SystemAudioInput {
 
         let err_fn = |err| tracing::error!("Audio input error: {}", err);
 
+        let build_start = Instant::now();
         let stream = match config.sample_format() {
             cpal::SampleFormat::F32 => {
                 let state_clone = Arc::clone(&state);
@@ -173,8 +218,10 @@ impl SystemAudioInput {
             }
         }
         .map_err(|e| format!("Failed to build stream: {}", e))?;
+        tracing::debug!("[AUDIO] build_stream: build_input_stream() took {:?}", build_start.elapsed());
 
         *self.stream.lock().unwrap() = Some(StreamWrapper(stream));
+        tracing::debug!("[AUDIO] build_stream() total took {:?}", total_start.elapsed());
         Ok(())
     }
 }

@@ -554,6 +554,7 @@ impl FftSource {
 
 /// All automation source types
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data")]
 pub enum AutomationSource {
     /// Low-frequency oscillator
     Lfo(LfoSource),

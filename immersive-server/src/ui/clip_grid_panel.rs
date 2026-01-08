@@ -8,6 +8,8 @@
 
 use crate::compositor::{ClipCell, ClipSource, Layer};
 use crate::ui::ThumbnailCache;
+use crate::ui::draw_texture;
+use egui::PointerButton;
 use std::path::PathBuf;
 
 /// Size of clip grid cells in pixels
@@ -477,18 +479,15 @@ impl ClipGridPanel {
                 ui.add_sized([OPACITY_SLIDER_WIDTH, CELL_SIZE], slider)
             });
 
-            // Emit action if opacity changed
+            // Emit action if opacity changed (including right-click reset)
             if slider_result.inner.changed() {
                 actions.push(ClipGridAction::SetLayerOpacity { layer_id, opacity });
             }
 
-            // Right-click to reset opacity
-            slider_result.inner.clone().context_menu(|ui| {
-                if ui.button("Reset to 100%").clicked() {
-                    actions.push(ClipGridAction::SetLayerOpacity { layer_id, opacity: 1.0 });
-                    ui.close_menu();
-                }
-            });
+            // Right-click instantly resets opacity to 100%
+            if slider_result.inner.clicked_by(PointerButton::Secondary) {
+                actions.push(ClipGridAction::SetLayerOpacity { layer_id, opacity: 1.0 });
+            }
 
             // Tooltip for the slider
             slider_result.inner.on_hover_text("Layer opacity (0% = invisible, 100% = opaque)");
@@ -620,12 +619,7 @@ impl ClipGridPanel {
                         )
                     };
 
-                    ui.painter().image(
-                        texture_id,
-                        image_rect,
-                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                        egui::Color32::WHITE,
-                    );
+                    draw_texture(ui, texture_id, image_rect);
 
                     // Draw active indicator border
                     if is_active {

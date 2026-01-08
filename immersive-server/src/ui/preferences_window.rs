@@ -3,8 +3,10 @@
 //! A floating window for editing application-wide environment settings.
 //! Accessible via Immersive Server → Preferences (macOS) or Edit → Preferences (Windows).
 
+use crate::audio::AudioManager;
 use crate::compositor::Environment;
-use crate::settings::{EnvironmentSettings, ThumbnailMode};
+use crate::network::discovery::{DiscoveredSource, SourceType};
+use crate::settings::{AudioSourceType, EnvironmentSettings, ThumbnailMode};
 use crate::ui::properties_panel::PropertiesAction;
 
 /// Preferences window for editing environment settings
@@ -60,6 +62,8 @@ impl PreferencesWindow {
         api_server_running: bool,
         omt_discovery_active: bool,
         ndi_discovery_active: bool,
+        audio_manager: Option<&AudioManager>,
+        discovered_sources: &[DiscoveredSource],
     ) -> Vec<PropertiesAction> {
         let mut actions = Vec::new();
 
@@ -88,6 +92,8 @@ impl PreferencesWindow {
                             api_server_running,
                             omt_discovery_active,
                             ndi_discovery_active,
+                            audio_manager,
+                            discovered_sources,
                             &mut actions,
                         );
                     });
@@ -112,6 +118,8 @@ impl PreferencesWindow {
         api_server_running: bool,
         omt_discovery_active: bool,
         ndi_discovery_active: bool,
+        audio_manager: Option<&AudioManager>,
+        discovered_sources: &[DiscoveredSource],
         actions: &mut Vec<PropertiesAction>,
     ) {
         // ========== RESOLUTION ==========
@@ -296,21 +304,16 @@ impl PreferencesWindow {
             // FPS slider
             ui.horizontal(|ui| {
                 ui.label("Target FPS:");
-                let response = ui.add(
+                let mut response = ui.add(
                     egui::Slider::new(&mut self.temp_fps, 24..=240)
                         .suffix(" fps")
                         .clamping(egui::SliderClamping::Always),
                 );
+                // Right-click instantly resets to 60 fps
+                super::widgets::add_reset_u32(&mut response, &mut self.temp_fps, 60);
                 if response.changed() {
                     actions.push(PropertiesAction::SetTargetFPS { fps: self.temp_fps });
                 }
-                response.context_menu(|ui| {
-                    if ui.button("Reset to 60 fps").clicked() {
-                        self.temp_fps = 60;
-                        actions.push(PropertiesAction::SetTargetFPS { fps: 60 });
-                        ui.close_menu();
-                    }
-                });
             });
 
             // FPS presets
@@ -424,12 +427,13 @@ impl PreferencesWindow {
         ui.add_enabled_ui(floor_sync, |ui| {
             ui.horizontal(|ui| {
                 ui.label("Floor Layer:");
-                let mut layer_idx = settings.floor_layer_index;
-                if ui
-                    .add(egui::DragValue::new(&mut layer_idx).range(0..=15).speed(0.1))
-                    .changed()
-                {
-                    actions.push(PropertiesAction::SetFloorLayerIndex { index: layer_idx });
+                let mut layer_idx = settings.floor_layer_index as u32;
+                let mut response = ui
+                    .add(egui::DragValue::new(&mut layer_idx).range(0..=15).speed(0.1));
+                // Right-click instantly resets to 0
+                super::widgets::add_reset_u32(&mut response, &mut layer_idx, 0);
+                if response.changed() {
+                    actions.push(PropertiesAction::SetFloorLayerIndex { index: layer_idx as usize });
                 }
                 ui.label(egui::RichText::new("(0 = first layer)").small().weak());
             });
@@ -522,22 +526,18 @@ impl PreferencesWindow {
         ui.add_space(4.0);
 
         let mut buffer_capacity = settings.ndi_buffer_capacity as i32;
-        let response = ui.add(
+        let mut response = ui.add(
             egui::Slider::new(&mut buffer_capacity, 1..=10)
                 .text("Buffer Size")
                 .suffix(" frames"),
         );
+        // Right-click instantly resets to 3 frames
+        super::widgets::add_reset_i32(&mut response, &mut buffer_capacity, 3);
         if response.changed() {
             actions.push(PropertiesAction::SetNdiBufferCapacity {
                 capacity: buffer_capacity as usize,
             });
         }
-        response.context_menu(|ui| {
-            if ui.button("Reset to 3").clicked() {
-                actions.push(PropertiesAction::SetNdiBufferCapacity { capacity: 3 });
-                ui.close_menu();
-            }
-        });
         ui.label(
             egui::RichText::new("Higher values reduce drops but add latency")
                 .small()
@@ -621,6 +621,196 @@ impl PreferencesWindow {
                 ))
                 .small()
                 .color(egui::Color32::GREEN),
+            );
+        }
+
+        ui.add_space(16.0);
+        ui.separator();
+
+        // ========== AUDIO INPUT ==========
+        ui.add_space(8.0);
+        ui.heading("Audio Input");
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new("Audio source for FFT analysis and reactive effects")
+                .small()
+                .weak(),
+        );
+        ui.add_space(8.0);
+
+        // Audio source dropdown
+        let current_source = &settings.audio_source;
+        egui::ComboBox::from_id_salt("audio_source_selector")
+            .selected_text(current_source.display_name())
+            .width(250.0)
+            .show_ui(ui, |ui| {
+                // Disabled option
+                if ui
+                    .selectable_label(matches!(current_source, AudioSourceType::None), "Disabled")
+                    .clicked()
+                {
+                    actions.push(PropertiesAction::SetAudioSource {
+                        source_type: AudioSourceType::None,
+                    });
+                }
+
+                // System Default
+                if ui
+                    .selectable_label(
+                        matches!(current_source, AudioSourceType::SystemDefault),
+                        "System Default",
+                    )
+                    .clicked()
+                {
+                    actions.push(PropertiesAction::SetAudioSource {
+                        source_type: AudioSourceType::SystemDefault,
+                    });
+                }
+
+                ui.separator();
+
+                // System Devices submenu
+                let system_devices = AudioManager::list_audio_devices();
+                if !system_devices.is_empty() {
+                    ui.menu_button("System Devices...", |ui| {
+                        for device in &system_devices {
+                            let is_selected = matches!(
+                                current_source,
+                                AudioSourceType::SystemDevice(d) if d == device
+                            );
+                            if ui.selectable_label(is_selected, device).clicked() {
+                                actions.push(PropertiesAction::SetAudioSource {
+                                    source_type: AudioSourceType::SystemDevice(device.clone()),
+                                });
+                                ui.close_menu();
+                            }
+                        }
+                    });
+                }
+
+                // NDI sources
+                let ndi_sources: Vec<_> = discovered_sources
+                    .iter()
+                    .filter(|s| s.source_type == SourceType::Ndi)
+                    .collect();
+                if !ndi_sources.is_empty() {
+                    ui.menu_button("NDI Sources...", |ui| {
+                        for source in &ndi_sources {
+                            let full_name = source.id.clone();
+                            let is_selected =
+                                matches!(current_source, AudioSourceType::Ndi(n) if n == &full_name);
+                            if ui.selectable_label(is_selected, &source.name).clicked() {
+                                actions.push(PropertiesAction::SetAudioSource {
+                                    source_type: AudioSourceType::Ndi(full_name),
+                                });
+                                ui.close_menu();
+                            }
+                        }
+                    });
+                }
+
+                // OMT sources
+                let omt_sources: Vec<_> = discovered_sources
+                    .iter()
+                    .filter(|s| s.source_type == SourceType::Omt)
+                    .collect();
+                if !omt_sources.is_empty() {
+                    ui.menu_button("OMT Sources...", |ui| {
+                        for source in &omt_sources {
+                            let address = source.id.clone();
+                            let is_selected =
+                                matches!(current_source, AudioSourceType::Omt(a) if a == &address);
+                            if ui.selectable_label(is_selected, &source.name).clicked() {
+                                actions.push(PropertiesAction::SetAudioSource {
+                                    source_type: AudioSourceType::Omt(address),
+                                });
+                                ui.close_menu();
+                            }
+                        }
+                    });
+                }
+            });
+
+        ui.add_space(8.0);
+
+        // Level meter
+        if let Some(manager) = audio_manager {
+            let (low, mid, high) = manager.get_band_levels();
+
+            ui.horizontal(|ui| {
+                ui.label("Level:");
+
+                let meter_width = ui.available_width().min(200.0);
+                let meter_height = 16.0;
+
+                let (rect, _response) =
+                    ui.allocate_exact_size(egui::vec2(meter_width, meter_height), egui::Sense::hover());
+
+                if ui.is_rect_visible(rect) {
+                    let painter = ui.painter();
+
+                    // Background
+                    painter.rect_filled(rect, 2.0, egui::Color32::from_gray(30));
+
+                    let segment_width = rect.width() / 3.0;
+
+                    // Low band (red/orange)
+                    let low_width = segment_width * low.clamp(0.0, 1.0);
+                    let low_rect = egui::Rect::from_min_size(rect.min, egui::vec2(low_width, meter_height));
+                    painter.rect_filled(low_rect, 2.0, egui::Color32::from_rgb(255, 100, 50));
+
+                    // Mid band (green)
+                    let mid_start = rect.min.x + segment_width;
+                    let mid_width = segment_width * mid.clamp(0.0, 1.0);
+                    let mid_rect = egui::Rect::from_min_size(
+                        egui::pos2(mid_start, rect.min.y),
+                        egui::vec2(mid_width, meter_height),
+                    );
+                    painter.rect_filled(mid_rect, 0.0, egui::Color32::from_rgb(50, 255, 100));
+
+                    // High band (blue)
+                    let high_start = rect.min.x + 2.0 * segment_width;
+                    let high_width = segment_width * high.clamp(0.0, 1.0);
+                    let high_rect = egui::Rect::from_min_size(
+                        egui::pos2(high_start, rect.min.y),
+                        egui::vec2(high_width, meter_height),
+                    );
+                    painter.rect_filled(high_rect, 2.0, egui::Color32::from_rgb(50, 150, 255));
+
+                    // Segment dividers
+                    painter.vline(
+                        rect.min.x + segment_width,
+                        rect.y_range(),
+                        egui::Stroke::new(1.0, egui::Color32::from_gray(60)),
+                    );
+                    painter.vline(
+                        rect.min.x + 2.0 * segment_width,
+                        rect.y_range(),
+                        egui::Stroke::new(1.0, egui::Color32::from_gray(60)),
+                    );
+                }
+            });
+
+            // Request repaint for animation
+            if settings.audio_source.is_enabled() {
+                ui.ctx().request_repaint();
+            }
+        }
+
+        ui.add_space(4.0);
+
+        // Status text
+        if settings.audio_source.is_enabled() {
+            ui.label(
+                egui::RichText::new(format!("Active: {}", settings.audio_source.display_name()))
+                    .small()
+                    .color(egui::Color32::GREEN),
+            );
+        } else {
+            ui.label(
+                egui::RichText::new("No audio source selected")
+                    .small()
+                    .color(egui::Color32::GRAY),
             );
         }
 

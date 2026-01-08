@@ -5,6 +5,8 @@
 
 use std::collections::HashMap;
 
+use egui::PointerButton;
+
 use crate::audio::AudioBand;
 use crate::compositor::{BlendMode, ClipSource, ClipTransition, Environment, Layer, LoopMode};
 use crate::effects::{AutomationSource, EffectRegistry, EffectStack, FftSource, LfoSource, LfoShape, BeatSource, BeatTrigger, ParameterValue};
@@ -184,6 +186,10 @@ pub enum PropertiesAction {
     SetTestPattern { enabled: bool },
     /// BGRA pipeline mode changed (requires restart)
     SetBgraPipelineEnabled { enabled: bool },
+
+    // Audio source actions
+    /// Audio source changed for FFT analysis
+    SetAudioSource { source_type: crate::settings::AudioSourceType },
 }
 
 /// Context for rendering effect stacks (determines which PropertiesAction variants to emit)
@@ -440,12 +446,10 @@ impl PropertiesPanel {
             if response.changed() {
                 actions.push(PropertiesAction::SetLayerOpacity { layer_id, opacity });
             }
-            response.context_menu(|ui| {
-                if ui.button("Reset to 100%").clicked() {
-                    actions.push(PropertiesAction::SetLayerOpacity { layer_id, opacity: 1.0 });
-                    ui.close_menu();
-                }
-            });
+            // Right-click instantly resets to 100%
+            if response.clicked_by(PointerButton::Secondary) {
+                actions.push(PropertiesAction::SetLayerOpacity { layer_id, opacity: 1.0 });
+            }
         });
 
         ui.add_space(8.0);
@@ -515,12 +519,10 @@ impl PropertiesPanel {
                     y: pos_y,
                 });
             }
-            response.context_menu(|ui| {
-                if ui.button("Reset to center (0)").clicked() {
-                    actions.push(PropertiesAction::SetLayerPosition { layer_id, x: 0.0, y: pos_y });
-                    ui.close_menu();
-                }
-            });
+            // Right-click instantly resets to center (0)
+            if response.clicked_by(PointerButton::Secondary) {
+                actions.push(PropertiesAction::SetLayerPosition { layer_id, x: 0.0, y: pos_y });
+            }
         });
         ui.horizontal(|ui| {
             ui.label("Position Y:");
@@ -532,12 +534,10 @@ impl PropertiesPanel {
                     y: pos_y,
                 });
             }
-            response.context_menu(|ui| {
-                if ui.button("Reset to center (0)").clicked() {
-                    actions.push(PropertiesAction::SetLayerPosition { layer_id, x: pos_x, y: 0.0 });
-                    ui.close_menu();
-                }
-            });
+            // Right-click instantly resets to center (0)
+            if response.clicked_by(PointerButton::Secondary) {
+                actions.push(PropertiesAction::SetLayerPosition { layer_id, x: pos_x, y: 0.0 });
+            }
         });
 
         ui.add_space(4.0);
@@ -562,12 +562,10 @@ impl PropertiesPanel {
                     scale_y: uniform_scale / 100.0,
                 });
             }
-            response_uniform.context_menu(|ui| {
-                if ui.button("Reset to 100%").clicked() {
-                    actions.push(PropertiesAction::SetLayerScale { layer_id, scale_x: 1.0, scale_y: 1.0 });
-                    ui.close_menu();
-                }
-            });
+            // Right-click instantly resets both to 100%
+            if response_uniform.clicked_by(PointerButton::Secondary) {
+                actions.push(PropertiesAction::SetLayerScale { layer_id, scale_x: 1.0, scale_y: 1.0 });
+            }
             ui.add_space(8.0);
             // Independent X scale
             let response_x = ui.add(
@@ -583,16 +581,10 @@ impl PropertiesPanel {
                     scale_y: scale_y / 100.0,
                 });
             }
-            response_x.context_menu(|ui| {
-                if ui.button("Reset to 100%").clicked() {
-                    actions.push(PropertiesAction::SetLayerScale { layer_id, scale_x: 1.0, scale_y: scale_y / 100.0 });
-                    ui.close_menu();
-                }
-                if ui.button("Reset Both to 100%").clicked() {
-                    actions.push(PropertiesAction::SetLayerScale { layer_id, scale_x: 1.0, scale_y: 1.0 });
-                    ui.close_menu();
-                }
-            });
+            // Right-click instantly resets X to 100%
+            if response_x.clicked_by(PointerButton::Secondary) {
+                actions.push(PropertiesAction::SetLayerScale { layer_id, scale_x: 1.0, scale_y: scale_y / 100.0 });
+            }
             ui.label("×");
             // Independent Y scale
             let response_y = ui.add(
@@ -608,16 +600,10 @@ impl PropertiesPanel {
                     scale_y: scale_y / 100.0,
                 });
             }
-            response_y.context_menu(|ui| {
-                if ui.button("Reset to 100%").clicked() {
-                    actions.push(PropertiesAction::SetLayerScale { layer_id, scale_x: scale_x / 100.0, scale_y: 1.0 });
-                    ui.close_menu();
-                }
-                if ui.button("Reset Both to 100%").clicked() {
-                    actions.push(PropertiesAction::SetLayerScale { layer_id, scale_x: 1.0, scale_y: 1.0 });
-                    ui.close_menu();
-                }
-            });
+            // Right-click instantly resets Y to 100%
+            if response_y.clicked_by(PointerButton::Secondary) {
+                actions.push(PropertiesAction::SetLayerScale { layer_id, scale_x: scale_x / 100.0, scale_y: 1.0 });
+            }
         });
 
         ui.add_space(4.0);
@@ -638,12 +624,10 @@ impl PropertiesPanel {
                     degrees: rotation_deg,
                 });
             }
-            response.context_menu(|ui| {
-                if ui.button("Reset to 0°").clicked() {
-                    actions.push(PropertiesAction::SetLayerRotation { layer_id, degrees: 0.0 });
-                    ui.close_menu();
-                }
-            });
+            // Right-click instantly resets to 0°
+            if response.clicked_by(PointerButton::Secondary) {
+                actions.push(PropertiesAction::SetLayerRotation { layer_id, degrees: 0.0 });
+            }
         });
 
         // Effects section
@@ -771,6 +755,23 @@ impl PropertiesPanel {
                                             let delete_btn = ui.small_button("×").on_hover_text("Remove effect");
                                             if delete_btn.clicked() {
                                                 delete_clicked.set(true);
+                                            }
+
+                                            // Up/down reorder buttons
+                                            let can_move_up = index > 0;
+                                            let can_move_down = index < effect_count - 1;
+
+                                            if ui.add_enabled(can_move_up, egui::Button::new("▲").small())
+                                                .on_hover_text("Move up")
+                                                .clicked()
+                                            {
+                                                reorder_action = Some((effect_id, index - 1));
+                                            }
+                                            if ui.add_enabled(can_move_down, egui::Button::new("▼").small())
+                                                .on_hover_text("Move down")
+                                                .clicked()
+                                            {
+                                                reorder_action = Some((effect_id, index + 1));
                                             }
 
                                             // Effect name
@@ -1094,15 +1095,12 @@ impl PropertiesPanel {
                         }
                     }
 
-                    // Right-click to reset to default
-                    response.context_menu(|ui| {
-                        if ui.button("Reset to Default").clicked() {
-                            if let ParameterValue::Float(default_val) = param.meta.default {
-                                self.push_param_action(actions, context, effect_id, param.meta.name.clone(), ParameterValue::Float(default_val));
-                            }
-                            ui.close_menu();
+                    // Right-click instantly resets to default
+                    if response.clicked_by(PointerButton::Secondary) {
+                        if let ParameterValue::Float(default_val) = param.meta.default {
+                            self.push_param_action(actions, context, effect_id, param.meta.name.clone(), ParameterValue::Float(default_val));
                         }
-                    });
+                    }
 
                 }
                 ParameterValue::Int(value) => {
@@ -1128,14 +1126,12 @@ impl PropertiesPanel {
                         self.push_param_action(actions, context, effect_id, param.meta.name.clone(), ParameterValue::Int(val));
                     }
 
-                    response.context_menu(|ui| {
-                        if ui.button("Reset to Default").clicked() {
-                            if let ParameterValue::Int(default_val) = param.meta.default {
-                                self.push_param_action(actions, context, effect_id, param.meta.name.clone(), ParameterValue::Int(default_val));
-                            }
-                            ui.close_menu();
+                    // Right-click instantly resets to default
+                    if response.clicked_by(PointerButton::Secondary) {
+                        if let ParameterValue::Int(default_val) = param.meta.default {
+                            self.push_param_action(actions, context, effect_id, param.meta.name.clone(), ParameterValue::Int(default_val));
                         }
-                    });
+                    }
                 }
                 ParameterValue::Bool(value) => {
                     let mut val = *value;
@@ -1155,14 +1151,12 @@ impl PropertiesPanel {
                         self.push_param_action(actions, context, effect_id, param.meta.name.clone(), ParameterValue::Bool(val));
                     }
 
-                    response.context_menu(|ui| {
-                        if ui.button("Reset to Default").clicked() {
-                            if let ParameterValue::Bool(default_val) = param.meta.default {
-                                self.push_param_action(actions, context, effect_id, param.meta.name.clone(), ParameterValue::Bool(default_val));
-                            }
-                            ui.close_menu();
+                    // Right-click instantly resets to default
+                    if response.clicked_by(PointerButton::Secondary) {
+                        if let ParameterValue::Bool(default_val) = param.meta.default {
+                            self.push_param_action(actions, context, effect_id, param.meta.name.clone(), ParameterValue::Bool(default_val));
                         }
-                    });
+                    }
                 }
                 ParameterValue::Enum { index, options } => {
                     let mut current_index = *index;
@@ -1444,13 +1438,11 @@ impl PropertiesPanel {
                                 }
                             }
                         });
-                    shape_response.response.context_menu(|ui| {
-                        if ui.button("Reset to Default").clicked() {
-                            lfo.shape = default_lfo.shape;
-                            changed = true;
-                            ui.close_menu();
-                        }
-                    });
+                    // Right-click instantly resets to default
+                    if shape_response.response.clicked_by(PointerButton::Secondary) {
+                        lfo.shape = default_lfo.shape;
+                        changed = true;
+                    }
 
                     ui.separator();
 
@@ -1459,13 +1451,11 @@ impl PropertiesPanel {
                     if sync_response.changed() {
                         changed = true;
                     }
-                    sync_response.context_menu(|ui| {
-                        if ui.button("Reset to Default").clicked() {
-                            lfo.sync_to_bpm = default_lfo.sync_to_bpm;
-                            changed = true;
-                            ui.close_menu();
-                        }
-                    });
+                    // Right-click instantly resets to default
+                    if sync_response.clicked_by(PointerButton::Secondary) {
+                        lfo.sync_to_bpm = default_lfo.sync_to_bpm;
+                        changed = true;
+                    }
 
                     ui.separator();
 
@@ -1476,26 +1466,22 @@ impl PropertiesPanel {
                         if rate_response.changed() {
                             changed = true;
                         }
-                        rate_response.context_menu(|ui| {
-                            if ui.button("Reset to Default").clicked() {
-                                lfo.beats = default_lfo.beats;
-                                changed = true;
-                                ui.close_menu();
-                            }
-                        });
+                        // Right-click instantly resets to default
+                        if rate_response.clicked_by(PointerButton::Secondary) {
+                            lfo.beats = default_lfo.beats;
+                            changed = true;
+                        }
                     } else {
                         ui.label(egui::RichText::new("Rate:").small());
                         let rate_response = ui.add(egui::DragValue::new(&mut lfo.frequency).speed(0.01).range(0.01..=20.0).suffix("Hz"));
                         if rate_response.changed() {
                             changed = true;
                         }
-                        rate_response.context_menu(|ui| {
-                            if ui.button("Reset to Default").clicked() {
-                                lfo.frequency = default_lfo.frequency;
-                                changed = true;
-                                ui.close_menu();
-                            }
-                        });
+                        // Right-click instantly resets to default
+                        if rate_response.clicked_by(PointerButton::Secondary) {
+                            lfo.frequency = default_lfo.frequency;
+                            changed = true;
+                        }
                     }
 
                     ui.separator();
@@ -1506,13 +1492,11 @@ impl PropertiesPanel {
                     if depth_response.changed() {
                         changed = true;
                     }
-                    depth_response.context_menu(|ui| {
-                        if ui.button("Reset to Default").clicked() {
-                            lfo.amplitude = default_lfo.amplitude;
-                            changed = true;
-                            ui.close_menu();
-                        }
-                    });
+                    // Right-click instantly resets to default
+                    if depth_response.clicked_by(PointerButton::Secondary) {
+                        lfo.amplitude = default_lfo.amplitude;
+                        changed = true;
+                    }
 
                     ui.separator();
 
@@ -1522,13 +1506,11 @@ impl PropertiesPanel {
                     if phase_response.changed() {
                         changed = true;
                     }
-                    phase_response.context_menu(|ui| {
-                        if ui.button("Reset to Default").clicked() {
-                            lfo.phase = default_lfo.phase;
-                            changed = true;
-                            ui.close_menu();
-                        }
-                    });
+                    // Right-click instantly resets to default
+                    if phase_response.clicked_by(PointerButton::Secondary) {
+                        lfo.phase = default_lfo.phase;
+                        changed = true;
+                    }
 
                 });
 
@@ -1559,13 +1541,11 @@ impl PropertiesPanel {
                                 }
                             }
                         });
-                    trigger_response.response.context_menu(|ui| {
-                        if ui.button("Reset to Default").clicked() {
-                            beat.trigger_on = default_beat.trigger_on;
-                            changed = true;
-                            ui.close_menu();
-                        }
-                    });
+                    // Right-click instantly resets to default
+                    if trigger_response.response.clicked_by(PointerButton::Secondary) {
+                        beat.trigger_on = default_beat.trigger_on;
+                        changed = true;
+                    }
 
                     ui.separator();
 
@@ -1575,13 +1555,11 @@ impl PropertiesPanel {
                     if atk_response.changed() {
                         changed = true;
                     }
-                    atk_response.context_menu(|ui| {
-                        if ui.button("Reset to Default").clicked() {
-                            beat.attack_ms = default_beat.attack_ms;
-                            changed = true;
-                            ui.close_menu();
-                        }
-                    });
+                    // Right-click instantly resets to default
+                    if atk_response.clicked_by(PointerButton::Secondary) {
+                        beat.attack_ms = default_beat.attack_ms;
+                        changed = true;
+                    }
 
                     ui.separator();
 
@@ -1591,13 +1569,11 @@ impl PropertiesPanel {
                     if dec_response.changed() {
                         changed = true;
                     }
-                    dec_response.context_menu(|ui| {
-                        if ui.button("Reset to Default").clicked() {
-                            beat.decay_ms = default_beat.decay_ms;
-                            changed = true;
-                            ui.close_menu();
-                        }
-                    });
+                    // Right-click instantly resets to default
+                    if dec_response.clicked_by(PointerButton::Secondary) {
+                        beat.decay_ms = default_beat.decay_ms;
+                        changed = true;
+                    }
 
                     ui.separator();
 
@@ -1607,13 +1583,11 @@ impl PropertiesPanel {
                     if sus_response.changed() {
                         changed = true;
                     }
-                    sus_response.context_menu(|ui| {
-                        if ui.button("Reset to Default").clicked() {
-                            beat.sustain = default_beat.sustain;
-                            changed = true;
-                            ui.close_menu();
-                        }
-                    });
+                    // Right-click instantly resets to default
+                    if sus_response.clicked_by(PointerButton::Secondary) {
+                        beat.sustain = default_beat.sustain;
+                        changed = true;
+                    }
 
                     ui.separator();
 
@@ -1623,13 +1597,11 @@ impl PropertiesPanel {
                     if rel_response.changed() {
                         changed = true;
                     }
-                    rel_response.context_menu(|ui| {
-                        if ui.button("Reset to Default").clicked() {
-                            beat.release_ms = default_beat.release_ms;
-                            changed = true;
-                            ui.close_menu();
-                        }
-                    });
+                    // Right-click instantly resets to default
+                    if rel_response.clicked_by(PointerButton::Secondary) {
+                        beat.release_ms = default_beat.release_ms;
+                        changed = true;
+                    }
 
                 });
 
@@ -1670,13 +1642,11 @@ impl PropertiesPanel {
                                 }
                             }
                         });
-                    band_response.response.context_menu(|ui| {
-                        if ui.button("Reset to Default").clicked() {
-                            fft.band = default_fft.band;
-                            changed = true;
-                            ui.close_menu();
-                        }
-                    });
+                    // Right-click instantly resets to default
+                    if band_response.response.clicked_by(PointerButton::Secondary) {
+                        fft.band = default_fft.band;
+                        changed = true;
+                    }
 
                     ui.separator();
 
@@ -1686,13 +1656,11 @@ impl PropertiesPanel {
                     if gain_response.changed() {
                         changed = true;
                     }
-                    gain_response.context_menu(|ui| {
-                        if ui.button("Reset to Default").clicked() {
-                            fft.gain = default_fft.gain;
-                            changed = true;
-                            ui.close_menu();
-                        }
-                    });
+                    // Right-click instantly resets to default
+                    if gain_response.clicked_by(PointerButton::Secondary) {
+                        fft.gain = default_fft.gain;
+                        changed = true;
+                    }
 
                     ui.separator();
 
@@ -1702,13 +1670,11 @@ impl PropertiesPanel {
                     if smooth_response.changed() {
                         changed = true;
                     }
-                    smooth_response.context_menu(|ui| {
-                        if ui.button("Reset to Default").clicked() {
-                            fft.smoothing = default_fft.smoothing;
-                            changed = true;
-                            ui.close_menu();
-                        }
-                    });
+                    // Right-click instantly resets to default
+                    if smooth_response.clicked_by(PointerButton::Secondary) {
+                        fft.smoothing = default_fft.smoothing;
+                        changed = true;
+                    }
 
                 });
 
@@ -1722,13 +1688,11 @@ impl PropertiesPanel {
                     if atk_response.changed() {
                         changed = true;
                     }
-                    atk_response.context_menu(|ui| {
-                        if ui.button("Reset to Default").clicked() {
-                            fft.attack_ms = default_fft.attack_ms;
-                            changed = true;
-                            ui.close_menu();
-                        }
-                    });
+                    // Right-click instantly resets to default
+                    if atk_response.clicked_by(PointerButton::Secondary) {
+                        fft.attack_ms = default_fft.attack_ms;
+                        changed = true;
+                    }
 
                     ui.separator();
 
@@ -1738,13 +1702,11 @@ impl PropertiesPanel {
                     if rel_response.changed() {
                         changed = true;
                     }
-                    rel_response.context_menu(|ui| {
-                        if ui.button("Reset to Default").clicked() {
-                            fft.release_ms = default_fft.release_ms;
-                            changed = true;
-                            ui.close_menu();
-                        }
-                    });
+                    // Right-click instantly resets to default
+                    if rel_response.clicked_by(PointerButton::Secondary) {
+                        fft.release_ms = default_fft.release_ms;
+                        changed = true;
+                    }
                 });
 
                 if changed {
@@ -1971,12 +1933,10 @@ impl PropertiesPanel {
                     y: pos_y,
                 });
             }
-            response.context_menu(|ui| {
-                if ui.button("Reset to center (0)").clicked() {
-                    actions.push(PropertiesAction::SetClipPosition { layer_id, slot, x: 0.0, y: pos_y });
-                    ui.close_menu();
-                }
-            });
+            // Right-click instantly resets to center (0)
+            if response.clicked_by(PointerButton::Secondary) {
+                actions.push(PropertiesAction::SetClipPosition { layer_id, slot, x: 0.0, y: pos_y });
+            }
         });
         ui.horizontal(|ui| {
             ui.label("Position Y:");
@@ -1989,12 +1949,10 @@ impl PropertiesPanel {
                     y: pos_y,
                 });
             }
-            response.context_menu(|ui| {
-                if ui.button("Reset to center (0)").clicked() {
-                    actions.push(PropertiesAction::SetClipPosition { layer_id, slot, x: pos_x, y: 0.0 });
-                    ui.close_menu();
-                }
-            });
+            // Right-click instantly resets to center (0)
+            if response.clicked_by(PointerButton::Secondary) {
+                actions.push(PropertiesAction::SetClipPosition { layer_id, slot, x: pos_x, y: 0.0 });
+            }
         });
 
         ui.add_space(4.0);
@@ -2019,12 +1977,10 @@ impl PropertiesPanel {
                     scale_y: uniform_scale / 100.0,
                 });
             }
-            response_uniform.context_menu(|ui| {
-                if ui.button("Reset to 100%").clicked() {
-                    actions.push(PropertiesAction::SetClipScale { layer_id, slot, scale_x: 1.0, scale_y: 1.0 });
-                    ui.close_menu();
-                }
-            });
+            // Right-click instantly resets both to 100%
+            if response_uniform.clicked_by(PointerButton::Secondary) {
+                actions.push(PropertiesAction::SetClipScale { layer_id, slot, scale_x: 1.0, scale_y: 1.0 });
+            }
             ui.add_space(8.0);
             let response_x = ui.add(
                 egui::DragValue::new(&mut scale_x)
@@ -2040,6 +1996,10 @@ impl PropertiesPanel {
                     scale_y: scale_y / 100.0,
                 });
             }
+            // Right-click instantly resets X to 100%
+            if response_x.clicked_by(PointerButton::Secondary) {
+                actions.push(PropertiesAction::SetClipScale { layer_id, slot, scale_x: 1.0, scale_y: scale_y / 100.0 });
+            }
             ui.label("×");
             let response_y = ui.add(
                 egui::DragValue::new(&mut scale_y)
@@ -2054,6 +2014,10 @@ impl PropertiesPanel {
                     scale_x: scale_x / 100.0,
                     scale_y: scale_y / 100.0,
                 });
+            }
+            // Right-click instantly resets Y to 100%
+            if response_y.clicked_by(PointerButton::Secondary) {
+                actions.push(PropertiesAction::SetClipScale { layer_id, slot, scale_x: scale_x / 100.0, scale_y: 1.0 });
             }
         });
 
@@ -2076,12 +2040,10 @@ impl PropertiesPanel {
                     degrees: rotation_deg,
                 });
             }
-            response.context_menu(|ui| {
-                if ui.button("Reset to 0°").clicked() {
-                    actions.push(PropertiesAction::SetClipRotation { layer_id, slot, degrees: 0.0 });
-                    ui.close_menu();
-                }
-            });
+            // Right-click instantly resets to 0°
+            if response.clicked_by(PointerButton::Secondary) {
+                actions.push(PropertiesAction::SetClipRotation { layer_id, slot, degrees: 0.0 });
+            }
         });
 
         // ========== CLIP EFFECTS ==========

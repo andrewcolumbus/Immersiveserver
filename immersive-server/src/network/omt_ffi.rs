@@ -377,6 +377,8 @@ impl Drop for LibOmtSender {
 pub struct LibOmtReceiver {
     handle: *mut OmtReceiveHandle,
     address: String,
+    /// Whether audio capture is enabled
+    audio_enabled: bool,
 }
 
 // LibOmtReceiver is Send because the C library is thread-safe
@@ -389,12 +391,24 @@ impl LibOmtReceiver {
     /// - Discovery format: "HOSTNAME (NAME)"
     /// - Direct URL: "omt://hostname:port"
     pub fn new(address: &str) -> Result<Self, String> {
+        Self::new_with_audio(address, false)
+    }
+
+    /// Create a new OMT receiver with optional audio capture.
+    pub fn new_with_audio(address: &str, enable_audio: bool) -> Result<Self, String> {
         let c_address = CString::new(address).map_err(|e| format!("Invalid address: {}", e))?;
+
+        // Request both video and audio frames if audio is enabled
+        let frame_types = if enable_audio {
+            OMTFrameType::Video as c_int | OMTFrameType::Audio as c_int
+        } else {
+            OMTFrameType::Video as c_int
+        };
 
         let handle = unsafe {
             omt_receive_create(
                 c_address.as_ptr(),
-                OMTFrameType::Video as c_int, // Video frames only
+                frame_types,
                 OMTPreferredVideoFormat::BGRA as c_int,
                 OMTReceiveFlags::None as c_int,
             )
@@ -404,12 +418,22 @@ impl LibOmtReceiver {
             return Err("Failed to create OMT receiver - null handle returned".to_string());
         }
 
-        tracing::info!("libOMT: Created receiver for '{}'", address);
+        tracing::info!(
+            "libOMT: Created receiver for '{}' (audio: {})",
+            address,
+            enable_audio
+        );
 
         Ok(Self {
             handle,
             address: address.to_string(),
+            audio_enabled: enable_audio,
         })
+    }
+
+    /// Check if audio capture is enabled
+    pub fn audio_enabled(&self) -> bool {
+        self.audio_enabled
     }
 
     /// Receive a video frame with timeout.
@@ -462,6 +486,63 @@ impl LibOmtReceiver {
         })
     }
 
+    /// Receive any frame (video or audio) with timeout.
+    ///
+    /// Returns the frame type received, or None if timed out.
+    /// Use this when audio capture is enabled.
+    pub fn receive_any_frame(&self, timeout_ms: i32) -> Option<ReceivedAnyFrame> {
+        let frame_types = if self.audio_enabled {
+            OMTFrameType::Video as c_int | OMTFrameType::Audio as c_int
+        } else {
+            OMTFrameType::Video as c_int
+        };
+
+        let frame_ptr = unsafe { omt_receive(self.handle, frame_types, timeout_ms as c_int) };
+
+        if frame_ptr.is_null() {
+            return None;
+        }
+
+        let frame = unsafe { &*frame_ptr };
+
+        if frame.frame_type == OMTFrameType::Video as c_int {
+            // Video frame
+            if frame.width <= 0 || frame.height <= 0 {
+                return None;
+            }
+            if frame.data.is_null() || frame.data_length <= 0 {
+                return None;
+            }
+
+            let is_bgra = frame.codec == codec::BGRA;
+
+            Some(ReceivedAnyFrame::Video(ReceivedFrame {
+                width: frame.width as u32,
+                height: frame.height as u32,
+                stride: frame.stride as u32,
+                data_ptr: frame.data as *const u8,
+                data_len: frame.data_length as usize,
+                is_bgra,
+                frame_rate_n: frame.frame_rate_n,
+                frame_rate_d: frame.frame_rate_d,
+            }))
+        } else if frame.frame_type == OMTFrameType::Audio as c_int {
+            // Audio frame
+            if frame.data.is_null() || frame.samples_per_channel <= 0 || frame.channels <= 0 {
+                return None;
+            }
+
+            Some(ReceivedAnyFrame::Audio(ReceivedAudioFrame {
+                sample_rate: frame.sample_rate as u32,
+                channels: frame.channels as u32,
+                samples_per_channel: frame.samples_per_channel as usize,
+                data_ptr: frame.data as *const f32,
+            }))
+        } else {
+            None
+        }
+    }
+
     /// Get the address this receiver is connected to.
     pub fn address(&self) -> &str {
         &self.address
@@ -477,7 +558,13 @@ impl Drop for LibOmtReceiver {
     }
 }
 
-/// Temporary reference to a received frame.
+/// Enum for either video or audio frame.
+pub enum ReceivedAnyFrame {
+    Video(ReceivedFrame),
+    Audio(ReceivedAudioFrame),
+}
+
+/// Temporary reference to a received video frame.
 ///
 /// This data is only valid until the next call to `receive_frame()`.
 /// Copy the data if you need to keep it.
@@ -501,6 +588,30 @@ impl ReceivedFrame {
             return Vec::new();
         }
         std::slice::from_raw_parts(self.data_ptr, self.data_len).to_vec()
+    }
+}
+
+/// Temporary reference to a received audio frame.
+///
+/// OMT audio is interleaved float32 format.
+/// This data is only valid until the next call to `receive_frame()`.
+pub struct ReceivedAudioFrame {
+    pub sample_rate: u32,
+    pub channels: u32,
+    pub samples_per_channel: usize,
+    pub data_ptr: *const f32,
+}
+
+impl ReceivedAudioFrame {
+    /// Copy the audio data to a new Vec.
+    ///
+    /// SAFETY: The caller must ensure this is called before the next omt_receive() call.
+    pub unsafe fn copy_data(&self) -> Vec<f32> {
+        if self.data_ptr.is_null() || self.samples_per_channel == 0 {
+            return Vec::new();
+        }
+        let total_samples = self.samples_per_channel * self.channels as usize;
+        std::slice::from_raw_parts(self.data_ptr, total_samples).to_vec()
     }
 }
 

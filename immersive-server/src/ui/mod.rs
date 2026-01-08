@@ -19,6 +19,7 @@ pub mod properties_panel;
 pub mod sources_panel;
 pub mod thumbnail_cache;
 pub mod viewport_widget;
+pub mod widgets;
 pub mod window_registry;
 
 pub use advanced_output_window::{AdvancedOutputAction, AdvancedOutputWindow};
@@ -37,6 +38,18 @@ pub use properties_panel::{PropertiesPanel, PropertiesAction, PropertiesTab};
 pub use sources_panel::{DraggableSource, SourcesAction, SourcesPanel};
 pub use thumbnail_cache::ThumbnailCache;
 pub use viewport_widget::{ViewportConfig, ViewportResponse, UvRenderInfo, handle_viewport_input, compute_uv_rect, compute_uv_and_dest_rect, draw_zoom_indicator};
+pub use widgets::{
+    // Slider/DragValue reset helpers
+    slider_with_reset, slider_with_reset_suffix,
+    drag_value_with_reset, drag_value_with_reset_speed, drag_value_with_reset_suffix,
+    drag_value_i32_with_reset, drag_value_u32_with_reset, drag_value_with_reset_range_suffix,
+    add_reset_on_right_click, add_reset_f32, add_reset_i32, add_reset_u32,
+    // Texture registration helpers
+    register_egui_texture, register_egui_texture_ptr, free_egui_texture,
+    // Texture rendering helpers
+    draw_texture, draw_texture_uv, draw_texture_aspect_fit,
+    draw_texture_placeholder, draw_texture_or_placeholder, FULL_UV,
+};
 pub use window_registry::{WindowEntry, WindowRegistry, WindowType};
 
 // Re-export scrubber widget from external egui-widgets crate

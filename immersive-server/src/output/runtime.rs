@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use winit::window::WindowId;
 
-use super::{MaskShape, OutputDevice, Screen, ScreenId, Slice, SliceId, SliceInput, SliceMask, WarpMesh};
+use super::{MaskShape, OutputDevice, Rect, Screen, ScreenId, Slice, SliceId, SliceInput, SliceMask, WarpMesh};
 use crate::network::NdiCapture;
 
 /// Screen-level color correction parameters (matches shader uniform)
@@ -1016,7 +1016,8 @@ impl ScreenRuntime {
             format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_SRC,
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
 
@@ -1081,7 +1082,8 @@ impl ScreenRuntime {
             format: self.format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_SRC,
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
 
@@ -1834,16 +1836,28 @@ impl OutputManager {
     }
 
     /// Add a new screen with default slice
-    pub fn add_screen(&mut self, device: &wgpu::Device, name: impl Into<String>) -> ScreenId {
+    ///
+    /// The `env_dimensions` parameter is used to compute the default input_rect
+    /// so that the screen captures a pixel-accurate region of the environment
+    /// (e.g., a 1920x1080 screen captures a 1920x1080 region, not the full environment).
+    pub fn add_screen(&mut self, device: &wgpu::Device, name: impl Into<String>, env_dimensions: (u32, u32)) -> ScreenId {
         let screen_id = ScreenId(self.next_screen_id);
         self.next_screen_id += 1;
 
         let slice_id = SliceId(self.next_slice_id);
         self.next_slice_id += 1;
 
-        let screen = Screen::new_with_default_slice(screen_id, name, slice_id);
+        let mut screen = Screen::new_with_default_slice(screen_id, name, slice_id);
         let width = screen.width;
         let height = screen.height;
+
+        // Compute input_rect based on screen resolution vs environment
+        // A 1920x1080 screen in a 12000x2160 env gets input_rect (0, 0, 0.16, 0.5)
+        let input_width = (width as f32 / env_dimensions.0 as f32).min(1.0);
+        let input_height = (height as f32 / env_dimensions.1 as f32).min(1.0);
+        if let Some(slice) = screen.slices.first_mut() {
+            slice.input_rect = Rect::new(0.0, 0.0, input_width, input_height);
+        }
 
         // Create runtime
         let mut runtime = ScreenRuntime::new(device, screen_id, width, height, self.format);
@@ -1858,16 +1872,26 @@ impl OutputManager {
     }
 
     /// Add a screen from existing Screen data (for loading presets)
-    pub fn add_screen_from_data(&mut self, device: &wgpu::Device, mut screen: Screen) -> ScreenId {
+    ///
+    /// The `env_dimensions` parameter is used to compute the default input_rect
+    /// for slices that have full coverage, so screens capture a pixel-accurate
+    /// region of the environment rather than the entire thing.
+    pub fn add_screen_from_data(&mut self, device: &wgpu::Device, mut screen: Screen, env_dimensions: (u32, u32)) -> ScreenId {
         // Assign new IDs to avoid conflicts
         let screen_id = ScreenId(self.next_screen_id);
         self.next_screen_id += 1;
         screen.id = screen_id;
 
-        // Reassign slice IDs
+        // Reassign slice IDs and compute input_rect for slices with full coverage
+        let input_width = (screen.width as f32 / env_dimensions.0 as f32).min(1.0);
+        let input_height = (screen.height as f32 / env_dimensions.1 as f32).min(1.0);
         for slice in &mut screen.slices {
             slice.id = SliceId(self.next_slice_id);
             self.next_slice_id += 1;
+            // Only adjust input_rect if it's at default full coverage
+            if slice.input_rect.is_full() {
+                slice.input_rect = Rect::new(0.0, 0.0, input_width, input_height);
+            }
         }
 
         let width = screen.width;

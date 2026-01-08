@@ -106,10 +106,7 @@ impl Viewport {
             .map(|t| now.duration_since(t).as_millis() < 300)
             .unwrap_or(false);
 
-        tracing::info!("[VIEWPORT DEBUG] viewport.rs: on_right_mouse_down pos={:?}, is_double_click={}", pos, is_double_click);
-
         if is_double_click {
-            tracing::info!("[VIEWPORT DEBUG] viewport.rs: Double-click detected, resetting");
             self.reset();
             self.last_right_click = None;
             self.is_dragging = false;
@@ -121,13 +118,11 @@ impl Viewport {
         self.is_dragging = true;
         self.last_drag_pos = Some(pos);
         self.velocity = (0.0, 0.0);
-        tracing::info!("[VIEWPORT DEBUG] viewport.rs: Started dragging, is_dragging={}", self.is_dragging);
         false
     }
 
     /// Handle right mouse button release
     pub fn on_right_mouse_up(&mut self) {
-        tracing::info!("[VIEWPORT DEBUG] viewport.rs: on_right_mouse_up, was_dragging={}", self.is_dragging);
         self.is_dragging = false;
         self.last_drag_pos = None;
     }
@@ -147,7 +142,6 @@ impl Viewport {
         }
 
         let Some(last_pos) = self.last_drag_pos else {
-            tracing::info!("[VIEWPORT DEBUG] viewport.rs: on_mouse_move - no last_pos, setting to {:?}", pos);
             self.last_drag_pos = Some(pos);
             return;
         };
@@ -174,8 +168,6 @@ impl Viewport {
         // Apply resistance when past bounds
         self.offset.0 = Self::apply_drag_resistance(new_offset_x, min_offset.0, max_offset.0);
         self.offset.1 = Self::apply_drag_resistance(new_offset_y, min_offset.1, max_offset.1);
-
-        tracing::info!("[VIEWPORT DEBUG] viewport.rs: on_mouse_move delta=({:.1}, {:.1}), new_offset=({:.4}, {:.4})", delta_x, delta_y, self.offset.0, self.offset.1);
 
         self.last_drag_pos = Some(pos);
     }

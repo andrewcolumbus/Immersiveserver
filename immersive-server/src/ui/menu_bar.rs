@@ -7,6 +7,7 @@
 use super::layout_preset::LayoutPresetManager;
 use super::menu_definition::{MenuBarDefinition, MenuDefinition, MenuItem, MenuItemAction, MenuItemId, SettingId};
 use crate::settings::EnvironmentSettings;
+use egui::PointerButton;
 use std::path::PathBuf;
 
 /// UI state for the menu bar and panels
@@ -393,6 +394,11 @@ impl MenuBar {
 
                 if response.changed() {
                     self.pending_menu_action = Some(MenuAction::SetBpm { bpm });
+                }
+
+                // Right-click instantly resets to 120 BPM
+                if response.clicked_by(PointerButton::Secondary) {
+                    self.pending_menu_action = Some(MenuAction::SetBpm { bpm: 120.0 });
                 }
 
                 // Tap tempo button

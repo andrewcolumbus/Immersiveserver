@@ -1,7 +1,7 @@
 //! Central audio manager coordinating all audio sources and FFT analysis
 
 use super::fft::FftAnalyzer;
-use super::source::AudioSource;
+use super::source::{AudioSource, AudioSourceState};
 use super::system_input::SystemAudioInput;
 use super::types::{AudioBand, AudioSourceId, FftData};
 use std::collections::HashMap;
@@ -270,5 +270,123 @@ impl AudioManager {
     /// List available system audio devices
     pub fn list_audio_devices() -> Vec<String> {
         SystemAudioInput::list_devices()
+    }
+
+    /// Initialize system audio with a specific device (None = default device)
+    pub fn init_system_audio_device(&mut self, device_name: Option<&str>) -> Result<(), String> {
+        // Remove existing system audio if present
+        self.remove_source(&AudioSourceId::SystemInput);
+
+        match SystemAudioInput::with_device(device_name) {
+            Ok(mut input) => {
+                input.start_capture()?;
+                let sample_rate = input.sample_rate();
+                let id = input.id().clone();
+
+                self.sources.insert(id.clone(), Box::new(input));
+                self.analyzers
+                    .insert(id.clone(), FftAnalyzer::new(sample_rate));
+
+                // Set as primary source
+                self.primary_source = Some(id);
+                self.system_audio_initialized = true;
+
+                tracing::info!(
+                    "System audio initialized with device: {}",
+                    device_name.unwrap_or("default")
+                );
+                Ok(())
+            }
+            Err(e) => {
+                tracing::warn!("Failed to initialize system audio device: {}", e);
+                Err(e)
+            }
+        }
+    }
+
+    /// Add an NDI audio source and return its state for passing to NdiReceiver
+    pub fn add_ndi_source(&mut self, ndi_name: &str) -> Arc<AudioSourceState> {
+        use super::ndi_source::NdiAudioSource;
+
+        // Remove any existing NDI source with the same name
+        let source_id = AudioSourceId::Ndi(ndi_name.to_string());
+        self.remove_source(&source_id);
+
+        let source = NdiAudioSource::new(ndi_name);
+        let state = source.state();
+        let sample_rate = source.sample_rate();
+        let id = source.id().clone();
+
+        let _ = source.start();
+        self.sources.insert(id.clone(), Box::new(source));
+        self.analyzers.insert(id.clone(), FftAnalyzer::new(sample_rate));
+
+        // Set as primary source
+        self.primary_source = Some(id);
+
+        tracing::info!("Added NDI audio source: {}", ndi_name);
+        state
+    }
+
+    /// Add an OMT audio source and return its state for passing to OmtReceiver
+    pub fn add_omt_source(&mut self, address: &str) -> Arc<AudioSourceState> {
+        use super::omt_source::OmtAudioSource;
+
+        // Remove any existing OMT source with the same address
+        let source_id = AudioSourceId::Omt(address.to_string());
+        self.remove_source(&source_id);
+
+        let source = OmtAudioSource::new(address);
+        let state = source.state();
+        let sample_rate = source.sample_rate();
+        let id = source.id().clone();
+
+        let _ = source.start();
+        self.sources.insert(id.clone(), Box::new(source));
+        self.analyzers.insert(id.clone(), FftAnalyzer::new(sample_rate));
+
+        // Set as primary source
+        self.primary_source = Some(id);
+
+        tracing::info!("Added OMT audio source: {}", address);
+        state
+    }
+
+    /// Get current audio level (0.0-1.0) for level meter display
+    pub fn get_current_level(&self) -> f32 {
+        self.get_primary_fft_data()
+            .map(|fft| fft.full)
+            .unwrap_or(0.0)
+    }
+
+    /// Get per-band levels for detailed meter (low, mid, high)
+    pub fn get_band_levels(&self) -> (f32, f32, f32) {
+        self.get_primary_fft_data()
+            .map(|fft| (fft.low, fft.mid, fft.high))
+            .unwrap_or((0.0, 0.0, 0.0))
+    }
+
+    /// Clear all audio sources
+    pub fn clear_sources(&mut self) {
+        // Stop all sources first
+        self.stop_all();
+
+        // Clear collections
+        self.sources.clear();
+        self.analyzers.clear();
+
+        if let Ok(mut data) = self.fft_data.write() {
+            data.clear();
+        }
+
+        self.primary_source = None;
+        self.system_audio_initialized = false;
+
+        tracing::info!("Cleared all audio sources");
+    }
+
+    /// Get the default system audio device name
+    pub fn default_device_name() -> Option<String> {
+        SystemAudioInput::default_device_name()
     }
 }
