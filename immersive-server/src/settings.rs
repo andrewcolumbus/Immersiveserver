@@ -117,6 +117,14 @@ pub struct EnvironmentSettings {
     #[serde(rename = "ndiBufferCapacity", default = "default_ndi_buffer_capacity")]
     pub ndi_buffer_capacity: usize,
 
+    /// Whether OMT source discovery is enabled (auto-discovers OMT sources on network)
+    #[serde(rename = "omtDiscoveryEnabled", default = "default_discovery_enabled")]
+    pub omt_discovery_enabled: bool,
+
+    /// Whether NDI source discovery is enabled (auto-discovers NDI sources on network)
+    #[serde(rename = "ndiDiscoveryEnabled", default = "default_discovery_enabled")]
+    pub ndi_discovery_enabled: bool,
+
     /// Whether Syphon (macOS) / Spout (Windows) texture sharing is enabled
     #[serde(rename = "textureShareEnabled", default)]
     pub texture_share_enabled: bool,
@@ -206,6 +214,11 @@ fn default_api_enabled() -> bool {
     true
 }
 
+/// Default discovery enabled state (both OMT and NDI default to enabled)
+fn default_discovery_enabled() -> bool {
+    true
+}
+
 /// Default API server port
 fn default_api_port() -> u16 {
     8080
@@ -229,6 +242,8 @@ impl Default for EnvironmentSettings {
             ndi_broadcast_enabled: false,
             ndi_capture_fps: default_ndi_capture_fps(),
             ndi_buffer_capacity: default_ndi_buffer_capacity(),
+            omt_discovery_enabled: default_discovery_enabled(),
+            ndi_discovery_enabled: default_discovery_enabled(),
             texture_share_enabled: false,
             api_server_enabled: default_api_enabled(),
             api_port: default_api_port(),

@@ -58,6 +58,8 @@ impl PreferencesWindow {
         ndi_broadcasting: bool,
         texture_sharing_active: bool,
         api_server_running: bool,
+        omt_discovery_active: bool,
+        ndi_discovery_active: bool,
     ) -> Vec<PropertiesAction> {
         let mut actions = Vec::new();
 
@@ -84,6 +86,8 @@ impl PreferencesWindow {
                             ndi_broadcasting,
                             texture_sharing_active,
                             api_server_running,
+                            omt_discovery_active,
+                            ndi_discovery_active,
                             &mut actions,
                         );
                     });
@@ -106,6 +110,8 @@ impl PreferencesWindow {
         ndi_broadcasting: bool,
         texture_sharing_active: bool,
         api_server_running: bool,
+        omt_discovery_active: bool,
+        ndi_discovery_active: bool,
         actions: &mut Vec<PropertiesAction>,
     ) {
         // ========== RESOLUTION ==========
@@ -205,6 +211,60 @@ impl PreferencesWindow {
                 self.env_height_text = "1200".to_string();
             }
         });
+
+        ui.add_space(16.0);
+        ui.separator();
+
+        // ========== NETWORK DISCOVERY ==========
+        ui.add_space(8.0);
+        ui.heading("Network Discovery");
+        ui.add_space(4.0);
+
+        // OMT Discovery toggle
+        let mut omt_discovery = settings.omt_discovery_enabled;
+        if ui
+            .checkbox(&mut omt_discovery, "OMT Discovery")
+            .on_hover_text("Automatically discover OMT sources on the network")
+            .changed()
+        {
+            actions.push(PropertiesAction::SetOmtDiscovery {
+                enabled: omt_discovery,
+            });
+        }
+        if omt_discovery_active {
+            ui.horizontal(|ui| {
+                ui.add_space(20.0);
+                ui.label(
+                    egui::RichText::new("Discovering...")
+                        .small()
+                        .color(egui::Color32::GREEN),
+                );
+            });
+        }
+
+        ui.add_space(4.0);
+
+        // NDI Discovery toggle
+        let mut ndi_discovery = settings.ndi_discovery_enabled;
+        if ui
+            .checkbox(&mut ndi_discovery, "NDI Discovery")
+            .on_hover_text("Automatically discover NDI sources on the network")
+            .changed()
+        {
+            actions.push(PropertiesAction::SetNdiDiscovery {
+                enabled: ndi_discovery,
+            });
+        }
+        if ndi_discovery_active {
+            ui.horizontal(|ui| {
+                ui.add_space(20.0);
+                ui.label(
+                    egui::RichText::new("Discovering...")
+                        .small()
+                        .color(egui::Color32::from_rgb(100, 149, 237)), // Cornflower blue for NDI
+                );
+            });
+        }
 
         ui.add_space(16.0);
         ui.separator();

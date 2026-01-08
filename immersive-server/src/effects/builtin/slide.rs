@@ -5,7 +5,7 @@
 use crate::effects::traits::{
     CpuEffectRuntime, EffectDefinition, EffectParams, EffectProcessor, GpuEffectRuntime,
 };
-use crate::effects::types::{Parameter, ParameterMeta};
+use crate::effects::types::{AutomationSource, LfoShape, LfoSource, Parameter, ParameterMeta};
 
 /// Slide effect definition
 pub struct SlideDefinition;
@@ -29,7 +29,20 @@ impl EffectDefinition for SlideDefinition {
 
     fn default_parameters(&self) -> Vec<Parameter> {
         vec![
-            Parameter::new(ParameterMeta::float("offset_x", "Offset X", 0.0, -2.0, 2.0)),
+            {
+                let mut param =
+                    Parameter::new(ParameterMeta::float("offset_x", "Offset X", 0.0, -2.0, 2.0));
+                param.automation = Some(AutomationSource::Lfo(LfoSource {
+                    shape: LfoShape::Sine,
+                    frequency: 1.0 / 30.0, // 30 seconds per cycle
+                    phase: 0.0,
+                    amplitude: 1.0,
+                    offset: 0.0,
+                    sync_to_bpm: false,
+                    beats: 4.0, // unused when not synced
+                }));
+                param
+            },
             Parameter::new(ParameterMeta::float("offset_y", "Offset Y", 0.0, -2.0, 2.0)),
             Parameter::new(ParameterMeta::enumeration(
                 "wrap_mode",

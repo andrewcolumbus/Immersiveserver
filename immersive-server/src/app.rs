@@ -19,6 +19,7 @@ use crate::compositor::{Environment, LayerSource, Viewport};
 use crate::layer_runtime::{LayerRuntime, TextureUpdateResult};
 use crate::settings::EnvironmentSettings;
 use crate::ui::MenuBar;
+use crate::ui::viewport_widget::{self, ViewportConfig};
 use crate::video::{LayerParams, VideoParams, VideoPlayer, VideoRenderer, VideoTexture};
 
 /// Helper function to render egui pass
@@ -54,6 +55,9 @@ fn render_egui_pass(
 
 /// Update FPS display every 1 second
 const FPS_UPDATE_INTERVAL_SECS: f64 = 1.0;
+
+/// Refresh source discovery every 2 seconds
+const DISCOVERY_REFRESH_INTERVAL_SECS: f64 = 2.0;
 
 /// Main application state holding all wgpu resources
 pub struct App {
@@ -123,6 +127,8 @@ pub struct App {
     ui_frames_since_update: u64,
     /// UI FPS (frames per second, updated once per second)
     ui_fps: f64,
+    /// Last time source discovery was refreshed
+    last_discovery_refresh: Instant,
 
     // egui integration
     egui_ctx: egui::Context,
@@ -536,6 +542,9 @@ impl App {
             bc_texture_supported,
         ));
 
+        // Extract discovery settings before moving settings into the struct
+        let omt_discovery_enabled = settings.omt_discovery_enabled;
+
         Self {
             window,
             gpu,
@@ -565,6 +574,7 @@ impl App {
             last_ui_fps_update: now,
             ui_frames_since_update: 0,
             ui_fps: initial_target_fps, // Initialize to target so display isn't 0
+            last_discovery_refresh: now,
             egui_ctx,
             egui_state,
             egui_renderer,
@@ -650,7 +660,7 @@ impl App {
             shader_watcher,
 
             // Initialize OMT networking
-            omt_discovery: Self::create_omt_discovery(),
+            omt_discovery: Self::create_omt_discovery(omt_discovery_enabled),
             omt_sender: None,
             omt_capture: None,
             omt_broadcast_enabled: false, // Disabled by default - enable via menu
@@ -831,14 +841,18 @@ impl App {
     }
 
     /// Create the OMT discovery service
-    fn create_omt_discovery() -> Option<crate::network::SourceDiscovery> {
+    fn create_omt_discovery(enabled: bool) -> Option<crate::network::SourceDiscovery> {
         match crate::network::SourceDiscovery::new() {
             Ok(mut discovery) => {
-                // Start browsing for sources
-                if let Err(e) = discovery.start_browsing() {
-                    tracing::warn!("OMT: Failed to start source discovery: {}", e);
+                // Only start browsing if enabled in settings
+                if enabled {
+                    if let Err(e) = discovery.start_browsing() {
+                        tracing::warn!("OMT: Failed to start source discovery: {}", e);
+                    } else {
+                        tracing::info!("OMT: Source discovery started");
+                    }
                 } else {
-                    tracing::info!("OMT: Source discovery started");
+                    tracing::info!("OMT: Source discovery disabled in settings");
                 }
                 Some(discovery)
             }
@@ -1403,6 +1417,19 @@ impl App {
             // Reset counters
             self.last_ui_fps_update = now;
             self.ui_frames_since_update = 0;
+        }
+
+        // Refresh source discovery periodically
+        let discovery_elapsed = now.duration_since(self.last_discovery_refresh).as_secs_f64();
+        if discovery_elapsed >= DISCOVERY_REFRESH_INTERVAL_SECS {
+            self.last_discovery_refresh = now;
+            // Only refresh if discovery is enabled
+            if self.settings.omt_discovery_enabled {
+                self.refresh_omt_sources();
+            }
+            if self.settings.ndi_discovery_enabled {
+                self.refresh_ndi_sources();
+            }
         }
     }
     
@@ -2263,6 +2290,8 @@ impl App {
         self.converter_window.show(&self.egui_ctx);
 
         // Render Preferences window
+        let omt_discovery_active = self.omt_discovery.as_ref().map(|d| d.is_running()).unwrap_or(false);
+        let ndi_discovery_active = self.sources_panel.is_ndi_discovery_enabled();
         let pref_actions = self.preferences_window.render(
             &self.egui_ctx,
             &self.environment,
@@ -2271,6 +2300,8 @@ impl App {
             self.is_ndi_broadcasting(),
             self.texture_share_enabled,
             self.api_server_running,
+            omt_discovery_active,
+            ndi_discovery_active,
         );
         for action in pref_actions {
             self.handle_properties_action(action);
@@ -2868,6 +2899,43 @@ impl App {
 
         // Apply environment resolution changes (if any) before rendering.
         self.sync_environment_from_settings();
+
+        // Draw zoom indicator overlay on main environment preview (bottom-right corner)
+        // Only show when zoomed (not at 100%)
+        let zoom = self.viewport.zoom();
+        if (zoom - 1.0).abs() > 0.01 {
+            egui::Area::new(egui::Id::new("main_viewport_zoom_indicator"))
+                .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-16.0, -16.0))
+                .order(egui::Order::Tooltip)
+                .interactable(false)
+                .show(&self.egui_ctx, |ui| {
+                    let zoom_percent = (zoom * 100.0).round() as i32;
+                    let text = format!("{}%", zoom_percent);
+                    let font = egui::FontId::proportional(12.0);
+                    let text_color = egui::Color32::WHITE;
+                    let bg_color = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 180);
+
+                    let padding = 8.0;
+                    let galley = ui.painter().layout_no_wrap(text.clone(), font.clone(), text_color);
+                    let text_size = galley.size();
+
+                    let bg_rect = egui::Rect::from_min_size(
+                        egui::pos2(0.0, 0.0),
+                        egui::vec2(text_size.x + padding * 2.0, text_size.y + padding * 2.0),
+                    );
+
+                    let (rect, _) = ui.allocate_exact_size(bg_rect.size(), egui::Sense::hover());
+
+                    ui.painter().rect_filled(rect, 4.0, bg_color);
+                    ui.painter().text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        text,
+                        font,
+                        text_color,
+                    );
+                });
+        }
 
         let full_output = self.egui_ctx.end_pass();
 
@@ -3996,6 +4064,7 @@ impl App {
             video_height: player.height(),
             player: Some(player),
             ndi_receiver: None,
+            omt_receiver: None,
             texture: Some(video_texture),
             bind_group: Some(bind_group),
             has_frame: false, // Will be set to true when first frame is uploaded
@@ -4014,8 +4083,9 @@ impl App {
             fade_out_active: false,
             fade_out_start: None,
             fade_out_duration: std::time::Duration::ZERO,
-            // NDI format (not used for video files)
+            // Format tracking (not used for video files, decoded to RGBA)
             ndi_is_bgra: false,
+            omt_is_bgra: false,
         };
 
         if old_runtime_exists {
@@ -4074,6 +4144,7 @@ impl App {
             video_height: default_height,
             player: None,
             ndi_receiver: Some(receiver),
+            omt_receiver: None,
             texture: Some(video_texture),
             bind_group: Some(bind_group),
             has_frame: false,
@@ -4092,8 +4163,89 @@ impl App {
             fade_out_active: false,
             fade_out_start: None,
             fade_out_duration: std::time::Duration::ZERO,
-            // NDI format - default to BGRA, will be updated from actual frame data
+            // Format tracking - default to BGRA, will be updated from actual frame data
             ndi_is_bgra: true,
+            omt_is_bgra: true,
+        };
+
+        if old_runtime_exists {
+            // Put in pending - old runtime continues to render until new one has a frame
+            self.pending_runtimes.insert(layer_id, runtime);
+        } else {
+            // No old runtime - insert directly
+            self.layer_runtimes.insert(layer_id, runtime);
+        }
+
+        Ok(())
+    }
+
+    /// Load an OMT stream on a layer
+    fn load_layer_omt(
+        &mut self,
+        layer_id: u32,
+        address: &str,
+    ) -> Result<(), String> {
+        let old_runtime_exists = self.layer_runtimes.contains_key(&layer_id);
+
+        // Create OMT receiver
+        let receiver = crate::network::OmtReceiver::connect(address)
+            .map_err(|e| format!("Failed to connect to OMT source: {}", e))?;
+
+        tracing::info!(
+            "Layer {}: Connected to OMT source '{}'",
+            layer_id,
+            address
+        );
+
+        // Create a default-sized texture that will be resized on first frame
+        // OMT sources don't report their resolution until we receive a frame
+        let default_width = 1920;
+        let default_height = 1080;
+
+        // Use BGRA texture format in BGRA pipeline mode
+        let video_texture = if self.settings.bgra_pipeline_enabled {
+            VideoTexture::new_bgra(&self.device, default_width, default_height)
+        } else {
+            VideoTexture::new(&self.device, default_width, default_height)
+        };
+
+        // Create per-layer params buffer
+        let params_buffer = self.video_renderer.create_params_buffer(&self.device);
+
+        // Create bind group
+        let bind_group = self
+            .video_renderer
+            .create_bind_group_with_buffer(&self.device, &video_texture, &params_buffer);
+
+        // Store runtime
+        let runtime = LayerRuntime {
+            layer_id,
+            video_width: default_width,
+            video_height: default_height,
+            player: None,
+            ndi_receiver: None,
+            omt_receiver: Some(receiver),
+            texture: Some(video_texture),
+            bind_group: Some(bind_group),
+            has_frame: false,
+            // Transition state (initialized empty)
+            transition_active: false,
+            transition_start: None,
+            transition_duration: std::time::Duration::ZERO,
+            transition_type: crate::compositor::ClipTransition::Cut,
+            old_bind_group: None,
+            old_video_width: 0,
+            old_video_height: 0,
+            old_clip_transform: None,
+            old_params_buffer: None,
+            params_buffer: Some(params_buffer),
+            // Fade-out state (initialized empty)
+            fade_out_active: false,
+            fade_out_start: None,
+            fade_out_duration: std::time::Duration::ZERO,
+            // Format tracking - default to BGRA, will be updated from actual frame data
+            ndi_is_bgra: true,
+            omt_is_bgra: true,
         };
 
         if old_runtime_exists {
@@ -4490,9 +4642,39 @@ impl App {
                 }
             }
             crate::compositor::ClipSource::Omt { address, name } => {
-                // OMT source playback not yet implemented
-                tracing::warn!("📡 OMT playback not yet implemented: {} ({})", name, address);
-                return Err(format!("OMT playback not yet implemented. Source: {} ({})", name, address));
+                // Check if this is a replay of the same OMT source
+                let is_same_source = if let Some(runtime) = self.layer_runtimes.get(&layer_id) {
+                    if let Some(receiver) = &runtime.omt_receiver {
+                        receiver.source_address() == address
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+
+                if is_same_source {
+                    // Same OMT source - nothing to do (OMT streams continuously)
+                    tracing::info!("📡 OMT source already active on layer {}: {} ({})", layer_id, name, address);
+                } else {
+                    // Different source - connect to new OMT source
+                    tracing::info!(
+                        "📡 Connecting to OMT source '{}' ({}) on layer {} with {:?} transition",
+                        name, address, layer_id, transition.name()
+                    );
+
+                    // Store the transition type for when the new source is ready
+                    self.pending_transition.insert(layer_id, transition);
+
+                    self.load_layer_omt(layer_id, address)?;
+                }
+
+                // Update the active clip slot in the layer
+                if let Some(layer) = self.environment.get_layer_mut(layer_id) {
+                    layer.active_clip = Some(slot);
+                    // Use None for OMT sources (could add LayerSource::Omt variant later)
+                    layer.source = crate::compositor::LayerSource::None;
+                }
             }
             crate::compositor::ClipSource::Ndi { ndi_name, .. } => {
                 // Check if this is a replay of the same NDI source
@@ -4669,9 +4851,9 @@ impl App {
 
     /// Refresh the list of discovered OMT sources
     pub fn refresh_omt_sources(&mut self) {
-        // Get sources from discovery service
+        // Get OMT sources only (not NDI) from discovery service
         let sources: Vec<(String, String, String)> = if let Some(discovery) = &self.omt_discovery {
-            discovery.get_sources()
+            discovery.get_sources_by_type(crate::network::SourceType::Omt)
                 .into_iter()
                 .map(|s| {
                     let address = s.address(); // Call before moving name
@@ -4682,16 +4864,14 @@ impl App {
             Vec::new()
         };
 
-        let count = sources.len();
         self.sources_panel.set_omt_sources(sources);
-        tracing::info!("📡 OMT: Refreshed source list, found {} sources", count);
-        self.menu_bar.set_status(format!("Found {} OMT sources", count));
     }
 
     /// Update the UI with the current OMT sources (called periodically)
     pub fn update_omt_sources_in_ui(&mut self) {
         if let Some(discovery) = &self.omt_discovery {
-            let sources: Vec<(String, String, String)> = discovery.get_sources()
+            let sources: Vec<(String, String, String)> = discovery
+                .get_sources_by_type(crate::network::SourceType::Omt)
                 .into_iter()
                 .map(|s| {
                     let address = s.address(); // Call before moving name
@@ -5571,12 +5751,40 @@ impl App {
         false
     }
 
+    /// Start OMT discovery
+    pub fn start_omt_discovery(&mut self) {
+        if let Some(discovery) = &mut self.omt_discovery {
+            if let Err(e) = discovery.start_browsing() {
+                tracing::error!("📡 OMT: Failed to start discovery: {}", e);
+                self.menu_bar.set_status(format!("OMT discovery failed: {}", e));
+            } else {
+                tracing::info!("📡 OMT: Discovery started");
+                self.settings.omt_discovery_enabled = true;
+                self.sources_panel.set_omt_discovery_enabled(true);
+                self.menu_bar.set_status("OMT discovery started");
+            }
+        }
+    }
+
+    /// Stop OMT discovery
+    pub fn stop_omt_discovery(&mut self) {
+        if let Some(discovery) = &mut self.omt_discovery {
+            discovery.stop_browsing();
+            tracing::info!("📡 OMT: Discovery stopped");
+            self.settings.omt_discovery_enabled = false;
+            self.sources_panel.set_omt_discovery_enabled(false);
+            self.sources_panel.set_omt_sources(Vec::new());
+            self.menu_bar.set_status("OMT discovery stopped");
+        }
+    }
+
     /// Start NDI discovery
     pub fn start_ndi_discovery(&mut self) {
         if let Some(discovery) = &mut self.omt_discovery {
             match discovery.start_ndi_discovery() {
                 Ok(()) => {
                     tracing::info!("📺 NDI: Discovery started");
+                    self.settings.ndi_discovery_enabled = true;
                     self.sources_panel.set_ndi_discovery_enabled(true);
                     self.menu_bar.set_status("NDI discovery started");
                 }
@@ -5593,6 +5801,7 @@ impl App {
         if let Some(discovery) = &mut self.omt_discovery {
             discovery.stop_ndi_discovery();
             tracing::info!("📺 NDI: Discovery stopped");
+            self.settings.ndi_discovery_enabled = false;
             self.sources_panel.set_ndi_discovery_enabled(false);
             self.sources_panel.set_ndi_sources(Vec::new());
             self.menu_bar.set_status("NDI discovery stopped");
@@ -6271,6 +6480,20 @@ impl App {
                 self.settings.ndi_buffer_capacity = capacity;
                 crate::network::ndi::set_ndi_buffer_capacity(capacity);
             }
+            PropertiesAction::SetOmtDiscovery { enabled } => {
+                if enabled {
+                    self.start_omt_discovery();
+                } else {
+                    self.stop_omt_discovery();
+                }
+            }
+            PropertiesAction::SetNdiDiscovery { enabled } => {
+                if enabled {
+                    self.start_ndi_discovery();
+                } else {
+                    self.stop_ndi_discovery();
+                }
+            }
             PropertiesAction::SetThumbnailMode { mode } => {
                 self.settings.thumbnail_mode = mode;
                 // Cache will be automatically cleared on next poll via set_mode()
@@ -6857,6 +7080,12 @@ impl App {
             SourcesAction::RefreshNdiSources => {
                 self.refresh_ndi_sources();
             }
+            SourcesAction::StartOmtDiscovery => {
+                self.start_omt_discovery();
+            }
+            SourcesAction::StopOmtDiscovery => {
+                self.stop_omt_discovery();
+            }
             SourcesAction::StartNdiDiscovery => {
                 self.start_ndi_discovery();
             }
@@ -7138,16 +7367,20 @@ impl App {
     /// Handle right mouse button press for panning
     /// Returns true if viewport was reset (double-click)
     pub fn on_right_mouse_down(&mut self, x: f32, y: f32) -> bool {
-        let reset = self.viewport.on_right_mouse_down((x, y));
-        if reset {
+        let response = viewport_widget::handle_winit_right_mouse_down(
+            &mut self.viewport,
+            (x, y),
+            &ViewportConfig::default(),
+        );
+        if response.changed {
             self.update_present_params();
         }
-        reset
+        response.was_reset
     }
 
     /// Handle right mouse button release
     pub fn on_right_mouse_up(&mut self) {
-        self.viewport.on_right_mouse_up();
+        viewport_widget::handle_winit_right_mouse_up(&mut self.viewport);
     }
 
     /// Handle mouse movement
@@ -7155,16 +7388,41 @@ impl App {
         self.cursor_position = (x, y);
         let window_size = (self.size.width as f32, self.size.height as f32);
         let env_size = (self.environment.width() as f32, self.environment.height() as f32);
-        self.viewport.on_mouse_move((x, y), window_size, env_size);
-        self.update_present_params();
+        let response = viewport_widget::handle_winit_mouse_move(
+            &mut self.viewport,
+            (x, y),
+            window_size,
+            env_size,
+        );
+        if response.changed {
+            self.update_present_params();
+        }
     }
 
     /// Handle scroll wheel for zooming
     pub fn on_scroll(&mut self, delta: f32) {
         let window_size = (self.size.width as f32, self.size.height as f32);
         let env_size = (self.environment.width() as f32, self.environment.height() as f32);
-        self.viewport.on_scroll(delta, self.cursor_position, window_size, env_size);
-        self.update_present_params();
+
+        // Main window scroll is already normalized in main.rs (PixelDelta divided by 50)
+        // Use sensitivity=1.0 to avoid double-division
+        let config = ViewportConfig {
+            scroll_sensitivity: 1.0,
+            scroll_threshold: 0.001, // Match original threshold from main.rs
+            double_click_reset: true,
+        };
+
+        let response = viewport_widget::handle_winit_scroll(
+            &mut self.viewport,
+            delta,
+            self.cursor_position,
+            window_size,
+            env_size,
+            &config,
+        );
+        if response.changed {
+            self.update_present_params();
+        }
     }
 
     /// Handle keyboard zoom (+/- keys)

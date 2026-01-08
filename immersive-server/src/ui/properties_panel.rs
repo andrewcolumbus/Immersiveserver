@@ -67,6 +67,10 @@ pub enum PropertiesAction {
     SetNdiCaptureFps { fps: u32 },
     /// NDI receive buffer capacity changed
     SetNdiBufferCapacity { capacity: usize },
+    /// OMT discovery toggle changed
+    SetOmtDiscovery { enabled: bool },
+    /// NDI discovery toggle changed
+    SetNdiDiscovery { enabled: bool },
     /// Syphon/Spout texture sharing toggle changed
     SetTextureShare { enabled: bool },
     /// REST API server toggle changed

@@ -6,6 +6,7 @@
 use crate::compositor::Viewport;
 use crate::output::{DisplayInfo, EdgeBlendConfig, MaskShape, OutputDevice, OutputManager, OutputPresetManager, Point2D as MaskPoint2D, Screen, ScreenId, Slice, SliceId, SliceInput, SliceMask, WarpMesh};
 use crate::output::slice::{Point2D, Rect};
+use super::viewport_widget::{self, ViewportConfig};
 
 /// Tab selection for the Advanced Output window
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -673,7 +674,7 @@ impl AdvancedOutputWindow {
             ui.separator();
 
             // MIDDLE COLUMN: Environment preview with input_rect overlays
-            self.render_environment_preview(ui, screens, actions);
+            self.render_environment_preview(ui, screens, actions, env_dimensions);
 
             ui.separator();
 
@@ -704,25 +705,36 @@ impl AdvancedOutputWindow {
         ui: &mut egui::Ui,
         screens: &[&Screen],
         actions: &mut Vec<AdvancedOutputAction>,
+        env_dimensions: (u32, u32),
     ) {
         ui.vertical(|ui| {
             ui.set_min_width(300.0);
             ui.heading("Environment");
             ui.add_space(4.0);
 
-            // Calculate preview size with 16:9 aspect ratio
+            // Calculate preview size using actual environment aspect ratio
+            let env_aspect = env_dimensions.0 as f32 / env_dimensions.1 as f32;
             let available_height = (ui.available_height() - 50.0).max(100.0).min(500.0);
-            let preview_height = available_height;
-            let preview_width = preview_height * 16.0 / 9.0;
+            let available_width = ui.available_width();
+            // Fit to available space while maintaining aspect ratio
+            let preview_width = (available_height * env_aspect).min(available_width);
+            let preview_height = preview_width / env_aspect;
             let preview_size = egui::vec2(preview_width, preview_height);
 
             let (rect, response) = ui.allocate_exact_size(preview_size, egui::Sense::click_and_drag());
 
-            // Environment content size (16:9 - use 1920x1080 as reference)
-            let env_content_size = (1920.0_f32, 1080.0_f32);
+            // Environment content size (actual dimensions)
+            let env_content_size = (env_dimensions.0 as f32, env_dimensions.1 as f32);
 
             // Handle viewport pan/zoom (right-click drag, scroll wheel)
-            self.handle_viewport_input(ui, &response, rect, preview_size, env_content_size, true);
+            viewport_widget::handle_viewport_input(
+                ui,
+                &response,
+                rect,
+                &mut self.env_viewport,
+                env_content_size,
+                &ViewportConfig::default(),
+            );
 
             // Draw environment texture background
             ui.painter().rect_filled(rect, 4.0, egui::Color32::from_rgb(30, 30, 30));
@@ -774,12 +786,12 @@ impl AdvancedOutputWindow {
             // Handle interactions (click to select, drag to edit)
             self.handle_environment_interactions(ui, rect, preview_size, screens, actions, &response, env_content_size);
 
-            // Show resolution info and zoom level
+            // Draw zoom indicator in bottom-right corner
+            viewport_widget::draw_zoom_indicator(ui, rect, &self.env_viewport);
+
+            // Show help text
             ui.add_space(4.0);
-            let zoom_percent = (self.env_viewport.zoom() * 100.0).round() as i32;
-            ui.label(egui::RichText::new(
-                format!("Zoom: {}% | Right-drag to pan, scroll to zoom", zoom_percent)
-            ).small().weak());
+            ui.label(egui::RichText::new("Right-drag to pan, scroll to zoom").small().weak());
         });
     }
 
@@ -799,14 +811,9 @@ impl AdvancedOutputWindow {
         let zoom = self.env_viewport.zoom();
 
         for (index, screen) in screens.iter().enumerate() {
-            // Get the transform rect for this screen (use first slice's output.rect, or default to full)
+            // Get the input rect for this screen (which part of environment it captures)
             let transform_rect = screen.slices.first()
-                .map(|s| Rect {
-                    x: s.output.rect.x,
-                    y: s.output.rect.y,
-                    width: s.output.rect.width,
-                    height: s.output.rect.height,
-                })
+                .map(|s| s.input_rect)
                 .unwrap_or_else(Rect::full);
 
             // Convert normalized rect to screen coordinates using viewport transform
@@ -1156,12 +1163,7 @@ impl AdvancedOutputWindow {
         let find_screen_at = |this: &Self, pos: egui::Pos2| -> Option<(ScreenId, Rect, egui::Rect)> {
             for screen in screens.iter().rev() {
                 let transform_rect = screen.slices.first()
-                    .map(|s| Rect {
-                        x: s.output.rect.x,
-                        y: s.output.rect.y,
-                        width: s.output.rect.width,
-                        height: s.output.rect.height,
-                    })
+                    .map(|s| s.input_rect)
                     .unwrap_or_else(Rect::full);
 
                 let screen_rect = this.transform_rect_to_screen(
@@ -2458,7 +2460,14 @@ impl AdvancedOutputWindow {
                     ui.allocate_exact_size(preview_size, egui::Sense::click_and_drag());
 
                 // Handle viewport pan/zoom (right-click drag, scroll wheel)
-                self.handle_viewport_input(ui, &response, rect, preview_size, output_content_size, false);
+                viewport_widget::handle_viewport_input(
+                    ui,
+                    &response,
+                    rect,
+                    &mut self.output_viewport,
+                    output_content_size,
+                    &ViewportConfig::default(),
+                );
 
                 // Draw preview background
                 ui.painter().rect_filled(
@@ -3108,23 +3117,19 @@ impl AdvancedOutputWindow {
                 }
                 } // End of MeshWarp mode check
 
+                // Draw zoom indicator in bottom-right corner
+                viewport_widget::draw_zoom_indicator(ui, rect, &self.output_viewport);
+
                 ui.add_space(4.0);
-                // Show resolution info and zoom level
-                let zoom_percent = (self.output_viewport.zoom() * 100.0).round() as i32;
+                // Show resolution info
                 if let Some(screen_id) = self.selected_screen {
                     if let Some(screen) = screens.iter().find(|s| s.id == screen_id) {
                         ui.label(
-                            egui::RichText::new(format!("{}x{} | Zoom: {}%", screen.width, screen.height, zoom_percent))
+                            egui::RichText::new(format!("{}x{}", screen.width, screen.height))
                                 .small()
                                 .weak(),
                         );
                     }
-                } else {
-                    ui.label(
-                        egui::RichText::new(format!("Zoom: {}%", zoom_percent))
-                            .small()
-                            .weak(),
-                    );
                 }
             });
 
@@ -3988,67 +3993,6 @@ impl AdvancedOutputWindow {
             content_size,
         );
         egui::Rect::from_min_max(top_left, bottom_right)
-    }
-
-    /// Handle viewport input (right-click pan, scroll zoom)
-    /// Returns true if viewport input was handled (to skip other interactions)
-    fn handle_viewport_input(
-        &mut self,
-        ui: &egui::Ui,
-        response: &egui::Response,
-        rect: egui::Rect,
-        preview_size: egui::Vec2,
-        content_size: (f32, f32),
-        is_environment_preview: bool,
-    ) -> bool {
-        let viewport = if is_environment_preview {
-            &mut self.env_viewport
-        } else {
-            &mut self.output_viewport
-        };
-
-        let window_size = (preview_size.x, preview_size.y);
-        let mut handled = false;
-
-        // Handle right-click drag start
-        if response.drag_started_by(egui::PointerButton::Secondary) {
-            if let Some(pos) = response.interact_pointer_pos() {
-                let local_pos = (pos.x - rect.left(), pos.y - rect.top());
-                let _was_reset = viewport.on_right_mouse_down(local_pos);
-                handled = true;
-            }
-        }
-
-        // Handle right-click drag
-        if response.dragged_by(egui::PointerButton::Secondary) {
-            if let Some(pos) = response.interact_pointer_pos() {
-                let local_pos = (pos.x - rect.left(), pos.y - rect.top());
-                viewport.on_mouse_move(local_pos, window_size, content_size);
-                handled = true;
-            }
-        }
-
-        // Handle right-click drag end
-        if response.drag_stopped_by(egui::PointerButton::Secondary) {
-            viewport.on_right_mouse_up();
-            handled = true;
-        }
-
-        // Handle scroll wheel zoom (when hovered)
-        if response.hovered() {
-            let scroll = ui.input(|i| i.raw_scroll_delta.y);
-            if scroll.abs() > 0.5 {
-                if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
-                    let local_pos = (pos.x - rect.left(), pos.y - rect.top());
-                    // Normalize scroll to reasonable zoom increments
-                    let zoom_delta = scroll / 50.0;
-                    viewport.on_scroll(zoom_delta, local_pos, window_size, content_size);
-                    handled = true;
-                }
-            }
-        }
-
-        handled
     }
 
     /// Update viewport animations (call each frame when window is open)

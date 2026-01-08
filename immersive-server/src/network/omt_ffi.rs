@@ -83,6 +83,38 @@ pub enum OMTColorSpace {
     BT709 = 709,
 }
 
+/// Preferred uncompressed video format for receiver.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OMTPreferredVideoFormat {
+    /// UYVY only (fastest).
+    UYVY = 0,
+    /// BGRA only when alpha present, UYVY otherwise.
+    UYVYorBGRA = 1,
+    /// Always convert to BGRA.
+    BGRA = 2,
+    /// UYVA only when alpha present, UYVY otherwise.
+    UYVYorUYVA = 3,
+    /// High bit depth with alpha support.
+    UYVYorUYVAorP216orPA16 = 4,
+    /// P216 format.
+    P216 = 5,
+}
+
+/// Receiver flags.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OMTReceiveFlags {
+    /// No special flags.
+    None = 0,
+    /// Receive only 1/8th preview.
+    Preview = 1,
+    /// Include compressed VMX1 data.
+    IncludeCompressed = 2,
+    /// Only compressed data, no decode.
+    CompressedOnly = 4,
+}
+
 /// Media frame structure for sending/receiving.
 ///
 /// IMPORTANT: Zero this struct before use.
@@ -192,6 +224,30 @@ extern "C" {
 
     /// Get the number of active connections.
     pub fn omt_send_connections(instance: *mut OmtSendHandle) -> c_int;
+
+    // =========================================
+    // Receiver
+    // =========================================
+
+    /// Create a new OMT receiver and begin connecting to the sender.
+    pub fn omt_receive_create(
+        address: *const c_char,
+        frame_types: c_int,
+        format: c_int,
+        flags: c_int,
+    ) -> *mut OmtReceiveHandle;
+
+    /// Destroy a receiver instance.
+    pub fn omt_receive_destroy(instance: *mut OmtReceiveHandle);
+
+    /// Receive a frame with timeout.
+    /// Returns null if timed out, otherwise a valid frame pointer.
+    /// The frame data is valid until the next call to omt_receive.
+    pub fn omt_receive(
+        instance: *mut OmtReceiveHandle,
+        frame_types: c_int,
+        timeout_ms: c_int,
+    ) -> *mut OMTMediaFrame;
 
     // =========================================
     // Logging
@@ -314,6 +370,137 @@ impl Drop for LibOmtSender {
         unsafe {
             omt_send_destroy(self.handle);
         }
+    }
+}
+
+/// Safe wrapper around libOMT receiver.
+pub struct LibOmtReceiver {
+    handle: *mut OmtReceiveHandle,
+    address: String,
+}
+
+// LibOmtReceiver is Send because the C library is thread-safe
+unsafe impl Send for LibOmtReceiver {}
+
+impl LibOmtReceiver {
+    /// Create a new OMT receiver connecting to the given address.
+    ///
+    /// Address can be either:
+    /// - Discovery format: "HOSTNAME (NAME)"
+    /// - Direct URL: "omt://hostname:port"
+    pub fn new(address: &str) -> Result<Self, String> {
+        let c_address = CString::new(address).map_err(|e| format!("Invalid address: {}", e))?;
+
+        let handle = unsafe {
+            omt_receive_create(
+                c_address.as_ptr(),
+                OMTFrameType::Video as c_int, // Video frames only
+                OMTPreferredVideoFormat::BGRA as c_int,
+                OMTReceiveFlags::None as c_int,
+            )
+        };
+
+        if handle.is_null() {
+            return Err("Failed to create OMT receiver - null handle returned".to_string());
+        }
+
+        tracing::info!("libOMT: Created receiver for '{}'", address);
+
+        Ok(Self {
+            handle,
+            address: address.to_string(),
+        })
+    }
+
+    /// Receive a video frame with timeout.
+    ///
+    /// Returns None if timed out or no frame available.
+    /// The returned frame data must be copied before the next call.
+    pub fn receive_frame(&self, timeout_ms: i32) -> Option<ReceivedFrame> {
+        let frame_ptr = unsafe {
+            omt_receive(
+                self.handle,
+                OMTFrameType::Video as c_int,
+                timeout_ms as c_int,
+            )
+        };
+
+        if frame_ptr.is_null() {
+            return None;
+        }
+
+        // SAFETY: libOMT guarantees the frame pointer is valid until next omt_receive call
+        let frame = unsafe { &*frame_ptr };
+
+        // Only process video frames
+        if frame.frame_type != OMTFrameType::Video as c_int {
+            return None;
+        }
+
+        // Check for valid dimensions
+        if frame.width <= 0 || frame.height <= 0 {
+            return None;
+        }
+
+        // Check for valid data
+        if frame.data.is_null() || frame.data_length <= 0 {
+            return None;
+        }
+
+        // Determine if this is BGRA format
+        let is_bgra = frame.codec == codec::BGRA;
+
+        Some(ReceivedFrame {
+            width: frame.width as u32,
+            height: frame.height as u32,
+            stride: frame.stride as u32,
+            data_ptr: frame.data as *const u8,
+            data_len: frame.data_length as usize,
+            is_bgra,
+            frame_rate_n: frame.frame_rate_n,
+            frame_rate_d: frame.frame_rate_d,
+        })
+    }
+
+    /// Get the address this receiver is connected to.
+    pub fn address(&self) -> &str {
+        &self.address
+    }
+}
+
+impl Drop for LibOmtReceiver {
+    fn drop(&mut self) {
+        tracing::info!("libOMT: Destroying receiver for '{}'", self.address);
+        unsafe {
+            omt_receive_destroy(self.handle);
+        }
+    }
+}
+
+/// Temporary reference to a received frame.
+///
+/// This data is only valid until the next call to `receive_frame()`.
+/// Copy the data if you need to keep it.
+pub struct ReceivedFrame {
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    pub data_ptr: *const u8,
+    pub data_len: usize,
+    pub is_bgra: bool,
+    pub frame_rate_n: c_int,
+    pub frame_rate_d: c_int,
+}
+
+impl ReceivedFrame {
+    /// Copy the frame data to a new Vec.
+    ///
+    /// SAFETY: The caller must ensure this is called before the next omt_receive() call.
+    pub unsafe fn copy_data(&self) -> Vec<u8> {
+        if self.data_ptr.is_null() || self.data_len == 0 {
+            return Vec::new();
+        }
+        std::slice::from_raw_parts(self.data_ptr, self.data_len).to_vec()
     }
 }
 

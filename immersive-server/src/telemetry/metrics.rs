@@ -54,6 +54,23 @@ pub struct NdiStats {
     pub frames_dropped: u64,
 }
 
+/// OMT receiver statistics
+#[derive(Debug, Clone, Default)]
+pub struct OmtStats {
+    /// OMT source address
+    pub source_address: String,
+    /// Last frame pickup latency in milliseconds
+    pub pickup_latency_ms: f64,
+    /// Current number of frames in buffer
+    pub queue_depth: usize,
+    /// Buffer capacity
+    pub buffer_capacity: usize,
+    /// Total frames received
+    pub frames_received: u64,
+    /// Frames dropped due to full buffer
+    pub frames_dropped: u64,
+}
+
 impl GpuMemoryStats {
     /// Get total memory in megabytes
     pub fn total_mb(&self) -> f64 {

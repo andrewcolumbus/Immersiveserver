@@ -18,6 +18,7 @@ pub mod preview_monitor_panel;
 pub mod properties_panel;
 pub mod sources_panel;
 pub mod thumbnail_cache;
+pub mod viewport_widget;
 pub mod window_registry;
 
 pub use advanced_output_window::{AdvancedOutputAction, AdvancedOutputWindow};
@@ -35,6 +36,7 @@ pub use preview_monitor_panel::{PreviewClipInfo, PreviewLayerInfo, PreviewMode, 
 pub use properties_panel::{PropertiesPanel, PropertiesAction, PropertiesTab};
 pub use sources_panel::{DraggableSource, SourcesAction, SourcesPanel};
 pub use thumbnail_cache::ThumbnailCache;
+pub use viewport_widget::{ViewportConfig, ViewportResponse, UvRenderInfo, handle_viewport_input, compute_uv_rect, compute_uv_and_dest_rect, draw_zoom_indicator};
 pub use window_registry::{WindowEntry, WindowRegistry, WindowType};
 
 // Re-export scrubber widget from external egui-widgets crate

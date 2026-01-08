@@ -344,6 +344,41 @@ Creates horizontal copies of the video at its exact size, centered as a group in
 
 ---
 
+## Effect Defaults
+
+Effects can define default automation sources for parameters. This is useful for effects that are typically animated (like Slide).
+
+### Setting Default Automation in Effect Definitions
+
+```rust
+fn default_parameters(&self) -> Vec<Parameter> {
+    vec![
+        {
+            let mut param = Parameter::new(ParameterMeta::float("offset_x", "Offset X", 0.0, -2.0, 2.0));
+            param.automation = Some(AutomationSource::Lfo(LfoSource {
+                shape: LfoShape::Sine,
+                frequency: 0.5,
+                phase: 0.0,
+                amplitude: 1.0,
+                offset: 0.0,
+                sync_to_bpm: false,
+                beats: 4.0,
+            }));
+            param
+        },
+        // ... other params
+    ]
+}
+```
+
+### Built-in Effects with Default Automation
+
+| Effect | Parameter | Automation | Settings |
+|--------|-----------|------------|----------|
+| Slide | offset_x | LFO | Sine, 30s cycle (0.033 Hz), amplitude 1.0 |
+
+---
+
 ## UI Controls
 
 ### Effects Browser Panel (View → Effects)

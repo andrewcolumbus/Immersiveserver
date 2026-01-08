@@ -80,6 +80,10 @@ pub enum SourcesAction {
     RefreshOmtSources,
     /// Refresh NDI source discovery
     RefreshNdiSources,
+    /// Start OMT discovery
+    StartOmtDiscovery,
+    /// Stop OMT discovery
+    StopOmtDiscovery,
     /// Start NDI discovery
     StartNdiDiscovery,
     /// Stop NDI discovery
@@ -97,6 +101,8 @@ pub struct SourcesPanel {
     omt_sources: Vec<DraggableSource>,
     /// Discovered NDI sources
     ndi_sources: Vec<DraggableSource>,
+    /// Whether OMT discovery is enabled
+    omt_discovery_enabled: bool,
     /// Whether NDI discovery is enabled
     ndi_discovery_enabled: bool,
 }
@@ -108,6 +114,7 @@ impl SourcesPanel {
             open: true,
             omt_sources: Vec::new(),
             ndi_sources: Vec::new(),
+            omt_discovery_enabled: false,
             ndi_discovery_enabled: false,
         }
     }
@@ -131,6 +138,16 @@ impl SourcesPanel {
                 url_address,
             })
             .collect();
+    }
+
+    /// Set whether OMT discovery is enabled
+    pub fn set_omt_discovery_enabled(&mut self, enabled: bool) {
+        self.omt_discovery_enabled = enabled;
+    }
+
+    /// Check if OMT discovery is enabled
+    pub fn is_omt_discovery_enabled(&self) -> bool {
+        self.omt_discovery_enabled
     }
 
     /// Set whether NDI discovery is enabled
@@ -160,19 +177,37 @@ impl SourcesPanel {
 
         // OMT Sources section
         let omt_sources = self.omt_sources.clone();
+        let omt_enabled = self.omt_discovery_enabled;
         ui.collapsing("📡 OMT Sources", |ui| {
-            if omt_sources.is_empty() {
-                ui.label(egui::RichText::new("No OMT sources found").italics().color(egui::Color32::GRAY));
-                ui.add_space(4.0);
-                if ui.small_button("🔄 Refresh").clicked() {
-                    actions.push(SourcesAction::RefreshOmtSources);
-                }
-            } else {
-                for source in &omt_sources {
-                    if let Some(action) = Self::render_draggable_source(ui, source.clone()) {
-                        actions.push(action);
+            // Toggle for OMT discovery
+            ui.horizontal(|ui| {
+                let mut enabled = omt_enabled;
+                if ui.checkbox(&mut enabled, "Enable OMT Discovery").changed() {
+                    if enabled {
+                        actions.push(SourcesAction::StartOmtDiscovery);
+                    } else {
+                        actions.push(SourcesAction::StopOmtDiscovery);
                     }
                 }
+            });
+
+            if omt_enabled {
+                ui.add_space(4.0);
+                if omt_sources.is_empty() {
+                    ui.label(egui::RichText::new("No OMT sources found").italics().color(egui::Color32::GRAY));
+                    ui.add_space(4.0);
+                    if ui.small_button("🔄 Refresh").clicked() {
+                        actions.push(SourcesAction::RefreshOmtSources);
+                    }
+                } else {
+                    for source in &omt_sources {
+                        if let Some(action) = Self::render_draggable_source(ui, source.clone()) {
+                            actions.push(action);
+                        }
+                    }
+                }
+            } else {
+                ui.label(egui::RichText::new("Discovery disabled").italics().color(egui::Color32::GRAY));
             }
         });
 
@@ -228,7 +263,18 @@ impl SourcesPanel {
     /// Render a single draggable source item
     /// Returns Some(action) if the source was clicked for preview
     fn render_draggable_source(ui: &mut egui::Ui, source: DraggableSource) -> Option<SourcesAction> {
-        let id = egui::Id::new(format!("source_{}", source.display_name()));
+        // Use unique ID based on source type to avoid collisions
+        let id = match &source {
+            DraggableSource::Omt { id: omt_id, .. } => {
+                egui::Id::new(format!("source_omt_{}", omt_id))
+            }
+            DraggableSource::File { path, .. } => {
+                egui::Id::new(format!("source_file_{}", path.display()))
+            }
+            DraggableSource::Ndi { ndi_name, .. } => {
+                egui::Id::new(format!("source_ndi_{}", ndi_name))
+            }
+        };
 
         // Create a frame for the source item
         let frame = egui::Frame::new()

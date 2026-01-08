@@ -8,6 +8,7 @@
 use crate::compositor::Viewport;
 use crate::network::SourceType;
 use crate::preview_player::VideoInfo;
+use super::viewport_widget::{self, ViewportConfig};
 use egui_widgets::{video_scrubber, ScrubberAction, ScrubberState};
 
 /// Actions that can be returned from the preview monitor panel
@@ -353,69 +354,19 @@ impl PreviewMonitorPanel {
         let content_size = dimensions
             .map(|(w, h)| (w as f32, h as f32))
             .unwrap_or((preview_rect.width(), preview_rect.height()));
-        let preview_size = (preview_rect.width(), preview_rect.height());
 
-        // Handle scroll wheel zoom
-        if response.hovered() {
-            let scroll_delta = ui.input(|i| i.raw_scroll_delta.y);
-            if scroll_delta.abs() > 0.0 {
-                if let Some(pointer_pos) = ui.input(|i| i.pointer.hover_pos()) {
-                    // Convert to position relative to preview rect
-                    let local_pos = (
-                        pointer_pos.x - preview_rect.min.x,
-                        pointer_pos.y - preview_rect.min.y,
-                    );
-                    self.viewport.on_scroll(
-                        scroll_delta / 50.0, // Scale down scroll sensitivity
-                        local_pos,
-                        preview_size,
-                        content_size,
-                    );
-                }
-            }
-        }
-
-        // Handle right-click drag for panning
-        if response.dragged_by(egui::PointerButton::Secondary) {
-            if let Some(pointer_pos) = ui.input(|i| i.pointer.hover_pos()) {
-                let local_pos = (
-                    pointer_pos.x - preview_rect.min.x,
-                    pointer_pos.y - preview_rect.min.y,
-                );
-
-                // Start drag if not already dragging
-                if !self.viewport.offset().0.is_nan() {
-                    // First check if this is a new drag
-                    if response.drag_started_by(egui::PointerButton::Secondary) {
-                        self.viewport.on_right_mouse_down(local_pos);
-                    }
-                    self.viewport.on_mouse_move(local_pos, preview_size, content_size);
-                }
-            }
-        } else if response.drag_stopped_by(egui::PointerButton::Secondary) {
-            self.viewport.on_right_mouse_up();
-        }
-
-        // Handle double-right-click to reset viewport
-        if response.double_clicked_by(egui::PointerButton::Secondary) {
-            self.viewport.reset();
-        }
-
-        // Compute UV rect based on viewport zoom/pan
-        let (scale_x, scale_y, offset_x, offset_y) = self.viewport.get_shader_params(preview_size, content_size);
-
-        // Convert shader params to UV rect
-        // The shader does: adjusted_uv = (uv - 0.5) / scale + 0.5 + offset
-        // So we need to invert this for the UV rect
-        let half_width = 0.5 / scale_x;
-        let half_height = 0.5 / scale_y;
-        let center_u = 0.5 - offset_x / scale_x;
-        let center_v = 0.5 - offset_y / scale_y;
-
-        let uv_rect = egui::Rect::from_min_max(
-            egui::pos2(center_u - half_width, center_v - half_height),
-            egui::pos2(center_u + half_width, center_v + half_height),
+        // Use unified viewport widget for all interactions
+        let _viewport_response = viewport_widget::handle_viewport_input(
+            ui,
+            &response,
+            preview_rect,
+            &mut self.viewport,
+            content_size,
+            &ViewportConfig::default(),
         );
+
+        // Compute UV rect and destination rect for rendering (handles zoom-out clamping)
+        let render_info = viewport_widget::compute_uv_and_dest_rect(&self.viewport, preview_rect, content_size);
 
         // Draw preview background
         ui.painter().rect_filled(
@@ -425,8 +376,8 @@ impl PreviewMonitorPanel {
         );
 
         if has_frame {
-            // Render the preview texture with viewport-adjusted UVs
-            render_preview(ui, preview_rect, uv_rect);
+            // Render the preview texture with clamped UVs into the adjusted dest rect
+            render_preview(ui, render_info.dest_rect, render_info.uv_rect);
         } else {
             // Show appropriate message based on mode
             let message = match &self.mode {
@@ -443,6 +394,9 @@ impl PreviewMonitorPanel {
                 egui::Color32::GRAY,
             );
         }
+
+        // Draw zoom indicator in bottom-right corner
+        viewport_widget::draw_zoom_indicator(ui, preview_rect, &self.viewport);
 
         ui.add_space(4.0);
 

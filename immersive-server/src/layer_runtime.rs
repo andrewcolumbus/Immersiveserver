@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 
 use crate::compositor::layer::Transform2D;
 use crate::compositor::ClipTransition;
-use crate::network::NdiReceiver;
-use crate::telemetry::NdiStats;
+use crate::network::{NdiReceiver, OmtReceiver};
+use crate::telemetry::{NdiStats, OmtStats};
 use crate::video::{VideoPlayer, VideoTexture};
 
 /// Result of attempting to update a layer's texture
@@ -50,6 +50,9 @@ pub struct LayerRuntime {
 
     /// NDI receiver for this layer (if source is an NDI stream)
     pub ndi_receiver: Option<NdiReceiver>,
+
+    /// OMT receiver for this layer (if source is an OMT stream)
+    pub omt_receiver: Option<OmtReceiver>,
 
     /// GPU texture for video frames
     pub texture: Option<VideoTexture>,
@@ -99,6 +102,10 @@ pub struct LayerRuntime {
     /// Whether the current NDI frame is in BGRA format (requires R↔B swap).
     /// Updated each time an NDI frame is received based on actual FourCC.
     pub ndi_is_bgra: bool,
+
+    /// Whether the current OMT frame is in BGRA format (requires R↔B swap).
+    /// Updated each time an OMT frame is received based on actual codec.
+    pub omt_is_bgra: bool,
 }
 
 impl LayerRuntime {
@@ -108,6 +115,7 @@ impl LayerRuntime {
             layer_id,
             player: None,
             ndi_receiver: None,
+            omt_receiver: None,
             texture: None,
             bind_group: None,
             video_width: 0,
@@ -128,14 +136,15 @@ impl LayerRuntime {
             fade_out_active: false,
             fade_out_start: None,
             fade_out_duration: Duration::ZERO,
-            // NDI format tracking
+            // Format tracking
             ndi_is_bgra: true, // Default to BGRA (common case)
+            omt_is_bgra: true, // Default to BGRA (requested format)
         }
     }
 
-    /// Check if this runtime has an active video source (file or NDI)
+    /// Check if this runtime has an active video source (file, NDI, or OMT)
     pub fn has_video(&self) -> bool {
-        self.player.is_some() || self.ndi_receiver.is_some()
+        self.player.is_some() || self.ndi_receiver.is_some() || self.omt_receiver.is_some()
     }
 
     /// Check if this runtime has an NDI source
@@ -143,11 +152,18 @@ impl LayerRuntime {
         self.ndi_receiver.is_some()
     }
 
+    /// Check if this runtime has an OMT source
+    pub fn has_omt(&self) -> bool {
+        self.omt_receiver.is_some()
+    }
+
     /// Returns 1.0 if texture is BGRA (requires R↔B swap), 0.0 if RGBA.
-    /// For NDI sources, this reflects the actual format from the received frame.
+    /// For NDI/OMT sources, this reflects the actual format from the received frame.
     /// Video files always return 0.0 (decoded to RGBA).
     pub fn is_bgra(&self) -> f32 {
         if self.ndi_receiver.is_some() && self.ndi_is_bgra {
+            1.0
+        } else if self.omt_receiver.is_some() && self.omt_is_bgra {
             1.0
         } else {
             0.0
@@ -264,6 +280,37 @@ impl LayerRuntime {
             }
         }
 
+        // Try OmtReceiver
+        if let Some(omt_receiver) = &mut self.omt_receiver {
+            if let Some(omt_frame) = omt_receiver.take_frame() {
+                // Check if texture needs resize BEFORE processing the frame
+                if omt_frame.width != texture.width() || omt_frame.height != texture.height() {
+                    self.video_width = omt_frame.width;
+                    self.video_height = omt_frame.height;
+                    tracing::info!(
+                        "OMT frame resolution changed: {}x{} (texture was {}x{})",
+                        omt_frame.width,
+                        omt_frame.height,
+                        texture.width(),
+                        texture.height()
+                    );
+                    // Frame is lost but next one will have same dimensions
+                    return TextureUpdateResult::NeedsResize {
+                        width: omt_frame.width,
+                        height: omt_frame.height,
+                    };
+                }
+
+                // Update BGRA format tracking from actual frame data
+                self.omt_is_bgra = omt_frame.is_bgra;
+
+                // Upload frame data directly - shader swaps R↔B channels if BGRA
+                texture.upload_raw(queue, &omt_frame.data, omt_frame.width, omt_frame.height);
+                self.has_frame = true;
+                return TextureUpdateResult::Uploaded;
+            }
+        }
+
         TextureUpdateResult::NoFrame
     }
 
@@ -298,6 +345,7 @@ impl LayerRuntime {
     pub fn clear(&mut self) {
         self.player = None;
         self.ndi_receiver = None;
+        self.omt_receiver = None;
         self.texture = None;
         self.bind_group = None;
         self.video_width = 0;
@@ -401,6 +449,18 @@ impl LayerRuntime {
     pub fn ndi_stats(&self) -> Option<NdiStats> {
         self.ndi_receiver.as_ref().map(|recv| NdiStats {
             source_name: recv.source_name().to_string(),
+            pickup_latency_ms: recv.pickup_latency_ms(),
+            queue_depth: recv.queue_depth(),
+            buffer_capacity: recv.buffer_capacity(),
+            frames_received: recv.frame_count(),
+            frames_dropped: recv.frames_dropped(),
+        })
+    }
+
+    /// Get OMT receiver statistics (if this layer has an OMT source)
+    pub fn omt_stats(&self) -> Option<OmtStats> {
+        self.omt_receiver.as_ref().map(|recv| OmtStats {
+            source_address: recv.source_address().to_string(),
             pickup_latency_ms: recv.pickup_latency_ms(),
             queue_depth: recv.queue_depth(),
             buffer_capacity: recv.buffer_capacity(),

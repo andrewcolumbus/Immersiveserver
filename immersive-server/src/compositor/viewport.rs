@@ -91,7 +91,12 @@ impl Viewport {
         self.zoom = 1.0;
         self.velocity = (0.0, 0.0);
     }
-    
+
+    /// Check if currently dragging
+    pub fn is_dragging(&self) -> bool {
+        self.is_dragging
+    }
+
     /// Handle right mouse button press
     /// Returns true if this was a double-click (should reset)
     pub fn on_right_mouse_down(&mut self, pos: (f32, f32)) -> bool {
@@ -100,28 +105,33 @@ impl Viewport {
             .last_right_click
             .map(|t| now.duration_since(t).as_millis() < 300)
             .unwrap_or(false);
-        
+
+        tracing::info!("[VIEWPORT DEBUG] viewport.rs: on_right_mouse_down pos={:?}, is_double_click={}", pos, is_double_click);
+
         if is_double_click {
+            tracing::info!("[VIEWPORT DEBUG] viewport.rs: Double-click detected, resetting");
             self.reset();
             self.last_right_click = None;
             self.is_dragging = false;
             self.last_drag_pos = None;
             return true;
         }
-        
+
         self.last_right_click = Some(now);
         self.is_dragging = true;
         self.last_drag_pos = Some(pos);
         self.velocity = (0.0, 0.0);
+        tracing::info!("[VIEWPORT DEBUG] viewport.rs: Started dragging, is_dragging={}", self.is_dragging);
         false
     }
-    
+
     /// Handle right mouse button release
     pub fn on_right_mouse_up(&mut self) {
+        tracing::info!("[VIEWPORT DEBUG] viewport.rs: on_right_mouse_up, was_dragging={}", self.is_dragging);
         self.is_dragging = false;
         self.last_drag_pos = None;
     }
-    
+
     /// Handle mouse movement during drag
     /// `pos` is current mouse position in window pixels
     /// `window_size` is (width, height) of window
@@ -135,35 +145,38 @@ impl Viewport {
         if !self.is_dragging {
             return;
         }
-        
+
         let Some(last_pos) = self.last_drag_pos else {
+            tracing::info!("[VIEWPORT DEBUG] viewport.rs: on_mouse_move - no last_pos, setting to {:?}", pos);
             self.last_drag_pos = Some(pos);
             return;
         };
-        
+
         // Calculate delta in window pixels
         let delta_x = pos.0 - last_pos.0;
         let delta_y = pos.1 - last_pos.1;
-        
+
         // Convert to normalized offset based on visible environment area
         // At zoom=1, the environment fits the window. At zoom=2, we see half.
         let base_scale = Self::compute_base_scale(window_size, env_size);
         let effective_scale = base_scale * self.zoom;
-        
+
         // Delta in normalized environment coordinates
         let norm_delta_x = delta_x / (window_size.0 * effective_scale);
         let norm_delta_y = delta_y / (window_size.1 * effective_scale);
-        
+
         // Calculate bounds and apply resistance if past them
         let (min_offset, max_offset) = self.compute_offset_bounds(window_size, env_size);
-        
+
         let new_offset_x = self.offset.0 + norm_delta_x;
         let new_offset_y = self.offset.1 + norm_delta_y;
-        
+
         // Apply resistance when past bounds
         self.offset.0 = Self::apply_drag_resistance(new_offset_x, min_offset.0, max_offset.0);
         self.offset.1 = Self::apply_drag_resistance(new_offset_y, min_offset.1, max_offset.1);
-        
+
+        tracing::info!("[VIEWPORT DEBUG] viewport.rs: on_mouse_move delta=({:.1}, {:.1}), new_offset=({:.4}, {:.4})", delta_x, delta_y, self.offset.0, self.offset.1);
+
         self.last_drag_pos = Some(pos);
     }
     

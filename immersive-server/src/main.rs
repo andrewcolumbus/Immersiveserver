@@ -820,8 +820,19 @@ impl ApplicationHandler for ImmersiveApp {
 
             let preferences = AppPreferences::load();
 
-            // Refresh OMT source list for UI
-            app.refresh_omt_sources();
+            // Sync sources panel state with discovery settings
+            app.sources_panel.set_omt_discovery_enabled(app.settings.omt_discovery_enabled);
+            app.sources_panel.set_ndi_discovery_enabled(app.settings.ndi_discovery_enabled);
+
+            // Refresh OMT source list for UI (if discovery is enabled)
+            if app.settings.omt_discovery_enabled {
+                app.refresh_omt_sources();
+            }
+
+            // Start NDI discovery if enabled in settings
+            if app.settings.ndi_discovery_enabled {
+                app.start_ndi_discovery();
+            }
 
             // Initialize native menu on supported platforms
             let native_menu = if is_native_menu_supported() {
@@ -1125,17 +1136,18 @@ impl ApplicationHandler for ImmersiveApp {
                 app.resize(physical_size);
             }
 
-            // On macOS, ensure window gets focus when clicked (always, even if egui consumes)
-            WindowEvent::MouseInput { state: ElementState::Pressed, .. } => {
-                focus_window_on_click(&window);
-            }
+            // Handle mouse button events
+            WindowEvent::MouseInput { state, button, .. } => {
+                // On macOS, ensure window gets focus when clicked (always, even if egui consumes)
+                if state == ElementState::Pressed {
+                    focus_window_on_click(&window);
+                }
 
-            // Handle mouse button events (for viewport panning)
-            WindowEvent::MouseInput { state, button, .. } if !egui_consumed => {
-                if button == MouseButton::Right {
+                // Handle right-click for viewport panning (only when egui doesn't consume)
+                // This prevents double-handling when panning on egui panels like preview monitor
+                if button == MouseButton::Right && !egui_consumed {
                     match state {
                         ElementState::Pressed => {
-                            // Use the tracked cursor position
                             let (cx, cy) = app.cursor_position();
                             app.on_right_mouse_down(cx, cy);
                         }
@@ -1151,7 +1163,8 @@ impl ApplicationHandler for ImmersiveApp {
                 app.on_mouse_move(position.x as f32, position.y as f32);
             }
 
-            // Handle scroll wheel (for viewport zooming)
+            // Handle scroll wheel for viewport zooming (only when egui doesn't consume it)
+            // This prevents double-handling when scrolling over egui panels like preview monitor
             WindowEvent::MouseWheel { delta, .. } if !egui_consumed => {
                 let scroll_amount = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y,

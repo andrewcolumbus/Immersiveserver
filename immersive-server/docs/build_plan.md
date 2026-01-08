@@ -349,11 +349,10 @@ src/ui/effects_browser_panel.rs
 - [x] OMT receiver connects and displays stream
 - [x] OMT latency is measurably lower than NDI (< 1 frame target) [AFTER NDI IMPLTEMENTATION]
 - [x] OMT sender outputs compositor to OMT stream
-- [ ] OMT output receivable by other OMT clients
-- [ ] QUIC transport handles packet loss gracefully
-- [ ] Fallback to libOMT works when Aqueduct unavailable
-- [ ] OMT and NDI can run simultaneously without conflicts - [AFTER NDI IMPLTEMENTATION]
-- [ ] OMT reconnects automatically on network interruption
+- [x] OMT output receivable by other OMT clients
+- [x] QUIC transport handles packet loss gracefully
+- [x] OMT and NDI can run simultaneously without conflicts - [AFTER NDI IMPLTEMENTATION]
+- [x] OMT reconnects automatically on network interruption
 
 ---
 
@@ -511,8 +510,8 @@ src/ui/effects_browser_panel.rs
     - `viewport:changed`
     - `file:opened`, `file:saved`
     - `status:fps` (periodic)
-- [x] **Static File Serving**
-  - Serve web dashboard from embedded assets (dashboard.html)
+- [ ] **Static File Serving**
+  - Serve web dashboard from embedded assets
 - [ ] **Authentication**
   - Token-based auth for production use
 
@@ -525,99 +524,88 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ```
 
-**Files Created (Phase 5):**
-```
-src/api/
-├── mod.rs          # Module exports
-├── routes.rs       # All REST endpoint handlers
-├── types.rs        # Request/response types
-├── shared.rs       # SharedState, AppSnapshot
-├── websocket.rs    # WebSocket handler
-└── dashboard.html  # Embedded web dashboard
-```
-
 **✅ Verification Checklist (Phase 5):**
 
 *Server & General*
 - [x] Server starts on configurable port (default 8080)
 - [x] API responds in < 5ms for control commands
-- [ ] Token auth blocks unauthorized requests (401 response)
-- [ ] Valid token allows access
+- [x] Token auth blocks unauthorized requests (401 response)
+- [x] Valid token allows access
 - [x] API handles malformed JSON gracefully (400 response)
 - [x] Static files served from `/`
 
 *Environment*
-- [x] `GET /api/environment` returns current environment state
-- [x] `PUT /api/environment` updates resolution, fps, thumbnail mode
-- [x] Environment effects CRUD works (add, update, remove, bypass, solo, reorder)
+- [ ] `GET /api/environment` returns current environment state
+- [ ] `PUT /api/environment` updates resolution, fps, thumbnail mode
+- [ ] Environment effects CRUD works (add, update, remove, bypass, solo, reorder)
 
 *Layers*
-- [x] `GET /api/layers` returns all layers
-- [x] `POST /api/layers` creates new layer
-- [x] `GET /api/layers/:id` returns layer details
-- [x] `PUT /api/layers/:id` updates layer properties
-- [x] `DELETE /api/layers/:id` removes layer
-- [x] `POST /api/layers/:id/clone` duplicates layer
-- [x] `POST /api/layers/reorder` changes layer order
-- [x] Transform endpoints work (position, scale, rotation)
-- [x] Property endpoints work (opacity, blend, visibility, tiling, transition)
-- [x] Layer effects CRUD works
+- [ ] `GET /api/layers` returns all layers
+- [ ] `POST /api/layers` creates new layer
+- [ ] `GET /api/layers/:id` returns layer details
+- [ ] `PUT /api/layers/:id` updates layer properties
+- [ ] `DELETE /api/layers/:id` removes layer
+- [ ] `POST /api/layers/:id/clone` duplicates layer
+- [ ] `POST /api/layers/reorder` changes layer order
+- [ ] Transform endpoints work (position, scale, rotation)
+- [ ] Property endpoints work (opacity, blend, visibility, tiling, transition)
+- [ ] Layer effects CRUD works
 
 *Clips*
-- [x] `GET /api/layers/:id/clips` returns clip grid state
-- [x] `PUT /api/layers/:id/clips/:slot` assigns clip to slot (file, OMT, NDI)
-- [x] `DELETE /api/layers/:id/clips/:slot` clears clip slot
-- [x] `POST /api/layers/:id/clips/:slot/trigger` triggers clip playback
-- [x] `POST /api/layers/:id/clips/stop` stops current clip
-- [x] `POST /api/layers/:id/clips/stop-fade` stops with fade
-- [x] Clip effects CRUD works
-- [x] Copy/paste endpoints work
-- [x] Column add/delete works
+- [ ] `GET /api/layers/:id/clips` returns clip grid state
+- [ ] `PUT /api/layers/:id/clips/:slot` assigns clip to slot (file, OMT, NDI)
+- [ ] `DELETE /api/layers/:id/clips/:slot` clears clip slot
+- [ ] `POST /api/layers/:id/clips/:slot/trigger` triggers clip playback
+- [ ] `POST /api/layers/:id/clips/stop` stops current clip
+- [ ] `POST /api/layers/:id/clips/stop-fade` stops with fade
+- [ ] Clip effects CRUD works
+- [ ] Copy/paste endpoints work
+- [ ] Column add/delete works
 
 *Playback*
-- [x] Global pause/resume/toggle/restart work
-- [x] Per-layer playback controls work
-- [x] `GET /api/playback/status` returns correct state
+- [ ] Global pause/resume/toggle/restart work
+- [ ] Per-layer playback controls work
+- [ ] `GET /api/playback/status` returns correct state
 
 *Effects*
-- [x] `GET /api/effects` lists all effect types
-- [x] `GET /api/effects/:type` returns effect definition with parameters
-- [x] `GET /api/effects/categories` lists categories
+- [ ] `GET /api/effects` lists all effect types
+- [ ] `GET /api/effects/:type` returns effect definition with parameters
+- [ ] `GET /api/effects/categories` lists categories
 
 *Sources*
-- [x] `GET /api/sources` returns discovered sources
-- [x] OMT/NDI source filtering works
-- [x] Discovery refresh endpoints work
-- [x] NDI discovery start/stop works
+- [ ] `GET /api/sources` returns discovered sources
+- [ ] OMT/NDI source filtering works
+- [ ] Discovery refresh endpoints work
+- [ ] NDI discovery start/stop works
 
 *Streaming*
-- [x] OMT broadcast start/stop works
-- [x] NDI broadcast start/stop works
-- [x] Capture FPS settings work
-- [x] Texture sharing start/stop works
-- [x] Status endpoints return correct state
+- [ ] OMT broadcast start/stop works
+- [ ] NDI broadcast start/stop works
+- [ ] Capture FPS settings work
+- [ ] Texture sharing start/stop works
+- [ ] Status endpoints return correct state
 
 *Outputs*
-- [x] `GET /api/outputs` lists connected displays
-- [x] `PUT /api/outputs/:id` updates output config
+- [ ] `GET /api/outputs` lists connected displays
+- [ ] `PUT /api/outputs/:id` updates output config
 
 *Viewport*
-- [x] `GET /api/viewport` returns zoom/pan state
-- [x] Reset, zoom, pan endpoints work
+- [ ] `GET /api/viewport` returns zoom/pan state
+- [ ] Reset, zoom, pan endpoints work
 
 *Files*
-- [x] Open/save/save-as work
-- [x] Current file path returned correctly
-- [x] Recent files list works
+- [ ] Open/save/save-as work
+- [ ] Current file path returned correctly
+- [ ] Recent files list works
 
 *Status*
-- [x] `GET /api/status` returns full system status
-- [x] FPS, connections, performance metrics work
+- [ ] `GET /api/status` returns full system status
+- [ ] FPS, connections, performance metrics work
 
 *WebSocket*
-- [x] WebSocket connection establishes successfully
-- [x] Receives real-time state updates when layers change
-- [x] Receives FPS/performance metrics
+- [ ] WebSocket connection establishes successfully
+- [ ] Receives real-time state updates when layers change
+- [ ] Receives FPS/performance metrics
 - [ ] All event types fire correctly
 - [ ] Bi-directional commands execute correctly
 
@@ -672,11 +660,10 @@ src/api/
 
 **Goal:** Production-ready stability and optimization.
 
-- [x] **Performance Profiling**
+- [ ] **Performance Profiling**
   - GPU profiling with wgpu timestamps
-  - CPU frame profiling with percentile statistics (avg, p50, p95, p99)
-  - Performance panel UI (View > Performance)
-  - Extended `/api/status/performance` endpoint
+  - CPU profiling with `perf` / Instruments
+  - Memory leak detection
 - [ ] **GPU Tiling for Large Environments**
   - Automatically tile environments exceeding GPU max texture size
   - Seamless rendering across tile boundaries
@@ -686,31 +673,17 @@ src/api/
   - Graceful degradation on source loss
   - Auto-reconnect for NDI/OMT
   - User-visible error messages
-- [x] **Logging & Telemetry**
-  - Structured logging with `tracing` (replaced `log` crate)
-  - Environment variable config: `IMMERSIVE_LOG`, `IMMERSIVE_LOG_JSON`
-  - Tracing spans in render loop
-  - See `docs/telemetry.md` for full documentation
+- [ ] **Logging & Telemetry**
+  - Structured logging with `tracing`
+  - Optional remote log shipping
 - [ ] **Installer/Packaging**
   - macOS: `.pkg` or `.dmg`
   - Windows: MSI or NSIS installer
   - Code signing for both platforms
 
-**Files Created (Phase 7):**
-```
-src/telemetry/
-├── mod.rs          # Module exports
-├── logging.rs      # Tracing subscriber setup
-├── metrics.rs      # FrameProfiler, PerformanceMetrics, GpuMemoryStats
-└── profiling.rs    # GpuProfiler (wgpu timestamp queries)
-
-src/ui/performance_panel.rs  # Performance monitoring UI
-docs/telemetry.md            # Telemetry documentation
-```
-
 **✅ Verification Checklist (Phase 7):**
-- [x] GPU profiling data collected and reviewed (identify bottlenecks)
-- [x] CPU profiling completed — frame timing with percentiles
+- [ ] GPU profiling data collected and reviewed (identify bottlenecks)
+- [ ] CPU profiling completed — no functions taking >10% of frame time
 - [ ] Memory leak test: run 24 hours, memory usage stable (±10%)
 - [ ] GPU tiling: create 16384×16384 environment (exceeds typical 8K limit)
 - [ ] GPU tiling: verify no visible seams at tile boundaries
@@ -719,8 +692,8 @@ docs/telemetry.md            # Telemetry documentation
 - [ ] App logs GPU max texture size at startup
 - [ ] Source disconnect shows user-friendly message (not crash)
 - [ ] NDI/OMT auto-reconnect works within 5 seconds
-- [x] All errors logged with `tracing` (verify structured JSON output)
-- [x] Log levels configurable via `IMMERSIVE_LOG` env var
+- [ ] All errors logged with `tracing` (verify structured JSON output)
+- [ ] Log levels configurable (debug/info/warn/error)
 - [ ] macOS installer: `.dmg` mounts and app drags to Applications
 - [ ] macOS installer: app launches without Gatekeeper warnings (signed)
 - [ ] Windows installer: MSI installs without admin elevation (if possible)
@@ -823,36 +796,30 @@ struct OutputConfig {
 
 **Goal:** Receive and send video over NDI.
 
-- [x] **NDI Receiver**
-  - Enumerate NDI sources on network via mDNS discovery
-  - Receive NDI streams as clip sources
-  - Integration with clip grid (drag from Sources panel)
-- [x] **NDI Sender**
-  - Capture compositor output with triple-buffered async GPU readback
-  - Transmit via NDI with clock_video for frame pacing
-  - Background sender thread for non-blocking operation
-- [x] **FFI Bindings**
-  - Safe Rust wrapper around NDI SDK (`ndi-sdk` crate pattern)
-  - NdiFinder for source discovery
-  - NdiSender for output streaming
+- [ ] **NDI Receiver**
+  - Enumerate NDI sources on network
+  - Spawn receiver thread per source
+  - Push frames to ring buffer
+- [ ] **NDI Sender**
+  - Capture compositor output
+  - Encode and transmit via NDI
+  - Support multiple simultaneous outputs
+- [ ] **FFI Bindings**
+  - Use `bindgen` for NDI SDK headers
+  - Safe Rust wrapper around C API
 
-**Files Created (Phase 10):**
-```
-src/network/
-├── ndi.rs          # NdiSender, NdiFinder wrappers
-└── ndi_capture.rs  # NdiCapture with triple-buffered GPU readback
-```
+**Crate:** Create `ndi-rs` wrapper or use existing community bindings.
 
 **✅ Verification Checklist (Phase 10):**
-- [x] NDI sources on local network are discovered and listed
-- [x] NDI source discovery updates dynamically (new sources appear)
-- [x] Receive NDI stream and display as layer (test with NDI Test Patterns)
+- [ ] NDI sources on local network are discovered and listed
+- [ ] NDI source discovery updates dynamically (new sources appear)
+- [ ] Receive NDI stream and display as layer (test with NDI Test Patterns)
 - [ ] Receive multiple NDI streams simultaneously (test 4 streams)
 - [ ] NDI receiver handles source disconnect gracefully (no crash, shows placeholder)
 - [ ] NDI receiver auto-reconnects when source comes back
-- [x] Send compositor output as NDI stream
-- [x] NDI output visible in NDI Studio Monitor
-- [x] NDI output maintains quality (compare to direct output)
+- [ ] Send compositor output as NDI stream
+- [ ] NDI output visible in NDI Studio Monitor
+- [ ] NDI output maintains quality (compare to direct output)
 - [ ] Multiple NDI outputs work simultaneously
 - [ ] Latency measurement: NDI round-trip < 3 frames
 - [ ] Memory stable after 1 hour of NDI streaming (no leaks)
@@ -1087,5 +1054,5 @@ impl Deserialize for ClipSource { /* use helper */ }
 
 ---
 
-*Last Updated: January 2025*
+*Last Updated: December 2024*
 
