@@ -160,6 +160,8 @@ pub struct App {
     pub divider_drag_state: crate::ui::DividerDragState,
     /// Panel drag state for moving panels between cells
     pub panel_drag_state: crate::ui::PanelDragState,
+    /// Cell drag state for moving entire cells (tiles) in tiled layout
+    pub cell_drag_state: crate::ui::CellDragState,
     /// Whether to use the new tiled layout (vs legacy dock manager)
     pub use_tiled_layout: bool,
     /// Pending layout choice when opening a file with different layout than preferences
@@ -682,6 +684,7 @@ impl App {
                 .unwrap_or_else(crate::ui::TiledLayout::default_layout),
             divider_drag_state: crate::ui::DividerDragState::default(),
             panel_drag_state: crate::ui::PanelDragState::default(),
+            cell_drag_state: crate::ui::CellDragState::default(),
             use_tiled_layout: app_preferences.use_tiled_layout,
             pending_layout_choice: None,
             properties_panel: crate::ui::PropertiesPanel::new(),
@@ -8235,6 +8238,7 @@ impl App {
         }
 
         // Render each cell
+        let environment_cell_id = self.tiled_layout.get_environment_cell_id();
         for (cell_id, rect) in &layout.cell_rects {
             if let Some(cell) = self.tiled_layout.find_cell(*cell_id) {
                 let panel_ids_in_cell = cell.panel_ids.clone();
@@ -8258,6 +8262,26 @@ impl App {
 
                             // Render tab bar if multiple panels (or single panel header for drag handle)
                             ui.horizontal(|ui| {
+                                // Cell drag handle (grip icon) - only for non-environment cells
+                                if cell_id_copy != environment_cell_id {
+                                    let grip_response = ui.add(
+                                        egui::Button::new("\u{2630}")  // ☰ trigram for heaven (hamburger menu icon)
+                                            .frame(false)
+                                            .sense(egui::Sense::click_and_drag())
+                                    );
+
+                                    if grip_response.drag_started() {
+                                        self.cell_drag_state.start(cell_id_copy, grip_response.rect.center());
+                                    }
+
+                                    // Visual feedback: change cursor on hover
+                                    if grip_response.hovered() && !self.cell_drag_state.is_dragging() {
+                                        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                                    }
+
+                                    ui.add_space(2.0);
+                                }
+
                                 for (idx, panel_id) in panel_ids_in_cell.iter().enumerate() {
                                     let is_active = idx == active_tab || !has_tabs;
                                     let title = self.get_panel_title(panel_id);
@@ -8467,6 +8491,181 @@ impl App {
             }
         }
 
+        // Handle cell drag-and-drop (moving entire cells/tiles)
+        if self.cell_drag_state.is_dragging() {
+            // Update current position
+            self.cell_drag_state.current_pos = hover_pos;
+
+            // Determine drop target based on cursor position (same logic as panel drag)
+            let mut current_drop_target: Option<DropTarget> = None;
+            let edge_zone_size = 40.0;
+            let dragged_cell_id = self.cell_drag_state.dragged_cell_id.unwrap_or(u32::MAX);
+
+            if let Some(pos) = hover_pos {
+                for (cell_id, rect) in &layout.cell_rects {
+                    // Skip the cell being dragged
+                    if *cell_id == dragged_cell_id {
+                        continue;
+                    }
+
+                    if rect.contains(pos) {
+                        // Check edge zones for splits
+                        let left_zone = egui::Rect::from_min_max(
+                            rect.min,
+                            egui::pos2(rect.min.x + edge_zone_size, rect.max.y),
+                        );
+                        let right_zone = egui::Rect::from_min_max(
+                            egui::pos2(rect.max.x - edge_zone_size, rect.min.y),
+                            rect.max,
+                        );
+                        let top_zone = egui::Rect::from_min_max(
+                            rect.min,
+                            egui::pos2(rect.max.x, rect.min.y + edge_zone_size),
+                        );
+                        let bottom_zone = egui::Rect::from_min_max(
+                            egui::pos2(rect.min.x, rect.max.y - edge_zone_size),
+                            rect.max,
+                        );
+
+                        if left_zone.contains(pos) {
+                            current_drop_target = Some(DropTarget::Split {
+                                cell_id: *cell_id,
+                                direction: SplitDirection::Horizontal,
+                                new_first: true,
+                            });
+                        } else if right_zone.contains(pos) {
+                            current_drop_target = Some(DropTarget::Split {
+                                cell_id: *cell_id,
+                                direction: SplitDirection::Horizontal,
+                                new_first: false,
+                            });
+                        } else if top_zone.contains(pos) {
+                            current_drop_target = Some(DropTarget::Split {
+                                cell_id: *cell_id,
+                                direction: SplitDirection::Vertical,
+                                new_first: true,
+                            });
+                        } else if bottom_zone.contains(pos) {
+                            current_drop_target = Some(DropTarget::Split {
+                                cell_id: *cell_id,
+                                direction: SplitDirection::Vertical,
+                                new_first: false,
+                            });
+                        } else {
+                            // Center zone - merge tabs
+                            current_drop_target = Some(DropTarget::Tab { cell_id: *cell_id });
+                        }
+                        break;
+                    }
+                }
+            }
+
+            // Render drop zone highlights for cell drag
+            egui::Area::new(egui::Id::new("cell_drop_zones"))
+                .fixed_pos(available_rect.min)
+                .order(egui::Order::Foreground)
+                .interactable(false)
+                .show(ctx, |ui| {
+                    if let Some(pos) = hover_pos {
+                        for (cell_id, rect) in &layout.cell_rects {
+                            // Skip the cell being dragged
+                            if *cell_id == dragged_cell_id {
+                                // Draw a dimmed overlay on the source cell
+                                ui.painter().rect_filled(
+                                    *rect,
+                                    2.0,
+                                    egui::Color32::from_rgba_unmultiplied(0, 0, 0, 100),
+                                );
+                                continue;
+                            }
+
+                            if rect.contains(pos) {
+                                // Highlight drop zones (orange tint to differentiate from panel drag)
+                                let edge_color = egui::Color32::from_rgba_unmultiplied(255, 150, 50, 100);
+                                let center_color = egui::Color32::from_rgba_unmultiplied(255, 200, 100, 60);
+
+                                let left_zone = egui::Rect::from_min_max(
+                                    rect.min,
+                                    egui::pos2(rect.min.x + edge_zone_size, rect.max.y),
+                                );
+                                let right_zone = egui::Rect::from_min_max(
+                                    egui::pos2(rect.max.x - edge_zone_size, rect.min.y),
+                                    rect.max,
+                                );
+                                let top_zone = egui::Rect::from_min_max(
+                                    rect.min,
+                                    egui::pos2(rect.max.x, rect.min.y + edge_zone_size),
+                                );
+                                let bottom_zone = egui::Rect::from_min_max(
+                                    egui::pos2(rect.min.x, rect.max.y - edge_zone_size),
+                                    rect.max,
+                                );
+                                let center_zone = rect.shrink(edge_zone_size);
+
+                                // Highlight hovered zone
+                                if left_zone.contains(pos) {
+                                    ui.painter().rect_filled(left_zone, 4.0, edge_color);
+                                } else if right_zone.contains(pos) {
+                                    ui.painter().rect_filled(right_zone, 4.0, edge_color);
+                                } else if top_zone.contains(pos) {
+                                    ui.painter().rect_filled(top_zone, 4.0, edge_color);
+                                } else if bottom_zone.contains(pos) {
+                                    ui.painter().rect_filled(bottom_zone, 4.0, edge_color);
+                                } else {
+                                    ui.painter().rect_filled(center_zone, 4.0, center_color);
+                                }
+
+                                // Draw border around target cell
+                                ui.painter().rect_stroke(
+                                    *rect,
+                                    2.0,
+                                    egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 150, 50)),
+                                    egui::epaint::StrokeKind::Outside,
+                                );
+                                break;
+                            }
+                        }
+                    }
+
+                    // Draw dragged cell indicator near cursor
+                    if let Some(pos) = hover_pos {
+                        // Get the cell's panel titles for the label
+                        let label = if let Some(cell) = self.tiled_layout.find_cell(dragged_cell_id) {
+                            if cell.panel_ids.len() == 1 {
+                                self.get_panel_title(&cell.panel_ids[0])
+                            } else {
+                                format!("{} tabs", cell.panel_ids.len())
+                            }
+                        } else {
+                            "Cell".to_string()
+                        };
+
+                        let label_rect = egui::Rect::from_min_size(
+                            egui::pos2(pos.x + 10.0, pos.y + 10.0),
+                            egui::vec2(100.0, 24.0),
+                        );
+                        ui.painter().rect_filled(label_rect, 4.0, egui::Color32::from_rgba_unmultiplied(80, 60, 40, 220));
+                        ui.painter().text(
+                            label_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            &label,
+                            egui::FontId::default(),
+                            egui::Color32::WHITE,
+                        );
+                    }
+                });
+
+            // Handle drop on mouse release
+            if pointer_released {
+                if let Some(cell_id) = self.cell_drag_state.dragged_cell_id {
+                    if let Some(target) = current_drop_target {
+                        self.tiled_layout.handle_cell_drop(cell_id, target);
+                    }
+                }
+                self.cell_drag_state.clear();
+            }
+        }
+
         // Render dividers on top
         egui::Area::new(egui::Id::new("tiled_dividers"))
             .fixed_pos(available_rect.min)
@@ -8567,10 +8766,9 @@ impl App {
                 }
             }
             panel_ids::PROPERTIES => {
-                // Properties panel - simplified for now (full integration needs action handling)
                 let layers = self.environment.layers().to_vec();
                 let layer_video_info = self.layer_video_info();
-                let _actions = self.properties_panel.render(
+                let actions = self.properties_panel.render(
                     ui,
                     &self.environment,
                     &layers,
@@ -8587,7 +8785,9 @@ impl App {
                     &layer_video_info,
                     &mut self.cross_window_drag,
                 );
-                // TODO: Handle _actions
+                for action in actions {
+                    self.handle_properties_action(action);
+                }
             }
             panel_ids::CLIP_GRID => {
                 let layers = self.environment.layers().to_vec();
@@ -8597,20 +8797,22 @@ impl App {
                 }
             }
             panel_ids::SOURCES => {
-                let _actions = self.sources_panel.render_contents(ui);
-                // TODO: Handle _actions
+                let actions = self.sources_panel.render_contents(ui);
+                for action in actions {
+                    self.handle_sources_action(action);
+                }
             }
             panel_ids::EFFECTS_BROWSER => {
-                let _actions = self.effects_browser_panel.render_contents(
+                // Effects browser drag-drop is handled via cross_window_drag state
+                self.effects_browser_panel.render_contents(
                     ui,
                     self.effect_manager.registry(),
                     &mut self.cross_window_drag,
                 );
-                // TODO: Handle _actions
             }
             panel_ids::FILES => {
-                let _actions = self.file_browser_panel.render_contents(ui);
-                // TODO: Handle _actions
+                // File browser drag-drop is handled separately
+                self.file_browser_panel.render_contents(ui);
             }
             panel_ids::PREVIEW_MONITOR => {
                 // Preview monitor panel - placeholder

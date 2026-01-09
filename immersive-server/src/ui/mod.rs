@@ -29,7 +29,7 @@ pub use clip_grid_panel::{ClipGridAction, ClipGridPanel};
 pub use dock::{DockAction, DockManager, DockZone, DockablePanel};
 pub use effects_browser_panel::{DraggableEffect, EffectsBrowserAction, EffectsBrowserPanel, DRAG_EFFECT_PAYLOAD};
 pub use tiled_layout::{
-    ComputedLayout, DividerDragState, DividerInfo, DropTarget, PanelDragState,
+    CellDragState, ComputedLayout, DividerDragState, DividerInfo, DropTarget, PanelDragState,
     SplitDirection, TabbedCell, TileNode, TiledLayout,
 };
 pub use file_browser_panel::{FileBrowserAction, FileBrowserPanel};

@@ -337,6 +337,38 @@ impl PanelDragState {
     }
 }
 
+// ============================================================================
+// Cell Drag State (for moving entire cells)
+// ============================================================================
+
+/// State for tracking cell drag operations (moving entire cells with all their tabs).
+#[derive(Debug, Clone, Default)]
+pub struct CellDragState {
+    /// ID of the cell being dragged (None if not dragging).
+    pub dragged_cell_id: Option<u32>,
+    /// Current mouse position during drag.
+    pub current_pos: Option<egui::Pos2>,
+}
+
+impl CellDragState {
+    /// Returns true if currently dragging a cell.
+    pub fn is_dragging(&self) -> bool {
+        self.dragged_cell_id.is_some()
+    }
+
+    /// Starts dragging a cell.
+    pub fn start(&mut self, cell_id: u32, pos: egui::Pos2) {
+        self.dragged_cell_id = Some(cell_id);
+        self.current_pos = Some(pos);
+    }
+
+    /// Clears the drag state.
+    pub fn clear(&mut self) {
+        self.dragged_cell_id = None;
+        self.current_pos = None;
+    }
+}
+
 /// Target location for dropping a panel.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DropTarget {
@@ -889,6 +921,108 @@ impl TiledLayout {
         }
     }
 
+    /// Extracts a cell from the tree and returns it.
+    ///
+    /// The parent split is collapsed so the sibling takes its place.
+    /// Returns None if the cell is the environment cell, is the root, or not found.
+    pub fn extract_cell(&mut self, cell_id: u32) -> Option<TabbedCell> {
+        // Cannot extract environment cell
+        if cell_id == self.environment_cell_id {
+            return None;
+        }
+
+        // Check if root is the target leaf (can't extract root)
+        if let TileNode::Leaf(cell) = &self.root {
+            if cell.id == cell_id {
+                return None;
+            }
+        }
+
+        Self::extract_cell_recursive(&mut self.root, cell_id)
+    }
+
+    fn extract_cell_recursive(node: &mut TileNode, cell_id: u32) -> Option<TabbedCell> {
+        match node {
+            TileNode::Split { first, second, .. } => {
+                // Check if first child is the target leaf
+                if let TileNode::Leaf(cell) = first.as_ref() {
+                    if cell.id == cell_id {
+                        // Extract the cell and replace parent with sibling
+                        let extracted = cell.clone();
+                        let sibling = second.as_ref().clone();
+                        *node = sibling;
+                        return Some(extracted);
+                    }
+                }
+                // Check if second child is the target leaf
+                if let TileNode::Leaf(cell) = second.as_ref() {
+                    if cell.id == cell_id {
+                        // Extract the cell and replace parent with sibling
+                        let extracted = cell.clone();
+                        let sibling = first.as_ref().clone();
+                        *node = sibling;
+                        return Some(extracted);
+                    }
+                }
+                // Recurse into children
+                Self::extract_cell_recursive(first, cell_id)
+                    .or_else(|| Self::extract_cell_recursive(second, cell_id))
+            }
+            TileNode::Leaf(_) => None,
+        }
+    }
+
+    /// Inserts a cell at a target location, creating a new split.
+    ///
+    /// This is used when dropping an extracted cell at a new location.
+    pub fn insert_cell_at_split(
+        &mut self,
+        cell: TabbedCell,
+        target_cell_id: u32,
+        direction: SplitDirection,
+        new_first: bool,
+    ) -> bool {
+        Self::insert_cell_recursive(&mut self.root, cell, target_cell_id, direction, new_first)
+    }
+
+    fn insert_cell_recursive(
+        node: &mut TileNode,
+        cell: TabbedCell,
+        target_cell_id: u32,
+        direction: SplitDirection,
+        new_first: bool,
+    ) -> bool {
+        match node {
+            TileNode::Leaf(existing_cell) if existing_cell.id == target_cell_id => {
+                // Found target - replace with split containing both cells
+                let old_leaf = std::mem::replace(
+                    node,
+                    TileNode::Leaf(TabbedCell::new(0, String::new())),
+                );
+                let new_leaf = TileNode::Leaf(cell);
+
+                let (first, second) = if new_first {
+                    (Box::new(new_leaf), Box::new(old_leaf))
+                } else {
+                    (Box::new(old_leaf), Box::new(new_leaf))
+                };
+
+                *node = TileNode::Split {
+                    direction,
+                    ratio: 0.5,
+                    first,
+                    second,
+                };
+                true
+            }
+            TileNode::Leaf(_) => false,
+            TileNode::Split { first, second, .. } => {
+                Self::insert_cell_recursive(first, cell.clone(), target_cell_id, direction, new_first)
+                    || Self::insert_cell_recursive(second, cell, target_cell_id, direction, new_first)
+            }
+        }
+    }
+
     /// Moves a panel to a different cell as a new tab.
     pub fn move_panel_to_cell(&mut self, panel_id: &str, target_cell_id: u32) -> bool {
         // Find source location
@@ -1045,6 +1179,52 @@ impl TiledLayout {
                 // Now create the split
                 self.split_cell(cell_id, direction, panel_id.to_string(), new_first)
                     .is_some()
+            }
+        }
+    }
+
+    /// Handles dropping an entire cell at a new location.
+    ///
+    /// This extracts the cell from its current position in the tree
+    /// and inserts it at the target location.
+    pub fn handle_cell_drop(&mut self, cell_id: u32, target: DropTarget) -> bool {
+        // Don't allow dropping environment cell
+        if cell_id == self.environment_cell_id {
+            return false;
+        }
+
+        // Don't drop onto self
+        let target_cell_id = match &target {
+            DropTarget::Tab { cell_id: t } => *t,
+            DropTarget::Split { cell_id: t, .. } => *t,
+        };
+        if target_cell_id == cell_id {
+            return false;
+        }
+
+        match target {
+            DropTarget::Tab { cell_id: target_cell_id } => {
+                // Merge: Move all panels from dragged cell into target cell
+                if let Some(extracted_cell) = self.extract_cell(cell_id) {
+                    for panel_id in extracted_cell.panel_ids {
+                        self.add_tab(target_cell_id, panel_id);
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+            DropTarget::Split {
+                cell_id: target_cell_id,
+                direction,
+                new_first,
+            } => {
+                // Extract the cell, then insert at new location
+                if let Some(extracted_cell) = self.extract_cell(cell_id) {
+                    self.insert_cell_at_split(extracted_cell, target_cell_id, direction, new_first)
+                } else {
+                    false
+                }
             }
         }
     }
