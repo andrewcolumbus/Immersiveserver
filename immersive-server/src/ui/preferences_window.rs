@@ -22,6 +22,10 @@ pub struct PreferencesWindow {
     pending_resolution: Option<(u32, u32)>,
     /// Temporary FPS value for slider editing
     temp_fps: u32,
+    /// Cached list of system audio devices (to avoid slow enumeration every frame)
+    cached_audio_devices: Vec<String>,
+    /// Whether audio devices need to be refreshed
+    audio_devices_dirty: bool,
 }
 
 impl Default for PreferencesWindow {
@@ -40,12 +44,18 @@ impl PreferencesWindow {
             show_resolution_confirm: false,
             pending_resolution: None,
             temp_fps: 60,
+            cached_audio_devices: Vec::new(),
+            audio_devices_dirty: true,
         }
     }
 
     /// Toggle the window open/closed
     pub fn toggle(&mut self) {
         self.open = !self.open;
+        // Refresh audio devices when opening
+        if self.open {
+            self.audio_devices_dirty = true;
+        }
     }
 
     /// Render the preferences window
@@ -638,6 +648,15 @@ impl PreferencesWindow {
         );
         ui.add_space(8.0);
 
+        // Refresh cached audio devices if needed (only when dirty, not every frame)
+        if self.audio_devices_dirty {
+            self.cached_audio_devices = AudioManager::list_audio_devices();
+            self.audio_devices_dirty = false;
+        }
+
+        // Clone cached devices for use in closure
+        let system_devices = self.cached_audio_devices.clone();
+
         // Audio source dropdown
         let current_source = &settings.audio_source;
         egui::ComboBox::from_id_salt("audio_source_selector")
@@ -667,69 +686,75 @@ impl PreferencesWindow {
                     });
                 }
 
-                ui.separator();
-
-                // System Devices submenu
-                let system_devices = AudioManager::list_audio_devices();
+                // System Devices (flat list)
                 if !system_devices.is_empty() {
-                    ui.menu_button("System Devices...", |ui| {
-                        for device in &system_devices {
-                            let is_selected = matches!(
-                                current_source,
-                                AudioSourceType::SystemDevice(d) if d == device
-                            );
-                            if ui.selectable_label(is_selected, device).clicked() {
-                                actions.push(PropertiesAction::SetAudioSource {
-                                    source_type: AudioSourceType::SystemDevice(device.clone()),
-                                });
-                                ui.close_menu();
-                            }
+                    ui.separator();
+                    ui.label(egui::RichText::new("System Devices").small().weak());
+                    for device in &system_devices {
+                        let is_selected = matches!(
+                            current_source,
+                            AudioSourceType::SystemDevice(d) if d == device
+                        );
+                        if ui.selectable_label(is_selected, device).clicked() {
+                            actions.push(PropertiesAction::SetAudioSource {
+                                source_type: AudioSourceType::SystemDevice(device.clone()),
+                            });
                         }
-                    });
+                    }
                 }
 
-                // NDI sources
+                // NDI sources (flat list)
                 let ndi_sources: Vec<_> = discovered_sources
                     .iter()
                     .filter(|s| s.source_type == SourceType::Ndi)
                     .collect();
                 if !ndi_sources.is_empty() {
-                    ui.menu_button("NDI Sources...", |ui| {
-                        for source in &ndi_sources {
-                            let full_name = source.id.clone();
-                            let is_selected =
-                                matches!(current_source, AudioSourceType::Ndi(n) if n == &full_name);
-                            if ui.selectable_label(is_selected, &source.name).clicked() {
-                                actions.push(PropertiesAction::SetAudioSource {
-                                    source_type: AudioSourceType::Ndi(full_name),
-                                });
-                                ui.close_menu();
-                            }
+                    ui.separator();
+                    ui.label(egui::RichText::new("NDI Sources").small().weak());
+                    for source in &ndi_sources {
+                        let full_name = source.id.clone();
+                        let is_selected =
+                            matches!(current_source, AudioSourceType::Ndi(n) if n == &full_name);
+                        if ui.selectable_label(is_selected, &source.name).clicked() {
+                            actions.push(PropertiesAction::SetAudioSource {
+                                source_type: AudioSourceType::Ndi(full_name),
+                            });
                         }
-                    });
+                    }
                 }
 
-                // OMT sources
+                // OMT sources (flat list)
                 let omt_sources: Vec<_> = discovered_sources
                     .iter()
                     .filter(|s| s.source_type == SourceType::Omt)
                     .collect();
                 if !omt_sources.is_empty() {
-                    ui.menu_button("OMT Sources...", |ui| {
-                        for source in &omt_sources {
-                            let address = source.id.clone();
-                            let is_selected =
-                                matches!(current_source, AudioSourceType::Omt(a) if a == &address);
-                            if ui.selectable_label(is_selected, &source.name).clicked() {
-                                actions.push(PropertiesAction::SetAudioSource {
-                                    source_type: AudioSourceType::Omt(address),
-                                });
-                                ui.close_menu();
-                            }
+                    ui.separator();
+                    ui.label(egui::RichText::new("OMT Sources").small().weak());
+                    for source in &omt_sources {
+                        let address = source.id.clone();
+                        let is_selected =
+                            matches!(current_source, AudioSourceType::Omt(a) if a == &address);
+                        if ui.selectable_label(is_selected, &source.name).clicked() {
+                            actions.push(PropertiesAction::SetAudioSource {
+                                source_type: AudioSourceType::Omt(address),
+                            });
                         }
-                    });
+                    }
                 }
             });
+
+        // Refresh button for audio devices
+        ui.horizontal(|ui| {
+            if ui.small_button("Refresh Devices").clicked() {
+                self.audio_devices_dirty = true;
+            }
+            ui.label(
+                egui::RichText::new(format!("{} device(s) found", self.cached_audio_devices.len()))
+                    .small()
+                    .weak(),
+            );
+        });
 
         ui.add_space(8.0);
 

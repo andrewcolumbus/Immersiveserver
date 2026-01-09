@@ -736,122 +736,94 @@ impl PropertiesPanel {
                                 egui::Color32::from_rgb(45, 65, 55) // Subtle green tint when active
                             };
 
-                            // Track button clicks using Cell for interior mutability
-                            let delete_clicked = std::cell::Cell::new(false);
-
-                            // Wrap effect header in drag source for reordering
                             let effect_id = effect.id;
                             let drag_id = egui::Id::new(("effect_drag", effect_id));
 
-                            let drag_response = ui.dnd_drag_source(drag_id, DraggedEffectReorder { effect_id, source_index: index }, |ui| {
-                                // Effect header with collapsible state
-                                let header_response = egui::Frame::new()
-                                    .fill(header_bg)
-                                    .inner_margin(egui::Margin::symmetric(6, 4))
-                                    .corner_radius(2.0)
-                                    .show(ui, |ui| {
-                                        ui.horizontal(|ui| {
-                                            // Delete button on the left
-                                            let delete_btn = ui.small_button("×").on_hover_text("Remove effect");
-                                            if delete_btn.clicked() {
-                                                delete_clicked.set(true);
-                                            }
+                            // Track if header was clicked (for expand/collapse)
+                            let header_clicked = std::cell::Cell::new(false);
 
-                                            // Up/down reorder buttons
-                                            let can_move_up = index > 0;
-                                            let can_move_down = index < effect_count - 1;
+                            // Up/down reorder buttons
+                            let can_move_up = index > 0;
+                            let can_move_down = index < effect_count - 1;
 
-                                            if ui.add_enabled(can_move_up, egui::Button::new("▲").small())
-                                                .on_hover_text("Move up")
-                                                .clicked()
-                                            {
-                                                reorder_action = Some((effect_id, index - 1));
-                                            }
-                                            if ui.add_enabled(can_move_down, egui::Button::new("▼").small())
-                                                .on_hover_text("Move down")
-                                                .clicked()
-                                            {
-                                                reorder_action = Some((effect_id, index + 1));
-                                            }
+                            // Render effect header with buttons OUTSIDE the drag source
+                            egui::Frame::new()
+                                .fill(header_bg)
+                                .inner_margin(egui::Margin::symmetric(6, 4))
+                                .corner_radius(2.0)
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        // Delete button - outside drag source
+                                        if ui.small_button("x").on_hover_text("Remove effect").clicked() {
+                                            self.push_remove_action(actions, context, effect.id);
+                                        }
 
-                                            // Effect name
+                                        // Up button - outside drag source
+                                        if ui.add_enabled(can_move_up, egui::Button::new("↑").small())
+                                            .on_hover_text("Move up")
+                                            .clicked()
+                                        {
+                                            reorder_action = Some((effect_id, index - 1));
+                                        }
+
+                                        // Down button - outside drag source
+                                        if ui.add_enabled(can_move_down, egui::Button::new("↓").small())
+                                            .on_hover_text("Move down")
+                                            .clicked()
+                                        {
+                                            reorder_action = Some((effect_id, index + 1));
+                                        }
+
+                                        // Draggable effect name area
+                                        let drag_response = ui.dnd_drag_source(drag_id, DraggedEffectReorder { effect_id, source_index: index }, |ui| {
                                             let name_color = if effect.bypassed {
                                                 egui::Color32::from_gray(100)
                                             } else {
                                                 egui::Color32::from_gray(200)
                                             };
                                             let name_text = egui::RichText::new(&effect.name).color(name_color);
-                                            ui.label(name_text);
+                                            let response = ui.add(egui::Label::new(name_text).sense(egui::Sense::click()));
+                                            if response.clicked() {
+                                                header_clicked.set(true);
+                                            }
+                                            response
+                                        });
 
-                                            // Indicators on the right
-                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                // Bypass indicator
-                                                if effect.bypassed {
-                                                    ui.label(egui::RichText::new("B").size(10.0).color(egui::Color32::from_gray(80)));
-                                                }
-                                                // Solo indicator
-                                                if effect.soloed {
-                                                    ui.label(egui::RichText::new("S").size(10.0).color(egui::Color32::YELLOW));
-                                                }
-                                            });
-                                        })
+                                        // Right-click context menu on the draggable area
+                                        drag_response.response.context_menu(|ui| {
+                                            let bypass_label = if effect.bypassed { "Enable" } else { "Bypass" };
+                                            if ui.button(bypass_label).clicked() {
+                                                self.push_bypass_action(actions, context, effect.id, !effect.bypassed);
+                                                ui.close_menu();
+                                            }
+                                            let solo_label = if effect.soloed { "Unsolo" } else { "Solo" };
+                                            if ui.button(solo_label).clicked() {
+                                                self.push_solo_action(actions, context, effect.id, !effect.soloed);
+                                                ui.close_menu();
+                                            }
+                                            ui.separator();
+                                            if ui.button("Delete").clicked() {
+                                                self.push_remove_action(actions, context, effect.id);
+                                                ui.close_menu();
+                                            }
+                                        });
+
+                                        // Indicators on the right
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            if effect.bypassed {
+                                                ui.label(egui::RichText::new("B").size(10.0).color(egui::Color32::from_gray(80)));
+                                            }
+                                            if effect.soloed {
+                                                ui.label(egui::RichText::new("S").size(10.0).color(egui::Color32::YELLOW));
+                                            }
+                                        });
                                     });
+                                });
 
-                                header_response
-                            });
-
-                            // Handle delete button click (outside drag source closure)
-                            if delete_clicked.get() {
-                                self.push_remove_action(actions, context, effect.id);
+                            // Handle click on effect name to toggle expanded state
+                            if header_clicked.get() && !is_dragging_reorder && !is_dragging_new_effect {
+                                self.push_expanded_action(actions, context, effect.id, !effect.expanded);
                             }
-
-                            // Handle click on header to toggle expanded state (only if not dragging)
-                            if !is_dragging_reorder && !is_dragging_new_effect && !delete_clicked.get() {
-                                if drag_response.response.clicked() {
-                                    self.push_expanded_action(actions, context, effect.id, !effect.expanded);
-                                }
-                            }
-
-                            // Right-click context menu for effect controls
-                            drag_response.response.context_menu(|ui| {
-                                // Bypass toggle
-                                let bypass_label = if effect.bypassed { "Enable" } else { "Bypass" };
-                                if ui.button(bypass_label).clicked() {
-                                    self.push_bypass_action(actions, context, effect.id, !effect.bypassed);
-                                    ui.close_menu();
-                                }
-
-                                // Solo toggle
-                                let solo_label = if effect.soloed { "Unsolo" } else { "Solo" };
-                                if ui.button(solo_label).clicked() {
-                                    self.push_solo_action(actions, context, effect.id, !effect.soloed);
-                                    ui.close_menu();
-                                }
-
-                                ui.separator();
-
-                                // Reorder options
-                                if index > 0 {
-                                    if ui.button("Move Up").clicked() {
-                                        self.push_reorder_action(actions, context, effect.id, index - 1);
-                                        ui.close_menu();
-                                    }
-                                }
-                                if index < effect_count - 1 {
-                                    if ui.button("Move Down").clicked() {
-                                        self.push_reorder_action(actions, context, effect.id, index + 1);
-                                        ui.close_menu();
-                                    }
-                                }
-
-                                ui.separator();
-
-                                // Remove
-                                if ui.button(egui::RichText::new("Remove").color(egui::Color32::from_rgb(200, 80, 80))).clicked() {
-                                    self.push_remove_action(actions, context, effect.id);
-                                    ui.close_menu();
-                                }
-                            });
 
                             // Render parameters if expanded and not bypassed
                             if effect.expanded && !effect.bypassed {

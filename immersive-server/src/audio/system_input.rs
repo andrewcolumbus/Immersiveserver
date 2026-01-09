@@ -45,7 +45,7 @@ impl SystemAudioInput {
         let device_start = Instant::now();
         let device = if let Some(name) = device_name {
             let enum_start = Instant::now();
-            let devices = host.input_devices()
+            let mut devices = host.input_devices()
                 .map_err(|e| format!("Failed to enumerate devices: {}", e))?;
             tracing::debug!("[AUDIO] input_devices() enumeration took {:?}", enum_start.elapsed());
 
@@ -105,7 +105,7 @@ impl SystemAudioInput {
         tracing::debug!("[AUDIO] list_devices: default_host() took {:?}", host_start.elapsed());
 
         let enum_start = Instant::now();
-        let result = host.input_devices()
+        let result: Vec<String> = host.input_devices()
             .map(|devices| devices.filter_map(|d| d.name().ok()).collect())
             .unwrap_or_default();
         tracing::debug!("[AUDIO] list_devices: input_devices() took {:?}", enum_start.elapsed());
@@ -307,10 +307,18 @@ impl AudioSource for SystemAudioInput {
 impl SystemAudioInput {
     /// Initialize and start the audio capture
     pub fn start_capture(&mut self) -> Result<(), String> {
+        use std::time::Instant;
+        let total_start = Instant::now();
+        tracing::debug!("[AUDIO] start_capture() started");
+
+        let build_start = Instant::now();
         self.build_stream()?;
+        tracing::debug!("[AUDIO] start_capture: build_stream() took {:?}", build_start.elapsed());
+
         self.state.set_running(true);
         self.state.set_active(true);
 
+        let play_start = Instant::now();
         if let Ok(guard) = self.stream.lock() {
             if let Some(ref wrapper) = *guard {
                 wrapper.0
@@ -318,6 +326,8 @@ impl SystemAudioInput {
                     .map_err(|e| format!("Failed to start stream: {}", e))?;
             }
         }
+        tracing::debug!("[AUDIO] start_capture: play() took {:?}", play_start.elapsed());
+        tracing::debug!("[AUDIO] start_capture() total took {:?}", total_start.elapsed());
 
         Ok(())
     }

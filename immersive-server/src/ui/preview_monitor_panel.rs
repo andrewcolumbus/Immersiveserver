@@ -76,6 +76,9 @@ pub enum PreviewMode {
     Source(PreviewSourceInfo),
 }
 
+/// Default preview area height in pixels
+const DEFAULT_PREVIEW_HEIGHT: f32 = 280.0;
+
 /// State for the preview monitor panel
 pub struct PreviewMonitorPanel {
     /// Current preview mode (clip, layer, or none)
@@ -84,6 +87,8 @@ pub struct PreviewMonitorPanel {
     scrubber_state: ScrubberState,
     /// Viewport for pan/zoom navigation
     viewport: Viewport,
+    /// Preview area height (user-adjustable via window resize)
+    preview_height: f32,
 }
 
 impl Default for PreviewMonitorPanel {
@@ -99,7 +104,18 @@ impl PreviewMonitorPanel {
             mode: PreviewMode::None,
             scrubber_state: ScrubberState::new(),
             viewport: Viewport::new(),
+            preview_height: DEFAULT_PREVIEW_HEIGHT,
         }
+    }
+
+    /// Set the preview area height (called when user resizes the window)
+    pub fn set_preview_height(&mut self, height: f32) {
+        self.preview_height = height.max(100.0); // Minimum 100px
+    }
+
+    /// Get the current preview area height
+    pub fn preview_height(&self) -> f32 {
+        self.preview_height
     }
 
     /// Set the clip to preview (switches to clip mode)
@@ -291,19 +307,28 @@ impl PreviewMonitorPanel {
                 ui.add_space(4.0);
                 ui.separator();
             }
-            PreviewMode::None => {}
+            PreviewMode::None => {
+                // Placeholder header to maintain consistent window size
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("No preview selected")
+                            .weak()
+                            .size(14.0),
+                    );
+                });
+                ui.label(
+                    egui::RichText::new("Select a clip, layer, or source to preview")
+                        .weak()
+                        .small(),
+                );
+                ui.add_space(4.0);
+                ui.separator();
+            }
         }
 
-        // Preview area
-        let available_size = ui.available_size();
-        // Leave more room for controls in clip mode (scrubber + transport), less in layer/source mode
-        let controls_height = match &self.mode {
-            PreviewMode::Clip(_) => 80.0,
-            PreviewMode::Layer(_) => 30.0,
-            PreviewMode::Source(_) => 30.0,
-            PreviewMode::None => 30.0,
-        };
-        let preview_height = (available_size.y - controls_height).max(100.0);
+        // Preview area - use stored preview_height (user-adjustable via window resize)
+        let available_width = ui.available_width();
+        let preview_height = self.preview_height;
 
         // Get dimensions for aspect ratio calculation
         let dimensions: Option<(u32, u32)> = match &self.mode {
@@ -313,42 +338,28 @@ impl PreviewMonitorPanel {
             PreviewMode::None => None,
         };
 
-        // Calculate aspect ratio for preview
-        let (preview_rect, response) = if let Some((width, height)) = dimensions {
-            let aspect = width as f32 / height as f32;
-            let display_width = available_size.x.min(preview_height * aspect);
-            let display_height = display_width / aspect;
+        // Calculate aspect ratio - use 16:9 default when dimensions unknown (minimizes jump)
+        let aspect = dimensions
+            .map(|(w, h)| w as f32 / h as f32)
+            .unwrap_or(16.0 / 9.0);
 
-            // Center the preview
-            let x_offset = (available_size.x - display_width) / 2.0;
-            let rect = egui::Rect::from_min_size(
-                ui.cursor().min + egui::vec2(x_offset, 0.0),
-                egui::vec2(display_width, display_height),
-            );
+        // Calculate display size maintaining aspect ratio
+        let display_width = available_width.min(preview_height * aspect);
+        let display_height = display_width / aspect;
 
-            // Reserve the space with click_and_drag sense for viewport interaction
-            let response = ui.allocate_rect(
-                egui::Rect::from_min_size(ui.cursor().min, egui::vec2(available_size.x, display_height)),
-                egui::Sense::click_and_drag(),
-            );
+        // Center the preview both horizontally and vertically within fixed preview_height
+        let x_offset = (available_width - display_width) / 2.0;
+        let y_offset = (preview_height - display_height) / 2.0;
+        let preview_rect = egui::Rect::from_min_size(
+            ui.cursor().min + egui::vec2(x_offset, y_offset),
+            egui::vec2(display_width, display_height),
+        );
 
-            (rect, response)
-        } else {
-            // No dimensions - use default square
-            let size = available_size.x.min(preview_height);
-            let x_offset = (available_size.x - size) / 2.0;
-            let rect = egui::Rect::from_min_size(
-                ui.cursor().min + egui::vec2(x_offset, 0.0),
-                egui::vec2(size, size),
-            );
-
-            let response = ui.allocate_rect(
-                egui::Rect::from_min_size(ui.cursor().min, egui::vec2(available_size.x, size)),
-                egui::Sense::click_and_drag(),
-            );
-
-            (rect, response)
-        };
+        // Reserve FIXED space for the preview area
+        let response = ui.allocate_rect(
+            egui::Rect::from_min_size(ui.cursor().min, egui::vec2(available_width, preview_height)),
+            egui::Sense::click_and_drag(),
+        );
 
         // Handle viewport interactions (right-click drag for pan, scroll for zoom)
         let content_size = dimensions

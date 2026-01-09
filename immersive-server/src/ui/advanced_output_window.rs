@@ -760,7 +760,7 @@ impl AdvancedOutputWindow {
                                     let can_move_up = slice_idx > 0;
                                     let can_move_down = slice_idx < slice_count - 1;
 
-                                    if ui.add_enabled(can_move_up, egui::Button::new("▲").small())
+                                    if ui.add_enabled(can_move_up, egui::Button::new("↑").small())
                                         .on_hover_text("Move up")
                                         .clicked()
                                     {
@@ -769,7 +769,7 @@ impl AdvancedOutputWindow {
                                             slice_id: slice.id,
                                         });
                                     }
-                                    if ui.add_enabled(can_move_down, egui::Button::new("▼").small())
+                                    if ui.add_enabled(can_move_down, egui::Button::new("↓").small())
                                         .on_hover_text("Move down")
                                         .clicked()
                                     {

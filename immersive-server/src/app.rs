@@ -2818,13 +2818,26 @@ impl App {
                         );
                     });
 
-                // Update window position for persistence
+                // Update window position and size for persistence, and sync preview height
                 if let Some(resp) = &window_response {
                     let rect = resp.response.rect;
                     if let Some(p) = self.dock_manager.get_panel_mut(crate::ui::dock::panel_ids::PREVIEW_MONITOR) {
                         p.floating_pos = Some((rect.left(), rect.top()));
                         p.floating_size = Some((rect.width(), rect.height()));
                     }
+
+                    // Calculate preview height from window size and update the panel
+                    // Window chrome: ~26px title bar + ~8px padding
+                    // Header section: ~50px (label + small text + separator)
+                    // Controls section: varies by mode (80 for clip, 30 for others)
+                    let window_chrome = 34.0;
+                    let header_height = 50.0;
+                    let controls_height = match self.preview_monitor_panel.mode() {
+                        crate::ui::PreviewMode::Clip(_) => 80.0,
+                        _ => 30.0,
+                    };
+                    let new_preview_height = rect.height() - window_chrome - header_height - controls_height;
+                    self.preview_monitor_panel.set_preview_height(new_preview_height);
                 }
 
                 if !open {
@@ -6863,14 +6876,20 @@ impl App {
             }
             PropertiesAction::SetAudioSource { source_type } => {
                 use crate::settings::AudioSourceType;
+                use std::time::Instant;
+                let total_start = Instant::now();
+                tracing::debug!("[AUDIO] SetAudioSource handler started, source_type={:?}", source_type);
 
                 // Update settings
                 self.settings.audio_source = source_type.clone();
 
                 // Clear existing audio sources
+                let clear_start = Instant::now();
                 self.audio_manager.clear_sources();
+                tracing::debug!("[AUDIO] SetAudioSource: clear_sources() took {:?}", clear_start.elapsed());
 
                 // Initialize new audio source based on type
+                let init_start = Instant::now();
                 match source_type {
                     AudioSourceType::None => {
                         tracing::info!("Audio source disabled");
@@ -6914,6 +6933,8 @@ impl App {
                         tracing::info!("OMT audio source added: {}", address);
                     }
                 }
+                tracing::debug!("[AUDIO] SetAudioSource: init took {:?}", init_start.elapsed());
+                tracing::debug!("[AUDIO] SetAudioSource handler total took {:?}", total_start.elapsed());
             }
         }
     }

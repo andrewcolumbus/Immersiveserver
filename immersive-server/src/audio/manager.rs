@@ -269,17 +269,33 @@ impl AudioManager {
 
     /// List available system audio devices
     pub fn list_audio_devices() -> Vec<String> {
-        SystemAudioInput::list_devices()
+        use std::time::Instant;
+        let start = Instant::now();
+        let result = SystemAudioInput::list_devices();
+        tracing::debug!("[AUDIO] list_audio_devices() took {:?}", start.elapsed());
+        result
     }
 
     /// Initialize system audio with a specific device (None = default device)
     pub fn init_system_audio_device(&mut self, device_name: Option<&str>) -> Result<(), String> {
-        // Remove existing system audio if present
-        self.remove_source(&AudioSourceId::SystemInput);
+        use std::time::Instant;
+        let total_start = Instant::now();
+        tracing::debug!("[AUDIO] init_system_audio_device() started, device={:?}", device_name);
 
+        // Remove existing system audio if present
+        let remove_start = Instant::now();
+        self.remove_source(&AudioSourceId::SystemInput);
+        tracing::debug!("[AUDIO] init_system_audio_device: remove_source() took {:?}", remove_start.elapsed());
+
+        let with_device_start = Instant::now();
         match SystemAudioInput::with_device(device_name) {
             Ok(mut input) => {
+                tracing::debug!("[AUDIO] init_system_audio_device: with_device() took {:?}", with_device_start.elapsed());
+
+                let capture_start = Instant::now();
                 input.start_capture()?;
+                tracing::debug!("[AUDIO] init_system_audio_device: start_capture() took {:?}", capture_start.elapsed());
+
                 let sample_rate = input.sample_rate();
                 let id = input.id().clone();
 
@@ -291,6 +307,7 @@ impl AudioManager {
                 self.primary_source = Some(id);
                 self.system_audio_initialized = true;
 
+                tracing::debug!("[AUDIO] init_system_audio_device() total took {:?}", total_start.elapsed());
                 tracing::info!(
                     "System audio initialized with device: {}",
                     device_name.unwrap_or("default")
@@ -368,8 +385,14 @@ impl AudioManager {
 
     /// Clear all audio sources
     pub fn clear_sources(&mut self) {
+        use std::time::Instant;
+        let total_start = Instant::now();
+        tracing::debug!("[AUDIO] clear_sources() started, {} sources to clear", self.sources.len());
+
         // Stop all sources first
+        let stop_start = Instant::now();
         self.stop_all();
+        tracing::debug!("[AUDIO] clear_sources: stop_all() took {:?}", stop_start.elapsed());
 
         // Clear collections
         self.sources.clear();
@@ -382,6 +405,7 @@ impl AudioManager {
         self.primary_source = None;
         self.system_audio_initialized = false;
 
+        tracing::debug!("[AUDIO] clear_sources() total took {:?}", total_start.elapsed());
         tracing::info!("Cleared all audio sources");
     }
 

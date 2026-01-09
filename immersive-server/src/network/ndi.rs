@@ -361,22 +361,7 @@ impl NdiReceiver {
                             state.frames_overwritten.fetch_add(1, Ordering::Relaxed);
                         }
                         buffer.push_back(ndi_frame);
-                        let frame_count = state.frame_count.fetch_add(1, Ordering::Relaxed) + 1;
-
-                        // Log stats every 60 frames
-                        if frame_count % 60 == 0 {
-                            let overwritten = state.frames_overwritten.load(Ordering::Relaxed);
-                            let queue_depth = buffer.len();
-                            tracing::info!(
-                                "NDI '{}': {} frames received, {} dropped ({:.1}%), buffer: {}/{}",
-                                ndi_name,
-                                frame_count,
-                                overwritten,
-                                if frame_count > 0 { overwritten as f64 / frame_count as f64 * 100.0 } else { 0.0 },
-                                queue_depth,
-                                capacity
-                            );
-                        }
+                        state.frame_count.fetch_add(1, Ordering::Relaxed);
                     }
 
                     // Free NDI's buffer
