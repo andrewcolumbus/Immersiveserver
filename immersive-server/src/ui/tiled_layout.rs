@@ -28,7 +28,7 @@
 //! +--------+---------+----------+
 //! ```
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 
 use super::dock::panel_ids;
@@ -101,7 +101,7 @@ impl SplitDirection {
 ///
 /// The tree is always balanced in structure (binary), but the visual balance
 /// depends on the split ratios.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub enum TileNode {
     /// A split node dividing space between two children.
     Split {
@@ -118,6 +118,102 @@ pub enum TileNode {
     },
     /// A leaf node containing one or more tabbed panels.
     Leaf(TabbedCell),
+}
+
+/// Helper struct for TileNode serialization (quick-xml compatible).
+///
+/// quick-xml doesn't support serde's default enum serialization for struct variants
+/// with nested complex types. This helper flattens the enum into a struct with a
+/// discriminator field (`node_type`) plus optional fields for each variant's data.
+#[derive(Serialize, Deserialize)]
+struct TileNodeHelper {
+    /// Discriminator: "Split" or "Leaf"
+    #[serde(rename = "type")]
+    node_type: String,
+    // Split variant fields
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    direction: Option<SplitDirection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ratio: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    first: Option<Box<TileNodeHelper>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    second: Option<Box<TileNodeHelper>>,
+    // Leaf variant field
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cell: Option<TabbedCell>,
+}
+
+impl TileNodeHelper {
+    /// Convert a TileNode to a helper struct (recursively).
+    fn from_node(node: &TileNode) -> Self {
+        match node {
+            TileNode::Split {
+                direction,
+                ratio,
+                first,
+                second,
+            } => TileNodeHelper {
+                node_type: "Split".to_string(),
+                direction: Some(*direction),
+                ratio: Some(*ratio),
+                first: Some(Box::new(TileNodeHelper::from_node(first))),
+                second: Some(Box::new(TileNodeHelper::from_node(second))),
+                cell: None,
+            },
+            TileNode::Leaf(cell) => TileNodeHelper {
+                node_type: "Leaf".to_string(),
+                direction: None,
+                ratio: None,
+                first: None,
+                second: None,
+                cell: Some(cell.clone()),
+            },
+        }
+    }
+
+    /// Convert a helper struct back to a TileNode (recursively).
+    fn to_node(self) -> TileNode {
+        match self.node_type.as_str() {
+            "Split" => TileNode::Split {
+                direction: self.direction.unwrap_or(SplitDirection::Horizontal),
+                ratio: self.ratio.unwrap_or(0.5),
+                first: Box::new(
+                    self.first
+                        .map(|h| h.to_node())
+                        .unwrap_or_else(|| TileNode::Leaf(TabbedCell::new(0, String::new()))),
+                ),
+                second: Box::new(
+                    self.second
+                        .map(|h| h.to_node())
+                        .unwrap_or_else(|| TileNode::Leaf(TabbedCell::new(0, String::new()))),
+                ),
+            },
+            _ => TileNode::Leaf(
+                self.cell
+                    .unwrap_or_else(|| TabbedCell::new(0, String::new())),
+            ),
+        }
+    }
+}
+
+impl Serialize for TileNode {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        TileNodeHelper::from_node(self).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for TileNode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let helper = TileNodeHelper::deserialize(deserializer)?;
+        Ok(helper.to_node())
+    }
 }
 
 impl TileNode {
