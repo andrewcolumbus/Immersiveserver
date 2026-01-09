@@ -3991,8 +3991,10 @@ impl App {
             self.advanced_output_window.preview_texture_id = None;
         }
 
-        // Register environment texture for floating environment window
-        if self.environment_floating && !self.environment_broken_out {
+        // Register environment texture for floating environment window or tiled layout
+        let needs_env_texture = (self.environment_floating && !self.environment_broken_out)
+            || self.use_tiled_layout;
+        if needs_env_texture {
             let env_texture_id = self.egui_renderer.register_native_texture(
                 &self.device,
                 self.environment.texture_view(),
