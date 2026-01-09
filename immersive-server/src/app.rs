@@ -178,6 +178,8 @@ pub struct App {
     preview_source_params_buffer: Option<wgpu::Buffer>,
     /// Whether source preview has received at least one frame
     preview_source_has_frame: bool,
+    /// Current preview height (updated when user resizes window)
+    current_preview_height: f32,
     /// Thumbnail cache for video previews in clip grid
     pub thumbnail_cache: crate::ui::ThumbnailCache,
     /// HAP Converter window
@@ -644,6 +646,7 @@ impl App {
             preview_source_bind_group: None,
             preview_source_params_buffer: None,
             preview_source_has_frame: false,
+            current_preview_height: 280.0,
             thumbnail_cache: crate::ui::ThumbnailCache::new(),
             converter_window: crate::converter::ConverterWindow::new(),
             preferences_window: crate::ui::PreferencesWindow::new(),
@@ -2789,6 +2792,7 @@ impl App {
                             video_info,
                             layer_dimensions,
                             source_dimensions,
+                            self.current_preview_height,
                             |ui, rect, uv_rect| {
                                 // Render the preview texture into the given rect with viewport-adjusted UVs
                                 if let Some(texture_id) = self.preview_player.egui_texture_id {
@@ -2818,26 +2822,13 @@ impl App {
                         );
                     });
 
-                // Update window position and size for persistence, and sync preview height
+                // Update window position for persistence (no preview height sync - causes feedback loops)
                 if let Some(resp) = &window_response {
                     let rect = resp.response.rect;
                     if let Some(p) = self.dock_manager.get_panel_mut(crate::ui::dock::panel_ids::PREVIEW_MONITOR) {
                         p.floating_pos = Some((rect.left(), rect.top()));
                         p.floating_size = Some((rect.width(), rect.height()));
                     }
-
-                    // Calculate preview height from window size and update the panel
-                    // Window chrome: ~26px title bar + ~8px padding
-                    // Header section: ~50px (label + small text + separator)
-                    // Controls section: varies by mode (80 for clip, 30 for others)
-                    let window_chrome = 34.0;
-                    let header_height = 50.0;
-                    let controls_height = match self.preview_monitor_panel.mode() {
-                        crate::ui::PreviewMode::Clip(_) => 80.0,
-                        _ => 30.0,
-                    };
-                    let new_preview_height = rect.height() - window_chrome - header_height - controls_height;
-                    self.preview_monitor_panel.set_preview_height(new_preview_height);
                 }
 
                 if !open {

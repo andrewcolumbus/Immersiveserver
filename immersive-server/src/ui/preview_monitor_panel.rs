@@ -76,9 +76,6 @@ pub enum PreviewMode {
     Source(PreviewSourceInfo),
 }
 
-/// Default preview area height in pixels
-const DEFAULT_PREVIEW_HEIGHT: f32 = 280.0;
-
 /// State for the preview monitor panel
 pub struct PreviewMonitorPanel {
     /// Current preview mode (clip, layer, or none)
@@ -87,8 +84,6 @@ pub struct PreviewMonitorPanel {
     scrubber_state: ScrubberState,
     /// Viewport for pan/zoom navigation
     viewport: Viewport,
-    /// Preview area height (user-adjustable via window resize)
-    preview_height: f32,
 }
 
 impl Default for PreviewMonitorPanel {
@@ -104,18 +99,7 @@ impl PreviewMonitorPanel {
             mode: PreviewMode::None,
             scrubber_state: ScrubberState::new(),
             viewport: Viewport::new(),
-            preview_height: DEFAULT_PREVIEW_HEIGHT,
         }
-    }
-
-    /// Set the preview area height (called when user resizes the window)
-    pub fn set_preview_height(&mut self, height: f32) {
-        self.preview_height = height.max(100.0); // Minimum 100px
-    }
-
-    /// Get the current preview area height
-    pub fn preview_height(&self) -> f32 {
-        self.preview_height
     }
 
     /// Set the clip to preview (switches to clip mode)
@@ -217,6 +201,7 @@ impl PreviewMonitorPanel {
         video_info: Option<VideoInfo>,
         layer_dimensions: Option<(u32, u32)>,
         source_dimensions: Option<(u32, u32)>,
+        preview_height: f32,
         render_preview: F,
     ) -> Vec<PreviewMonitorAction>
     where
@@ -326,9 +311,9 @@ impl PreviewMonitorPanel {
             }
         }
 
-        // Preview area - use stored preview_height (user-adjustable via window resize)
+        // Preview area - height is passed in from App, updated when user resizes window
         let available_width = ui.available_width();
-        let preview_height = self.preview_height;
+        // preview_height parameter is used directly (passed from App.current_preview_height)
 
         // Get dimensions for aspect ratio calculation
         let dimensions: Option<(u32, u32)> = match &self.mode {
