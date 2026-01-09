@@ -8718,55 +8718,74 @@ impl App {
     fn render_panel_content(&mut self, ui: &mut egui::Ui, panel_id: &str) {
         use crate::ui::dock::panel_ids;
 
-        match panel_id {
-            panel_ids::ENVIRONMENT => {
-                // Environment viewport - render the composition canvas with pan/zoom support
-                if let Some(tex_id) = self.environment_egui_texture_id {
-                    let available = ui.available_size();
-                    let env_width = self.environment.width() as f32;
-                    let env_height = self.environment.height() as f32;
-                    let content_size = (env_width, env_height);
+        // Environment panel fills the entire area (no padding needed for viewport)
+        // All other panels get consistent padding for better usability in tiled mode
+        if panel_id == panel_ids::ENVIRONMENT {
+            self.render_environment_panel(ui);
+        } else {
+            // Add consistent padding for all non-viewport panels
+            egui::Frame::none()
+                .inner_margin(egui::Margin::same(10))
+                .show(ui, |ui| {
+                    self.render_panel_content_inner(ui, panel_id);
+                });
+        }
+    }
 
-                    // Allocate rect with click_and_drag for viewport input
-                    let (full_rect, response) = ui.allocate_exact_size(available, egui::Sense::click_and_drag());
+    /// Render the Environment viewport panel (no padding, fills area).
+    fn render_environment_panel(&mut self, ui: &mut egui::Ui) {
+        if let Some(tex_id) = self.environment_egui_texture_id {
+            let available = ui.available_size();
+            let env_width = self.environment.width() as f32;
+            let env_height = self.environment.height() as f32;
+            let content_size = (env_width, env_height);
 
-                    // Handle viewport interactions (right-drag pan, scroll zoom)
-                    let viewport_response = crate::ui::viewport_widget::handle_viewport_input(
-                        ui,
-                        &response,
-                        full_rect,
-                        &mut self.tiled_env_viewport,
-                        content_size,
-                        &crate::ui::ViewportConfig::default(),
-                        "tiled_env",
-                    );
+            // Allocate rect with click_and_drag for viewport input
+            let (full_rect, response) = ui.allocate_exact_size(available, egui::Sense::click_and_drag());
 
-                    if viewport_response.changed {
-                        ui.ctx().request_repaint();
-                    }
+            // Handle viewport interactions (right-drag pan, scroll zoom)
+            let viewport_response = crate::ui::viewport_widget::handle_viewport_input(
+                ui,
+                &response,
+                full_rect,
+                &mut self.tiled_env_viewport,
+                content_size,
+                &crate::ui::ViewportConfig::default(),
+                "tiled_env",
+            );
 
-                    // Compute UV and dest rect with viewport transform
-                    let render_info = crate::ui::viewport_widget::compute_uv_and_dest_rect(
-                        &self.tiled_env_viewport,
-                        full_rect,
-                        content_size,
-                    );
-
-                    // Fill background with black for letterboxing
-                    ui.painter().rect_filled(full_rect, 0.0, egui::Color32::BLACK);
-
-                    // Draw environment texture with computed UV rect
-                    ui.painter().image(tex_id, render_info.dest_rect, render_info.uv_rect, egui::Color32::WHITE);
-
-                    // Draw zoom indicator (shows percentage in bottom-right)
-                    crate::ui::viewport_widget::draw_zoom_indicator(ui, full_rect, &self.tiled_env_viewport);
-                } else {
-                    // Show placeholder on first frame before texture is registered
-                    ui.centered_and_justified(|ui| {
-                        ui.label("Loading environment...");
-                    });
-                }
+            if viewport_response.changed {
+                ui.ctx().request_repaint();
             }
+
+            // Compute UV and dest rect with viewport transform
+            let render_info = crate::ui::viewport_widget::compute_uv_and_dest_rect(
+                &self.tiled_env_viewport,
+                full_rect,
+                content_size,
+            );
+
+            // Fill background with black for letterboxing
+            ui.painter().rect_filled(full_rect, 0.0, egui::Color32::BLACK);
+
+            // Draw environment texture with computed UV rect
+            ui.painter().image(tex_id, render_info.dest_rect, render_info.uv_rect, egui::Color32::WHITE);
+
+            // Draw zoom indicator (shows percentage in bottom-right)
+            crate::ui::viewport_widget::draw_zoom_indicator(ui, full_rect, &self.tiled_env_viewport);
+        } else {
+            // Show placeholder on first frame before texture is registered
+            ui.centered_and_justified(|ui| {
+                ui.label("Loading environment...");
+            });
+        }
+    }
+
+    /// Render inner panel content (called with padding wrapper for non-viewport panels).
+    fn render_panel_content_inner(&mut self, ui: &mut egui::Ui, panel_id: &str) {
+        use crate::ui::dock::panel_ids;
+
+        match panel_id {
             panel_ids::PROPERTIES => {
                 let layers = self.environment.layers().to_vec();
                 let layer_video_info = self.layer_video_info();
