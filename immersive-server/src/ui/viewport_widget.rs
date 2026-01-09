@@ -11,6 +11,8 @@ use crate::compositor::Viewport;
 pub const DEFAULT_SCROLL_SENSITIVITY: f32 = 50.0;
 /// Default scroll threshold to trigger zoom
 pub const DEFAULT_SCROLL_THRESHOLD: f32 = 0.5;
+/// Default pan sensitivity divisor (higher = less sensitive)
+pub const DEFAULT_PAN_SENSITIVITY: f32 = 5.0;
 
 /// Configuration for viewport interaction behavior
 #[derive(Clone)]
@@ -21,6 +23,8 @@ pub struct ViewportConfig {
     pub scroll_threshold: f32,
     /// Enable double-click to reset. Default: true
     pub double_click_reset: bool,
+    /// Pan sensitivity divisor (higher = less sensitive). Default: 1.0
+    pub pan_sensitivity: f32,
 }
 
 impl Default for ViewportConfig {
@@ -29,6 +33,7 @@ impl Default for ViewportConfig {
             scroll_sensitivity: DEFAULT_SCROLL_SENSITIVITY,
             scroll_threshold: DEFAULT_SCROLL_THRESHOLD,
             double_click_reset: true,
+            pan_sensitivity: DEFAULT_PAN_SENSITIVITY,
         }
     }
 }
@@ -50,6 +55,8 @@ pub struct ViewportResponse {
 ///
 /// Call this after `ui.allocate_rect()` with `Sense::click_and_drag()`.
 /// Handles: right-click drag (pan), scroll wheel (zoom), double-right-click (reset)
+///
+/// `context` is a label for logging (e.g., "floating_env", "preview_monitor")
 pub fn handle_viewport_input(
     ui: &egui::Ui,
     response: &egui::Response,
@@ -57,12 +64,14 @@ pub fn handle_viewport_input(
     viewport: &mut Viewport,
     content_size: (f32, f32),
     config: &ViewportConfig,
+    context: &str,
 ) -> ViewportResponse {
     let preview_size = (rect.width(), rect.height());
     let mut result = ViewportResponse::default();
 
     // Handle double-right-click to reset viewport
     if config.double_click_reset && response.double_clicked_by(egui::PointerButton::Secondary) {
+        tracing::debug!(target: "viewport", context = context, "double_click_reset");
         viewport.reset();
         result.changed = true;
         result.was_reset = true;
@@ -73,6 +82,13 @@ pub fn handle_viewport_input(
     if response.drag_started_by(egui::PointerButton::Secondary) {
         if let Some(pos) = response.interact_pointer_pos() {
             let local_pos = (pos.x - rect.left(), pos.y - rect.top());
+            tracing::debug!(
+                target: "viewport",
+                context = context,
+                local_x = local_pos.0,
+                local_y = local_pos.1,
+                "drag_start"
+            );
             viewport.on_right_mouse_down(local_pos);
             result.changed = true;
         }
@@ -82,13 +98,30 @@ pub fn handle_viewport_input(
     if response.dragged_by(egui::PointerButton::Secondary) {
         if let Some(pos) = response.interact_pointer_pos() {
             let local_pos = (pos.x - rect.left(), pos.y - rect.top());
-            viewport.on_mouse_move(local_pos, preview_size, content_size);
+            tracing::debug!(
+                target: "viewport",
+                context = context,
+                local_x = local_pos.0,
+                local_y = local_pos.1,
+                preview_w = preview_size.0,
+                preview_h = preview_size.1,
+                content_w = content_size.0,
+                content_h = content_size.1,
+                "dragging"
+            );
+            viewport.on_mouse_move_with_sensitivity(
+                local_pos,
+                preview_size,
+                content_size,
+                config.pan_sensitivity,
+            );
             result.changed = true;
         }
     }
 
     // Handle right-click drag end
     if response.drag_stopped_by(egui::PointerButton::Secondary) {
+        tracing::debug!(target: "viewport", context = context, "drag_end");
         viewport.on_right_mouse_up();
         result.changed = true;
     }
@@ -101,6 +134,13 @@ pub fn handle_viewport_input(
                 let local_pos = (pos.x - rect.left(), pos.y - rect.top());
                 // Normalize scroll to reasonable zoom increments
                 let zoom_delta = scroll / config.scroll_sensitivity;
+                tracing::debug!(
+                    target: "viewport",
+                    context = context,
+                    scroll = scroll,
+                    zoom_delta = zoom_delta,
+                    "scroll"
+                );
                 viewport.on_scroll(zoom_delta, local_pos, preview_size, content_size);
                 result.changed = true;
             }
@@ -288,7 +328,7 @@ pub fn handle_winit_mouse_move(
     window_size: (f32, f32),
     content_size: (f32, f32),
 ) -> ViewportResponse {
-    viewport.on_mouse_move(pos, window_size, content_size);
+    viewport.on_mouse_move_with_sensitivity(pos, window_size, content_size, DEFAULT_PAN_SENSITIVITY);
     ViewportResponse { changed: true, was_reset: false }
 }
 

@@ -963,6 +963,7 @@ impl AdvancedOutputWindow {
                 &mut self.env_viewport,
                 env_content_size,
                 &ViewportConfig::default(),
+                "adv_output_screens",
             );
 
             // Draw environment texture background
@@ -2512,6 +2513,7 @@ impl AdvancedOutputWindow {
                     &mut self.output_viewport,
                     output_content_size,
                     &ViewportConfig::default(),
+                    "adv_output_transform",
                 );
 
                 // Draw preview background

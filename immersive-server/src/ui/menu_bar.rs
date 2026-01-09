@@ -61,6 +61,10 @@ pub enum MenuAction {
     TapTempo,
     /// Resync to bar start
     ResyncBpm,
+    /// Breakout environment viewport to separate window
+    BreakoutEnvironment,
+    /// Redock environment viewport back to main window
+    RedockEnvironment,
 }
 
 /// BPM clock info for display
@@ -93,6 +97,7 @@ impl MenuBar {
     /// `panel_states` is a list of (panel_id, title, is_open) for View menu toggles.
     /// `layout_manager` is optional for rendering the Layout submenu.
     /// `bpm_info` is optional BPM clock information for the tempo display.
+    /// `audio_levels` is the (low, mid, high) band levels for the audio meter.
     pub fn render(
         &mut self,
         ctx: &egui::Context,
@@ -103,6 +108,7 @@ impl MenuBar {
         panel_states: &[(&str, &str, bool)],
         layout_manager: Option<&LayoutPresetManager>,
         bpm_info: Option<BpmInfo>,
+        audio_levels: (f32, f32, f32),
     ) -> bool {
         let mut settings_changed = false;
         let definition = MenuBarDefinition::build();
@@ -128,9 +134,9 @@ impl MenuBar {
                     );
                 }
 
-                // RIGHT SIDE: egui-only status area (FPS, BPM, status messages)
+                // RIGHT SIDE: egui-only status area (FPS, BPM, audio, status messages)
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    self.render_status_area(ui, settings, fps, frame_time_ms, bpm_info, &mut settings_changed);
+                    self.render_status_area(ui, settings, fps, frame_time_ms, bpm_info, audio_levels, &mut settings_changed);
                 });
             });
         });
@@ -330,8 +336,51 @@ impl MenuBar {
         fps: f64,
         frame_time_ms: f64,
         bpm_info: Option<BpmInfo>,
+        audio_levels: (f32, f32, f32),
         _settings_changed: &mut bool,
     ) {
+        // Audio level meter (compact horizontal bar)
+        {
+            let (low, mid, high) = audio_levels;
+            let meter_width = 60.0;
+            let meter_height = 10.0;
+
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(meter_width, meter_height), egui::Sense::hover());
+
+            if ui.is_rect_visible(rect) {
+                let painter = ui.painter();
+
+                // Background
+                painter.rect_filled(rect, 2.0, egui::Color32::from_gray(30));
+
+                let segment_width = rect.width() / 3.0;
+
+                // Low band (orange)
+                let low_width = segment_width * low.clamp(0.0, 1.0);
+                let low_rect = egui::Rect::from_min_size(rect.min, egui::vec2(low_width, meter_height));
+                painter.rect_filled(low_rect, 2.0, egui::Color32::from_rgb(255, 100, 50));
+
+                // Mid band (green)
+                let mid_start = rect.min.x + segment_width;
+                let mid_width = segment_width * mid.clamp(0.0, 1.0);
+                let mid_rect = egui::Rect::from_min_size(
+                    egui::pos2(mid_start, rect.min.y),
+                    egui::vec2(mid_width, meter_height),
+                );
+                painter.rect_filled(mid_rect, 0.0, egui::Color32::from_rgb(50, 255, 100));
+
+                // High band (blue)
+                let high_start = rect.min.x + 2.0 * segment_width;
+                let high_width = segment_width * high.clamp(0.0, 1.0);
+                let high_rect = egui::Rect::from_min_size(
+                    egui::pos2(high_start, rect.min.y),
+                    egui::vec2(high_width, meter_height),
+                );
+                painter.rect_filled(high_rect, 2.0, egui::Color32::from_rgb(50, 150, 255));
+            }
+            ui.separator();
+        }
+
         if settings.show_fps {
             ui.label(
                 egui::RichText::new(format!("{:.1} fps | {:.2}ms", fps, frame_time_ms))

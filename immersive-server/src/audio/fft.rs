@@ -8,7 +8,7 @@ use std::time::Instant;
 const FFT_SIZE: usize = 2048;
 
 /// Default smoothing factor (0 = no smoothing, 1 = full smoothing)
-const DEFAULT_SMOOTHING: f32 = 0.3;
+const DEFAULT_SMOOTHING: f32 = 0.0;
 
 /// FFT analyzer with frequency band extraction
 pub struct FftAnalyzer {
@@ -103,7 +103,8 @@ impl FftAnalyzer {
             .sqrt();
 
         // Normalize values (empirical scaling for 0-1 range)
-        let normalize = |v: f32| (v / (FFT_SIZE as f32 / 8.0)).min(1.0);
+        // Microphone input has low amplitude, so use gentle normalization
+        let normalize = |v: f32| (v / 4.0).min(1.0);
 
         let raw_data = FftData {
             low: normalize(low),

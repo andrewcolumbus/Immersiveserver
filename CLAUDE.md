@@ -48,12 +48,26 @@ immersive-server/
 │   ├── app.rs               # App struct: wgpu context, egui, render orchestration
 │   ├── layer_runtime.rs     # Per-layer GPU resources (players, textures, transitions)
 │   ├── settings.rs          # XML serialization for .immersive files
+│   ├── gpu_context.rs       # wgpu device/queue initialization
+│   ├── preview_player.rs    # Preview video player for UI
+│   │
+│   ├── audio/               # Audio input & FFT analysis
+│   │   ├── mod.rs           # Module exports
+│   │   ├── manager.rs       # AudioManager: coordinates sources & FFT
+│   │   ├── fft.rs           # FFT analyzer (RustFFT, 2048 samples, Hann window)
+│   │   ├── source.rs        # AudioSource trait & ring buffer
+│   │   ├── system_input.rs  # System audio capture (CoreAudio on macOS)
+│   │   ├── omt_source.rs    # OMT network audio source
+│   │   ├── ndi_source.rs    # NDI network audio source
+│   │   └── types.rs         # AudioBand, AudioBuffer, FftData types
+│   │
 │   ├── compositor/          # Composition engine
 │   │   ├── environment.rs   # Fixed-resolution canvas with layer vector
 │   │   ├── layer.rs         # Layer definition (source, transform, blend, clips)
 │   │   ├── clip.rs          # ClipCell, ClipGrid, ClipTransition
 │   │   ├── blend.rs         # BlendMode enum
 │   │   └── viewport.rs      # Pan/zoom with spring physics
+│   │
 │   ├── video/               # Video decoding & rendering
 │   │   ├── decoder.rs       # FFmpeg decoder with hwaccel (VideoToolbox/D3D11VA)
 │   │   ├── player.rs        # Background-threaded playback
@@ -61,28 +75,113 @@ immersive-server/
 │   │   ├── texture.rs       # GPU texture management
 │   │   ├── hap.rs           # HAP codec (BC1/BC3 direct upload)
 │   │   └── frame.rs         # DecodedFrame struct
+│   │
+│   ├── effects/             # Resolume-style stackable effects
+│   │   ├── mod.rs           # Module documentation
+│   │   ├── types.rs         # EffectStack, EffectInstance, parameters
+│   │   ├── traits.rs        # EffectDefinition, GpuEffectRuntime traits
+│   │   ├── registry.rs      # Effect factory registry
+│   │   ├── runtime.rs       # GPU effect chain processing
+│   │   ├── automation.rs    # BPM/LFO parameter modulation
+│   │   ├── manager.rs       # Effect lifecycle management
+│   │   └── builtin/         # Built-in effects
+│   │       ├── color_correction.rs  # Brightness, saturation, hue
+│   │       ├── invert.rs            # Video inversion
+│   │       ├── heat.rs              # Heat vision effect
+│   │       ├── auto_mask.rs         # Automatic masking
+│   │       ├── image_rain.rs        # Particle rain with image sampling
+│   │       ├── poop_rain.rs         # Emoji particle rain
+│   │       ├── multiplex.rs         # Multi-input composition
+│   │       └── slide.rs             # Slide/wipe transitions
+│   │
+│   ├── output/              # Multi-screen projection mapping
+│   │   ├── mod.rs           # Module exports
+│   │   ├── runtime.rs       # Output processing engine
+│   │   ├── display.rs       # DisplayManager, multi-monitor detection
+│   │   ├── screen.rs        # Physical display representation
+│   │   ├── slice.rs         # Slice-based input selection
+│   │   ├── warp.rs          # Perspective/mesh warp
+│   │   ├── edge_blend.rs    # Seamless projector overlap
+│   │   ├── mask.rs          # Per-output masking (Bezier)
+│   │   ├── color.rs         # Per-output color correction
+│   │   └── preset.rs        # Output configuration presets
+│   │
 │   ├── network/             # Streaming & discovery
-│   │   ├── omt.rs           # OmtReceiver/OmtSender via Aqueduct
+│   │   ├── omt.rs           # OMT receiver via Aqueduct
+│   │   ├── omt_ffi.rs       # OMT FFI bindings
 │   │   ├── omt_capture.rs   # GPU readback for OMT output streaming
-│   │   └── discovery.rs     # mDNS source discovery
-│   ├── ui/                  # egui panels
-│   │   ├── menu_bar.rs      # File/View menus, status bar
-│   │   ├── dock.rs          # Docking system for panels
-│   │   ├── clip_grid_panel.rs   # VJ-style clip launcher
-│   │   ├── properties_panel.rs  # Environment/Layer/Clip editing
-│   │   └── sources_panel.rs     # OMT/NDI source browser
+│   │   ├── ndi.rs           # NDI receiver
+│   │   ├── ndi_ffi.rs       # NDI FFI bindings
+│   │   ├── ndi_capture.rs   # NDI output streaming
+│   │   ├── syphon.rs        # macOS Syphon output
+│   │   ├── syphon_ffi.rs    # Syphon FFI bindings
+│   │   ├── spout.rs         # Windows Spout output
+│   │   ├── spout_ffi.rs     # Spout FFI bindings
+│   │   ├── discovery.rs     # mDNS source discovery
+│   │   └── texture_share.rs # Shared texture utilities
+│   │
+│   ├── api/                 # REST API & WebSocket control
+│   │   ├── server.rs        # Axum server setup
+│   │   ├── routes.rs        # REST API endpoints (40+)
+│   │   ├── websocket.rs     # WebSocket event streaming
+│   │   ├── shared.rs        # ApiCommand, AppSnapshot types
+│   │   ├── types.rs         # Request/response structures
+│   │   ├── dashboard.rs     # Dashboard HTML server
+│   │   └── dashboard.html   # Browser-based control UI
+│   │
+│   ├── telemetry/           # Performance monitoring & logging
+│   │   ├── logging.rs       # Structured logging (tracing crate)
+│   │   ├── metrics.rs       # Frame timing, GPU memory stats
+│   │   └── profiling.rs     # GPU timestamp queries
+│   │
+│   ├── previs/              # 3D wall layout preview
+│   │   ├── camera.rs        # 3D preview camera
+│   │   ├── mesh.rs          # 3D wall mesh generation
+│   │   ├── renderer.rs      # 3D rendering pipeline
+│   │   └── types.rs         # 3D data structures
+│   │
+│   ├── ui/                  # egui panels & windows
+│   │   ├── mod.rs           # Panel boilerplate macro
+│   │   ├── dock.rs          # Docking system (DockManager, DockZone)
+│   │   ├── window_registry.rs     # Window state management
+│   │   ├── widgets.rs       # Custom widgets (resettable sliders)
+│   │   ├── icons.rs         # Icon definitions
+│   │   ├── menu_bar.rs      # File/View/Help menus, status bar
+│   │   ├── menu_definition.rs     # Menu structure definitions
+│   │   ├── native_menu.rs   # Native OS menu support (macOS)
+│   │   ├── properties_panel.rs    # Environment/Layer/Clip editing
+│   │   ├── clip_grid_panel.rs     # VJ-style clip launcher
+│   │   ├── sources_panel.rs       # OMT/NDI source browser
+│   │   ├── effects_browser_panel.rs  # Effects browser
+│   │   ├── performance_panel.rs   # Real-time metrics display
+│   │   ├── preferences_window.rs  # Application settings
+│   │   ├── advanced_output_window.rs  # Projection mapping UI
+│   │   ├── preview_monitor_panel.rs   # Preview monitoring
+│   │   ├── file_browser_panel.rs  # Media file browsing
+│   │   ├── previs_panel.rs        # 3D wall preview
+│   │   ├── viewport_widget.rs     # Main composition viewport
+│   │   ├── thumbnail_cache.rs     # Video thumbnail caching
+│   │   └── layout_preset.rs       # UI layout presets
+│   │
 │   ├── converter/           # HAP video converter tool
-│   │   ├── mod.rs
-│   │   └── window.rs
+│   │   └── window.rs        # Converter UI
+│   │
 │   └── shaders/
 │       ├── mod.rs           # Shader loading with hot-reload
-│       └── fullscreen_quad.wgsl
+│       ├── fullscreen_quad.wgsl
+│       ├── test_pattern.wgsl
+│       ├── previs_3d.wgsl
+│       ├── effects/         # Effect-specific shaders
+│       └── output/          # Output processing shaders
+│
 ├── examples/
 │   ├── decode_video.rs      # Standalone FFmpeg decode test
 │   ├── decode_to_texture.rs # Decode → GPU texture test
 │   └── play_video.rs        # Full playback example
+│
 ├── docs/
 │   └── omt-evaluation.md    # OMT protocol evaluation notes
+│
 ├── Cargo.toml
 └── .cargo/config.toml       # FFmpeg library paths for macOS
 ```
@@ -199,6 +298,7 @@ Environment (fixed-resolution GPU texture)
         ├── ClipGrid (rows × columns of triggerable clips)
         ├── Transform2D (position, scale, rotation, anchor)
         ├── BlendMode (Normal, Additive, Multiply, Screen)
+        ├── EffectStack (stackable GPU/CPU effects)
         └── opacity, visible
 ```
 
@@ -209,8 +309,10 @@ Environment (fixed-resolution GPU texture)
 Each frame executes these render passes:
 1. **Checkerboard pass** - Fill environment texture with pattern background
 2. **Layer composition** - Render each layer with blend mode into environment texture
-3. **Viewport pass** - Scale/pan environment to fit window with zoom
-4. **egui pass** - UI overlay with `LoadOp::Load` (preserves previous content)
+3. **Effects processing** - Apply effect stacks to layers
+4. **Viewport pass** - Scale/pan environment to fit window with zoom
+5. **Output pass** - Apply warp/blend/mask for projection mapping
+6. **egui pass** - UI overlay with `LoadOp::Load` (preserves previous content)
 
 ### Video Pipeline
 
@@ -232,6 +334,38 @@ Implemented via `pending_runtimes` map that holds the new clip until first frame
 ### Viewport Navigation
 
 Environment resolution is independent of window size. The `Viewport` handles pan/zoom navigation with spring physics for smooth right-click panning with rubber-band snap-back.
+
+### Audio System
+
+Real-time audio input with FFT analysis for audio-reactive effects:
+- **Sources:** System audio (CoreAudio), OMT streams, NDI streams
+- **FFT:** RustFFT with 2048-sample window, Hann windowing
+- **Bands:** Configurable frequency bands with per-band sensitivity
+- **Output:** FftData struct with smoothed band levels
+
+### Effects System
+
+Resolume-style stackable effects with BPM/LFO automation:
+- **GPU Effects:** Shader-based processing (color correction, invert, heat)
+- **CPU Effects:** Rust-based processing (auto-mask, particle systems)
+- **Automation:** BPM sync, LFO modulation of any parameter
+- **Registry:** Factory pattern for effect instantiation
+
+### Output/Projection Mapping
+
+Multi-screen output with advanced projection features:
+- **Slices:** Crop/position regions from composition or layers
+- **Warp:** Perspective and mesh-based warping
+- **Edge Blend:** Seamless projector overlap
+- **Masks:** Bezier-based per-output masking
+- **Color:** Per-output color correction
+
+### API & WebSocket
+
+Remote control via Axum-based REST API and WebSocket:
+- **REST:** 40+ endpoints for layer/clip/effect/source control
+- **WebSocket:** Real-time state streaming and events
+- **Dashboard:** Browser-based control UI (dashboard.html)
 
 ### UI Conventions
 
@@ -271,8 +405,10 @@ Environment settings saved as `.immersive` XML files via `quick-xml` + serde.
 - **Graphics:** wgpu 24 (Metal/DX12), winit 0.30
 - **GUI:** egui 0.31
 - **Video:** ffmpeg-next 7.1, HAP codec
+- **Audio:** RustFFT, CoreAudio (macOS)
+- **Web:** Axum (REST API, WebSocket)
 - **Async:** tokio 1
-- **Streaming:** Aqueduct (OMT), mdns-sd
+- **Streaming:** Aqueduct (OMT), NDI, Syphon, Spout, mdns-sd
 
 ## Development Roadmap
 
@@ -284,12 +420,14 @@ See `immersive-server/build_plan.md` for full details. Current status:
 | 2. Environment & Layers | Multi-layer composition, blend modes, clip grid | ✅ Complete |
 | 2.5. Video Manipulation | Clone, multiplex, resize, position | ✅ Complete |
 | 3. Hardware Decode | VideoToolbox/NVDEC, HAP codec | ✅ Complete |
-| 4. OMT I/O | OMT streaming via Aqueduct | 🔶 Mostly complete |
-| 5. Web Control | REST API + WebSocket (Axum) | ⬜ Not started |
-| 6. Web Dashboard | Browser-based control surface | ⬜ Not started |
-| 7. Polish & Performance | GPU tiling, profiling, installers | ⬜ Not started |
-| 9. Projection Mapping | Mesh warp, edge blend, masking | ⬜ Not started |
-| 10. NDI I/O | NDI input/output streams | ⬜ Not started |
+| 4. OMT I/O | OMT streaming via Aqueduct | ✅ Complete |
+| 5. Web Control | REST API + WebSocket (Axum) | ✅ Complete |
+| 6. Web Dashboard | Browser-based control surface | ✅ Complete |
+| 7. Polish & Performance | GPU tiling, profiling, installers | 🔶 In progress |
+| 8. Effects System | Stackable effects with automation | ✅ Complete |
+| 9. Projection Mapping | Mesh warp, edge blend, masking | ✅ Complete |
+| 10. NDI I/O | NDI input/output streams | ✅ Complete |
+| 11. Audio Reactivity | FFT analysis, audio-reactive effects | ✅ Complete |
 
 ### Performance Targets
 
@@ -305,7 +443,7 @@ See `immersive-server/build_plan.md` for full details. Current status:
 
 ### Upcoming Features
 
-- **Web Control Server**: Axum-based REST API and WebSocket for remote control
-- **Projection Mapping**: Mesh warp, edge blending, masking, color correction
-- **NDI Support**: Industry-standard IP video input/output
-- **Multi-Output**: Multiple displays with independent mapping per output
+- **Multi-Output Windows:** Independent fullscreen windows per output
+- **Advanced Automation:** MIDI/OSC input for parameter control
+- **GPU Profiling:** Detailed per-pass timing statistics
+- **Installer Packages:** macOS .app and Windows .exe distributions

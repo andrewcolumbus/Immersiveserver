@@ -81,13 +81,21 @@ pub struct App {
 
     // Environment (fixed-resolution composition canvas)
     environment: Environment,
-    
+
     // Viewport navigation (pan/zoom)
     viewport: Viewport,
+    /// Separate viewport for floating environment window (avoids coordinate conflict with main window)
+    floating_env_viewport: Viewport,
     /// Current mouse position in window pixels
     cursor_position: (f32, f32),
     /// Last frame time for viewport animation
     last_frame_time: Instant,
+    /// Whether the environment is broken out to its own window
+    pub environment_broken_out: bool,
+    /// Whether the environment is rendered as a floating egui window (within main window)
+    pub environment_floating: bool,
+    /// Environment texture ID for egui rendering (when floating)
+    environment_egui_texture_id: Option<egui::TextureId>,
 
     // Checkerboard background pipeline
     /// Render pipeline for checkerboard background
@@ -158,6 +166,8 @@ pub struct App {
     pub preview_monitor_panel: crate::ui::PreviewMonitorPanel,
     /// 3D previsualization panel
     pub previs_panel: crate::ui::PrevisPanel,
+    /// Cross-window drag state for effects (enables drag-drop between undocked panels)
+    pub cross_window_drag: crate::ui::CrossWindowDragState,
     /// 3D previsualization renderer
     previs_renderer: Option<crate::previs::PrevisRenderer>,
     /// Preview player for clip preview playback
@@ -559,8 +569,12 @@ impl App {
             bc_texture_supported,
             environment,
             viewport: Viewport::new(),
+            floating_env_viewport: Viewport::new(),
             cursor_position: (0.0, 0.0),
             last_frame_time: now,
+            environment_broken_out: false,
+            environment_floating: true,  // Default to floating egui window
+            environment_egui_texture_id: None,
             checker_pipeline,
             checker_params_buffer,
             checker_bind_group,
@@ -587,30 +601,47 @@ impl App {
             dock_manager: {
                 let mut dm = crate::ui::DockManager::new();
                 // Register the standard panels with their default dock zones
-                dm.register_panel(crate::ui::DockablePanel::new(
+                // Note: Drag-drop panels have can_undock=false because egui's DragAndDrop
+                // API uses context-local payloads that don't work across separate windows
+                dm.register_panel(crate::ui::DockablePanel::new_extended(
                     crate::ui::dock::panel_ids::CLIP_GRID,
                     "Clip Grid",
                     crate::ui::DockZone::Right,
+                    false,  // can_undock - drop target for sources/files
+                    false,  // requires_gpu_rendering
+                    crate::ui::dock::PanelCategory::General,
                 ));
-                dm.register_panel(crate::ui::DockablePanel::new(
+                dm.register_panel(crate::ui::DockablePanel::new_extended(
                     crate::ui::dock::panel_ids::PROPERTIES,
                     "Properties",
                     crate::ui::DockZone::Left,
+                    false,  // can_undock - drop target for effects + drag for reordering
+                    false,
+                    crate::ui::dock::PanelCategory::General,
                 ));
-                dm.register_panel(crate::ui::DockablePanel::new(
+                dm.register_panel(crate::ui::DockablePanel::new_extended(
                     crate::ui::dock::panel_ids::SOURCES,
                     "Sources",
                     crate::ui::DockZone::Left,
+                    false,  // can_undock - drag source for OMT/NDI/File
+                    false,
+                    crate::ui::dock::PanelCategory::General,
                 ));
-                dm.register_panel(crate::ui::DockablePanel::new(
+                dm.register_panel(crate::ui::DockablePanel::new_extended(
                     crate::ui::dock::panel_ids::EFFECTS_BROWSER,
                     "Effects",
                     crate::ui::DockZone::Left,
+                    false,  // can_undock - drag source for effects
+                    false,
+                    crate::ui::dock::PanelCategory::General,
                 ));
-                dm.register_panel(crate::ui::DockablePanel::new(
+                dm.register_panel(crate::ui::DockablePanel::new_extended(
                     crate::ui::dock::panel_ids::FILES,
                     "Files",
                     crate::ui::DockZone::Left,
+                    false,  // can_undock - drag source for video/image files
+                    false,
+                    crate::ui::dock::PanelCategory::General,
                 ));
                 dm.register_panel({
                     let mut panel = crate::ui::DockablePanel::new(
@@ -636,6 +667,7 @@ impl App {
             performance_panel: crate::ui::PerformancePanel::new(),
             preview_monitor_panel: crate::ui::PreviewMonitorPanel::new(),
             previs_panel: crate::ui::PrevisPanel::new(),
+            cross_window_drag: crate::ui::CrossWindowDragState::new(),
             previs_renderer: Some(previs_renderer),
             preview_player: crate::preview_player::PreviewPlayer::new(bc_texture_supported),
             preview_layer_id: None,
@@ -744,18 +776,41 @@ impl App {
         &self.egui_ctx
     }
 
+    /// Get the preview texture view for registering with external egui renderers.
+    ///
+    /// This is needed when rendering the Preview Monitor in an undocked window,
+    /// since each window has its own egui_renderer and texture IDs are not transferable.
+    pub fn preview_texture_view(&self) -> Option<&wgpu::TextureView> {
+        self.preview_player.texture_view()
+    }
+
     /// Render an undocked panel's content to the given UI.
     ///
     /// This is used when a panel is displayed in its own native window.
-    /// Returns true if the user requested to re-dock the panel.
-    pub fn render_undocked_panel(&mut self, panel_id: &str, ui: &mut egui::Ui) -> bool {
+    /// Returns (should_redock, should_close) indicating user actions.
+    ///
+    /// `external_preview_texture_id` is used when rendering the Preview Monitor in an undocked window.
+    /// Since each window has its own egui_renderer, the main window's texture IDs are invalid.
+    /// The caller should register the preview texture with the window's egui_renderer and pass the ID here.
+    pub fn render_undocked_panel(
+        &mut self,
+        panel_id: &str,
+        ui: &mut egui::Ui,
+        external_preview_texture_id: Option<egui::TextureId>,
+    ) -> (bool, bool) {
         use crate::ui::dock::panel_ids;
 
-        // Small dock button bar at top (window title bar already shows panel name)
+        // Small button bar at top (window title bar already shows panel name)
         let mut should_redock = false;
+        let mut should_close = false;
         ui.horizontal(|ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("⊟ Dock to Main").on_hover_text("Return panel to main window").clicked() {
+                // Close button
+                if ui.small_button(crate::ui::icons::panel::CLOSE).on_hover_text("Close panel").clicked() {
+                    should_close = true;
+                }
+                // Dock button
+                if ui.small_button(format!("{} to Main", crate::ui::icons::panel::DOCK)).on_hover_text("Return panel to main window").clicked() {
                     should_redock = true;
                 }
             });
@@ -770,7 +825,11 @@ impl App {
                 }
             }
             panel_ids::EFFECTS_BROWSER => {
-                let _actions = self.effects_browser_panel.render_contents(ui, self.effect_manager.registry());
+                let _actions = self.effects_browser_panel.render_contents(
+                    ui,
+                    self.effect_manager.registry(),
+                    &mut self.cross_window_drag,
+                );
                 // Effects actions are typically drag-drop which is handled elsewhere
             }
             panel_ids::FILES => {
@@ -801,17 +860,84 @@ impl App {
                     self.effect_manager.bpm_clock(),
                     self.effect_manager.time(),
                     Some(&self.audio_manager),
+                    &self.effect_manager,
                     &layer_video_info,
+                    &mut self.cross_window_drag,
                 );
                 for action in actions {
                     self.handle_properties_action(action);
                 }
             }
             panel_ids::PREVIEW_MONITOR => {
-                // Preview Monitor cannot be undocked (requires GPU texture access from main window)
-                ui.centered_and_justified(|ui| {
-                    ui.label("Preview Monitor cannot be undocked");
+                // Gather state needed for preview rendering
+                let has_frame = if self.preview_source_receiver.is_some() {
+                    // Source preview mode - check if we have received a frame
+                    self.preview_source_has_frame
+                } else if let Some(layer_id) = self.preview_layer_id {
+                    // Layer preview mode - check if layer runtime has a frame
+                    self.layer_runtimes.get(&layer_id)
+                        .map(|r| r.has_frame)
+                        .unwrap_or(false)
+                } else {
+                    // Clip preview mode
+                    self.preview_player.has_frame()
+                };
+                let is_playing = !self.preview_player.is_paused();
+                let video_info = if self.preview_player.has_frame() {
+                    self.preview_player.video_info()
+                } else if self.preview_source_has_frame && self.preview_monitor_panel.current_clip().is_some() {
+                    self.preview_source_output_texture.as_ref().map(|t| {
+                        crate::preview_player::VideoInfo {
+                            width: t.width(),
+                            height: t.height(),
+                            frame_rate: 0.0,
+                            duration: 0.0,
+                            position: 0.0,
+                            frame_index: 0,
+                        }
+                    })
+                } else {
+                    self.preview_player.video_info()
+                };
+                let layer_dimensions = self.preview_layer_id.map(|_| {
+                    (self.environment.width(), self.environment.height())
                 });
+                let source_dimensions = self.preview_source_receiver.as_ref()
+                    .and_then(|r| {
+                        let (w, h) = (r.width(), r.height());
+                        if w > 0 && h > 0 { Some((w, h)) } else { None }
+                    });
+
+                // Use external texture ID if provided, otherwise fall back to main window's texture
+                let texture_id = external_preview_texture_id.or(self.preview_player.egui_texture_id);
+
+                let actions = self.preview_monitor_panel.render_contents(
+                    ui,
+                    has_frame,
+                    is_playing,
+                    video_info,
+                    layer_dimensions,
+                    source_dimensions,
+                    self.current_preview_height,
+                    |ui, rect, uv_rect| {
+                        if let Some(tex_id) = texture_id {
+                            ui.painter().image(tex_id, rect, uv_rect, egui::Color32::WHITE);
+                        } else if self.preview_player.is_loaded() || self.preview_layer_id.is_some() || self.preview_source_receiver.is_some() {
+                            // Texture not yet registered, show loading state
+                            ui.painter().rect_filled(rect, 4.0, egui::Color32::from_gray(40));
+                            ui.painter().text(
+                                rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "Loading...",
+                                egui::FontId::proportional(11.0),
+                                egui::Color32::WHITE,
+                            );
+                        }
+                    },
+                );
+                for action in actions {
+                    self.handle_preview_action(action);
+                }
             }
             panel_ids::PREVIS => {
                 if let Some(renderer) = &mut self.previs_renderer {
@@ -828,7 +954,7 @@ impl App {
             }
         }
 
-        should_redock
+        (should_redock, should_close)
     }
 
     /// Create the Tokio runtime for async OMT operations
@@ -2190,6 +2316,7 @@ impl App {
         };
 
         // Render menu bar with appropriate FPS (skip when using native OS menus)
+        let audio_levels = self.audio_manager.get_band_levels_with_gain(self.settings.fft_gain);
         let settings_changed = if self.use_native_menu {
             // Native menus handle most UI, but still render a slim status bar
             self.render_status_bar(&self.egui_ctx.clone(), display_fps, display_frame_time_ms);
@@ -2204,6 +2331,7 @@ impl App {
                 &panel_states,
                 Some(&self.layout_preset_manager),
                 Some(bpm_info),
+                audio_levels,
             )
         };
 
@@ -2272,6 +2400,17 @@ impl App {
                 crate::ui::menu_bar::MenuAction::ResyncBpm => {
                     self.effect_manager.bpm_clock_mut().resync_to_bar();
                     tracing::debug!("Resync to bar start");
+                }
+                crate::ui::menu_bar::MenuAction::BreakoutEnvironment => {
+                    // Calculate a reasonable default position and size for the environment window
+                    let pos = (100.0, 100.0);
+                    let size = (self.environment.width() as f32 * 0.5, self.environment.height() as f32 * 0.5);
+                    self.dock_manager.request_environment_breakout(pos, size);
+                    self.menu_bar.set_status("Environment viewport broken out to separate window");
+                }
+                crate::ui::menu_bar::MenuAction::RedockEnvironment => {
+                    self.dock_manager.request_environment_redock();
+                    self.menu_bar.set_status("Environment viewport returned to main window");
                 }
             }
         }
@@ -2348,12 +2487,14 @@ impl App {
                                 ui.horizontal(|ui| {
                                     ui.heading("Properties");
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        // Undock to separate window
-                                        if ui.button("⧉").on_hover_text("Undock to separate window").clicked() {
-                                            self.dock_manager.request_undock(crate::ui::dock::panel_ids::PROPERTIES);
+                                        // Undock to separate window (only if panel can be undocked)
+                                        if self.dock_manager.get_panel(crate::ui::dock::panel_ids::PROPERTIES).map(|p| p.can_undock).unwrap_or(false) {
+                                            if ui.button(crate::ui::icons::panel::UNDOCK).on_hover_text("Undock to separate window").clicked() {
+                                                self.dock_manager.request_undock(crate::ui::dock::panel_ids::PROPERTIES);
+                                            }
                                         }
                                         // Float within main window
-                                        if ui.button("⊞").on_hover_text("Float panel").clicked() {
+                                        if ui.button(crate::ui::icons::panel::FLOAT).on_hover_text("Float panel").clicked() {
                                             if let Some(p) = self.dock_manager.get_panel_mut(crate::ui::dock::panel_ids::PROPERTIES) {
                                                 p.zone = crate::ui::DockZone::Floating;
                                                 p.floating_pos = Some((100.0, 100.0));
@@ -2363,7 +2504,7 @@ impl App {
                                     });
                                 });
                                 ui.separator();
-                                actions = self.properties_panel.render(ui, &self.environment, &layers, &self.settings, omt_broadcasting, ndi_broadcasting, self.texture_share_enabled, self.api_server_running, self.effect_manager.registry(), self.effect_manager.bpm_clock(), self.effect_manager.time(), Some(&self.audio_manager), &layer_video_info);
+                                actions = self.properties_panel.render(ui, &self.environment, &layers, &self.settings, omt_broadcasting, ndi_broadcasting, self.texture_share_enabled, self.api_server_running, self.effect_manager.registry(), self.effect_manager.bpm_clock(), self.effect_manager.time(), Some(&self.audio_manager), &self.effect_manager, &layer_video_info, &mut self.cross_window_drag);
                             });
                         actions
                     }
@@ -2394,7 +2535,7 @@ impl App {
                                 // Dock button in header
                                 ui.horizontal(|ui| {
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        if ui.small_button("⊟").on_hover_text("Dock to left").clicked() {
+                                        if ui.small_button(crate::ui::icons::panel::DOCK).on_hover_text("Dock to left").clicked() {
                                             if let Some(p) = self.dock_manager.get_panel_mut(crate::ui::dock::panel_ids::PROPERTIES) {
                                                 p.zone = crate::ui::DockZone::Left;
                                             }
@@ -2402,7 +2543,7 @@ impl App {
                                     });
                                 });
                                 ui.separator();
-                                actions = self.properties_panel.render(ui, &self.environment, &layers, &self.settings, omt_broadcasting, ndi_broadcasting, self.texture_share_enabled, self.api_server_running, self.effect_manager.registry(), self.effect_manager.bpm_clock(), self.effect_manager.time(), Some(&self.audio_manager), &layer_video_info);
+                                actions = self.properties_panel.render(ui, &self.environment, &layers, &self.settings, omt_broadcasting, ndi_broadcasting, self.texture_share_enabled, self.api_server_running, self.effect_manager.registry(), self.effect_manager.bpm_clock(), self.effect_manager.time(), Some(&self.audio_manager), &self.effect_manager, &layer_video_info, &mut self.cross_window_drag);
                             });
 
                         // Track window dragging for dock zone snapping
@@ -2470,12 +2611,14 @@ impl App {
                                 ui.horizontal(|ui| {
                                     ui.heading("Clip Grid");
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        // Undock to separate window
-                                        if ui.button("⧉").on_hover_text("Undock to separate window").clicked() {
-                                            self.dock_manager.request_undock(crate::ui::dock::panel_ids::CLIP_GRID);
+                                        // Undock to separate window (only if panel can be undocked)
+                                        if self.dock_manager.get_panel(crate::ui::dock::panel_ids::CLIP_GRID).map(|p| p.can_undock).unwrap_or(false) {
+                                            if ui.button(crate::ui::icons::panel::UNDOCK).on_hover_text("Undock to separate window").clicked() {
+                                                self.dock_manager.request_undock(crate::ui::dock::panel_ids::CLIP_GRID);
+                                            }
                                         }
                                         // Float within main window
-                                        if ui.button("⊞").on_hover_text("Float panel").clicked() {
+                                        if ui.button(crate::ui::icons::panel::FLOAT).on_hover_text("Float panel").clicked() {
                                             if let Some(p) = self.dock_manager.get_panel_mut(crate::ui::dock::panel_ids::CLIP_GRID) {
                                                 p.zone = crate::ui::DockZone::Floating;
                                                 p.floating_pos = Some((400.0, 100.0));
@@ -2516,7 +2659,7 @@ impl App {
                                 // Dock button in header
                                 ui.horizontal(|ui| {
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        if ui.small_button("⊟").on_hover_text("Dock to right").clicked() {
+                                        if ui.small_button(crate::ui::icons::panel::DOCK).on_hover_text("Dock to right").clicked() {
                                             if let Some(p) = self.dock_manager.get_panel_mut(crate::ui::dock::panel_ids::CLIP_GRID) {
                                                 p.zone = crate::ui::DockZone::Right;
                                             }
@@ -2587,18 +2730,20 @@ impl App {
                     .collapsible(true)
                     .open(&mut open)
                     .show(&self.egui_ctx, |ui| {
-                        // Undock button in header
+                        // Undock button in header (only if panel can be undocked)
                         ui.horizontal(|ui| {
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.small_button("⧉").on_hover_text("Undock to separate window").clicked() {
-                                    self.dock_manager.request_undock(crate::ui::dock::panel_ids::SOURCES);
+                                if self.dock_manager.get_panel(crate::ui::dock::panel_ids::SOURCES).map(|p| p.can_undock).unwrap_or(false) {
+                                    if ui.small_button(crate::ui::icons::panel::UNDOCK).on_hover_text("Undock to separate window").clicked() {
+                                        self.dock_manager.request_undock(crate::ui::dock::panel_ids::SOURCES);
+                                    }
                                 }
                             });
                         });
                         ui.separator();
                         actions = self.sources_panel.render_contents(ui);
                     });
-                
+
                 // Update window position for persistence
                 if let Some(resp) = &window_response {
                     let rect = resp.response.rect;
@@ -2639,16 +2784,22 @@ impl App {
                     .collapsible(true)
                     .open(&mut open)
                     .show(&self.egui_ctx, |ui| {
-                        // Undock button in header
+                        // Undock button in header (only if panel can be undocked)
                         ui.horizontal(|ui| {
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.small_button("⧉").on_hover_text("Undock to separate window").clicked() {
-                                    self.dock_manager.request_undock(crate::ui::dock::panel_ids::EFFECTS_BROWSER);
+                                if self.dock_manager.get_panel(crate::ui::dock::panel_ids::EFFECTS_BROWSER).map(|p| p.can_undock).unwrap_or(false) {
+                                    if ui.small_button(crate::ui::icons::panel::UNDOCK).on_hover_text("Undock to separate window").clicked() {
+                                        self.dock_manager.request_undock(crate::ui::dock::panel_ids::EFFECTS_BROWSER);
+                                    }
                                 }
                             });
                         });
                         ui.separator();
-                        actions = self.effects_browser_panel.render_contents(ui, self.effect_manager.registry());
+                        actions = self.effects_browser_panel.render_contents(
+                            ui,
+                            self.effect_manager.registry(),
+                            &mut self.cross_window_drag,
+                        );
                     });
 
                 // Update window position for persistence
@@ -2690,11 +2841,13 @@ impl App {
                     .collapsible(true)
                     .open(&mut open)
                     .show(&self.egui_ctx, |ui| {
-                        // Undock button in header
+                        // Undock button in header (only if panel can be undocked)
                         ui.horizontal(|ui| {
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.small_button("⧉").on_hover_text("Undock to separate window").clicked() {
-                                    self.dock_manager.request_undock(crate::ui::dock::panel_ids::FILES);
+                                if self.dock_manager.get_panel(crate::ui::dock::panel_ids::FILES).map(|p| p.can_undock).unwrap_or(false) {
+                                    if ui.small_button(crate::ui::icons::panel::UNDOCK).on_hover_text("Undock to separate window").clicked() {
+                                        self.dock_manager.request_undock(crate::ui::dock::panel_ids::FILES);
+                                    }
                                 }
                             });
                         });
@@ -2865,7 +3018,7 @@ impl App {
                         // Undock button in header
                         ui.horizontal(|ui| {
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.small_button("⧉").on_hover_text("Undock to separate window").clicked() {
+                                if ui.small_button(crate::ui::icons::panel::UNDOCK).on_hover_text("Undock to separate window").clicked() {
                                     self.dock_manager.request_undock(crate::ui::dock::panel_ids::PREVIS);
                                 }
                             });
@@ -2901,10 +3054,146 @@ impl App {
         // Apply environment resolution changes (if any) before rendering.
         self.sync_environment_from_settings();
 
+        // Render environment as floating egui window (within main window)
+        if self.environment_floating && !self.environment_broken_out {
+            // Calculate minimum size based on environment aspect ratio
+            let env_width = self.environment.width() as f32;
+            let env_height = self.environment.height() as f32;
+            let env_aspect = env_width / env_height;
+
+            // Minimum size preserves aspect ratio (base minimum ~200px on smaller dimension)
+            let base_min = 200.0;
+            let min_width = base_min * env_aspect.max(1.0);
+            let min_height = base_min / env_aspect.min(1.0);
+
+            let mut env_open = true;
+            egui::Window::new("Environment")
+                .id(egui::Id::new("environment_floating_window"))
+                .default_pos(egui::pos2(300.0, 50.0))
+                .default_size(egui::vec2(800.0, 600.0))
+                .min_size(egui::vec2(min_width, min_height))
+                .resizable(true)
+                .collapsible(true)
+                .open(&mut env_open)
+                .show(&self.egui_ctx, |ui| {
+                    // Header with Dock button
+                    ui.horizontal(|ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button(crate::ui::icons::panel::DOCK)
+                                .on_hover_text("Dock environment to main window")
+                                .clicked()
+                            {
+                                self.environment_floating = false;
+                                self.menu_bar.set_status("Environment docked to main window");
+                            }
+                            if ui.small_button(crate::ui::icons::panel::UNDOCK)
+                                .on_hover_text("Undock to separate window")
+                                .clicked()
+                            {
+                                let pos = (100.0, 100.0);
+                                let size = (self.environment.width() as f32 * 0.5, self.environment.height() as f32 * 0.5);
+                                self.dock_manager.request_environment_breakout(pos, size);
+                                self.environment_floating = false;
+                                self.menu_bar.set_status("Environment viewport broken out");
+                            }
+                        });
+                    });
+                    ui.separator();
+
+                    // Draw environment texture with pan/zoom support
+                    if let Some(tex_id) = self.environment_egui_texture_id {
+                        let available = ui.available_size();
+                        let env_width = self.environment.width() as f32;
+                        let env_height = self.environment.height() as f32;
+                        let content_size = (env_width, env_height);
+
+                        // Allocate rect with click_and_drag for viewport input
+                        let (full_rect, response) = ui.allocate_exact_size(available, egui::Sense::click_and_drag());
+
+                        // Handle viewport interactions (right-drag pan, scroll zoom)
+                        // Uses separate floating_env_viewport to avoid coordinate conflicts with main window
+                        let viewport_response = crate::ui::viewport_widget::handle_viewport_input(
+                            ui,
+                            &response,
+                            full_rect,
+                            &mut self.floating_env_viewport,
+                            content_size,
+                            &crate::ui::ViewportConfig::default(),
+                            "floating_env",
+                        );
+
+                        if viewport_response.changed {
+                            ui.ctx().request_repaint();
+                        }
+
+                        // Compute UV and dest rect with viewport transform
+                        let render_info = crate::ui::viewport_widget::compute_uv_and_dest_rect(
+                            &self.floating_env_viewport,
+                            full_rect,
+                            content_size,
+                        );
+
+                        // Fill background with black for letterboxing
+                        ui.painter().rect_filled(full_rect, 0.0, egui::Color32::BLACK);
+
+                        // Draw environment texture with computed UV rect
+                        ui.painter().image(tex_id, render_info.dest_rect, render_info.uv_rect, egui::Color32::WHITE);
+
+                        // Draw zoom indicator (shows percentage in bottom-right)
+                        crate::ui::viewport_widget::draw_zoom_indicator(ui, full_rect, &self.floating_env_viewport);
+                    } else {
+                        // Show placeholder on first frame before texture is registered
+                        ui.centered_and_justified(|ui| {
+                            ui.label("Loading environment...");
+                        });
+                    }
+                });
+
+            // Handle window close (X button clicked)
+            if !env_open {
+                self.environment_floating = false;
+            }
+        }
+
+        // Draw environment viewport controls overlay (top-right corner)
+        // Only show when environment is docked (not floating, not broken out)
+        if !self.environment_floating && !self.environment_broken_out {
+            egui::Area::new(egui::Id::new("environment_viewport_controls"))
+                .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-16.0, 48.0)) // Below menu bar
+                .order(egui::Order::Foreground)
+                .interactable(true)
+                .show(&self.egui_ctx, |ui| {
+                    egui::Frame::popup(ui.style())
+                        .fill(egui::Color32::from_rgba_unmultiplied(40, 40, 40, 220))
+                        .corner_radius(4.0)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("Environment").small());
+                                if ui.small_button(crate::ui::icons::panel::FLOAT)
+                                    .on_hover_text("Float environment as window")
+                                    .clicked()
+                                {
+                                    self.environment_floating = true;
+                                    self.menu_bar.set_status("Environment floating");
+                                }
+                                if ui.small_button(crate::ui::icons::panel::UNDOCK)
+                                    .on_hover_text("Undock to separate window")
+                                    .clicked()
+                                {
+                                    let pos = (100.0, 100.0);
+                                    let size = (self.environment.width() as f32 * 0.5, self.environment.height() as f32 * 0.5);
+                                    self.dock_manager.request_environment_breakout(pos, size);
+                                    self.menu_bar.set_status("Environment viewport broken out");
+                                }
+                            });
+                        });
+                });
+        }
+
         // Draw zoom indicator overlay on main environment preview (bottom-right corner)
-        // Only show when zoomed (not at 100%)
+        // Only show when zoomed (not at 100%) and environment is docked
         let zoom = self.viewport.zoom();
-        if (zoom - 1.0).abs() > 0.01 {
+        if (zoom - 1.0).abs() > 0.01 && !self.environment_floating && !self.environment_broken_out {
             egui::Area::new(egui::Id::new("main_viewport_zoom_indicator"))
                 .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-16.0, -16.0))
                 .order(egui::Order::Tooltip)
@@ -3482,6 +3771,18 @@ impl App {
             self.advanced_output_window.preview_texture_id = None;
         }
 
+        // Register environment texture for floating environment window
+        if self.environment_floating && !self.environment_broken_out {
+            let env_texture_id = self.egui_renderer.register_native_texture(
+                &self.device,
+                self.environment.texture_view(),
+                wgpu::FilterMode::Linear,
+            );
+            self.environment_egui_texture_id = Some(env_texture_id);
+        } else {
+            self.environment_egui_texture_id = None;
+        }
+
         // Capture environment texture for OMT output (before we move on to present)
         if self.omt_broadcast_enabled {
             if let Some(capture) = &mut self.omt_capture {
@@ -3615,9 +3916,13 @@ impl App {
                 occlusion_query_set: None,
             });
 
-            render_pass.set_pipeline(&self.copy_pipeline);
-            render_pass.set_bind_group(0, &self.copy_bind_group, &[]);
-            render_pass.draw(0..3, 0..1);
+            // Only draw environment to surface if docked (not floating, not broken out)
+            // When floating or broken out, show solid black background
+            if !self.environment_floating && !self.environment_broken_out {
+                render_pass.set_pipeline(&self.copy_pipeline);
+                render_pass.set_bind_group(0, &self.copy_bind_group, &[]);
+                render_pass.draw(0..3, 0..1);
+            }
         }
 
         // Render egui on top of the surface
@@ -6927,6 +7232,11 @@ impl App {
                 tracing::debug!("[AUDIO] SetAudioSource: init took {:?}", init_start.elapsed());
                 tracing::debug!("[AUDIO] SetAudioSource handler total took {:?}", total_start.elapsed());
             }
+            PropertiesAction::SetFftGain { gain } => {
+                self.settings.fft_gain = gain;
+                self.audio_manager.set_master_sensitivity(gain);
+                tracing::debug!("[AUDIO] FFT gain set to {:.2}x", gain);
+            }
         }
     }
 
@@ -7527,6 +7837,7 @@ impl App {
             scroll_sensitivity: 1.0,
             scroll_threshold: 0.001, // Match original threshold from main.rs
             double_click_reset: true,
+            pan_sensitivity: 1.0,
         };
 
         let response = viewport_widget::handle_winit_scroll(
@@ -7584,6 +7895,64 @@ impl App {
     /// Get current zoom level (for UI display)
     pub fn viewport_zoom(&self) -> f32 {
         self.viewport.zoom()
+    }
+
+    /// Render the environment texture to an external surface (e.g., environment breakout window)
+    ///
+    /// This method renders the composed environment texture to the provided surface view
+    /// using the copy pipeline, applying proper aspect ratio scaling.
+    pub fn render_environment_to_surface(
+        &self,
+        surface_view: &wgpu::TextureView,
+        window_width: u32,
+        window_height: u32,
+    ) {
+        // Calculate viewport params for this window size
+        let window_size = (window_width as f32, window_height as f32);
+        let env_size = (self.environment.width() as f32, self.environment.height() as f32);
+
+        // Get shader params from viewport (applies current zoom/pan state)
+        let (scale_x, scale_y, offset_x, offset_y) = self.viewport.get_shader_params(window_size, env_size);
+
+        let params = VideoParams {
+            scale: [scale_x, scale_y],
+            offset: [offset_x, offset_y],
+            opacity: 1.0,
+            _padding: [0.0; 3],
+        };
+
+        // Update the copy params buffer
+        self.queue.write_buffer(&self.copy_params_buffer, 0, bytemuck::bytes_of(&params));
+
+        // Create command encoder
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Environment Window Encoder"),
+        });
+
+        // Render pass: clear to black and draw environment
+        {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Environment Window Present Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: surface_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+
+            render_pass.set_pipeline(&self.copy_pipeline);
+            render_pass.set_bind_group(0, &self.copy_bind_group, &[]);
+            render_pass.draw(0..3, 0..1);
+        }
+
+        // Submit GPU work
+        self.queue.submit(std::iter::once(encoder.finish()));
     }
 
     /// Shutdown the application gracefully

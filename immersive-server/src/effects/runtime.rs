@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 
+use super::automation::{BeatEnvelopeState, FftEnvelopeState, TimelineEnvelopeState};
 use super::traits::{EffectParams, GpuEffectRuntime};
 use super::{EffectInstance, EffectRegistry, EffectStack};
 
@@ -155,6 +156,12 @@ pub struct EffectStackRuntime {
     sampler: Option<wgpu::Sampler>,
     /// Uniform buffer for copy shader params (is_bgra flag)
     copy_params_buffer: Option<wgpu::Buffer>,
+    /// FFT envelope states keyed by (effect_id, param_name) for smoothed audio reactivity
+    fft_envelope_states: HashMap<(u32, String), FftEnvelopeState>,
+    /// Beat envelope states keyed by (effect_id, param_name) for ADSR beat sync
+    beat_envelope_states: HashMap<(u32, String), BeatEnvelopeState>,
+    /// Timeline envelope states keyed by (effect_id, param_name) for time-based ramps
+    timeline_envelope_states: HashMap<(u32, String), TimelineEnvelopeState>,
 }
 
 impl Default for EffectStackRuntime {
@@ -173,7 +180,31 @@ impl EffectStackRuntime {
             copy_bind_group_layout: None,
             sampler: None,
             copy_params_buffer: None,
+            fft_envelope_states: HashMap::new(),
+            beat_envelope_states: HashMap::new(),
+            timeline_envelope_states: HashMap::new(),
         }
+    }
+
+    /// Get the current FFT envelope value for a parameter (for UI display)
+    pub fn get_fft_envelope_value(&self, effect_id: u32, param_name: &str) -> Option<f32> {
+        self.fft_envelope_states
+            .get(&(effect_id, param_name.to_string()))
+            .map(|e| e.value())
+    }
+
+    /// Get the current Beat envelope value for a parameter (for UI display)
+    pub fn get_beat_envelope_value(&self, effect_id: u32, param_name: &str) -> Option<f32> {
+        self.beat_envelope_states
+            .get(&(effect_id, param_name.to_string()))
+            .map(|e| e.value())
+    }
+
+    /// Get the current timeline envelope value for a parameter (for UI display)
+    pub fn get_timeline_envelope_value(&self, effect_id: u32, param_name: &str) -> Option<f32> {
+        self.timeline_envelope_states
+            .get(&(effect_id, param_name.to_string()))
+            .map(|e| e.value())
     }
 
     /// Initialize GPU resources
@@ -298,6 +329,7 @@ impl EffectStackRuntime {
     /// Sync effect runtimes with the effect stack
     ///
     /// Creates runtimes for new effects, removes runtimes for deleted effects.
+    /// Also cleans up orphaned envelope states.
     pub fn sync_with_stack(
         &mut self,
         stack: &EffectStack,
@@ -309,6 +341,11 @@ impl EffectStackRuntime {
         // Remove runtimes for effects that no longer exist
         let effect_ids: std::collections::HashSet<_> = stack.effects.iter().map(|e| e.id).collect();
         self.effect_runtimes.retain(|id, _| effect_ids.contains(id));
+
+        // Clean up envelope states for effects that no longer exist
+        self.fft_envelope_states.retain(|(eid, _), _| effect_ids.contains(eid));
+        self.beat_envelope_states.retain(|(eid, _), _| effect_ids.contains(eid));
+        self.timeline_envelope_states.retain(|(eid, _), _| effect_ids.contains(eid));
 
         // Create runtimes for new effects
         for effect in &stack.effects {
@@ -342,7 +379,7 @@ impl EffectStackRuntime {
         stack: &EffectStack,
         base_params: &EffectParams,
     ) {
-        self.process_internal(encoder, queue, device, input, output, stack, base_params, None, None)
+        self.process_internal(encoder, queue, device, input, output, stack, base_params, None, None, false)
     }
 
     /// Process the effect stack with automation support
@@ -368,10 +405,68 @@ impl EffectStackRuntime {
         clock: &super::automation::BpmClock,
         audio_manager: Option<&crate::audio::AudioManager>,
     ) {
-        self.process_internal(encoder, queue, device, input, output, stack, base_params, Some(clock), audio_manager)
+        self.process_internal(encoder, queue, device, input, output, stack, base_params, Some(clock), audio_manager, false)
+    }
+
+    /// Process the effect stack in-place (same texture for input and output)
+    ///
+    /// This is used for environment effects where we want to process effects
+    /// on a texture without requiring a separate output texture. Internally
+    /// uses ping-pong rendering and copies back to the original texture.
+    ///
+    /// # Arguments
+    /// * `encoder` - Command encoder
+    /// * `queue` - GPU queue
+    /// * `texture` - Texture view to process in-place
+    /// * `stack` - Effect stack definition
+    /// * `params` - Base effect parameters (timing, beat)
+    pub fn process_in_place(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        queue: &wgpu::Queue,
+        device: &wgpu::Device,
+        texture: &wgpu::TextureView,
+        stack: &EffectStack,
+        base_params: &EffectParams,
+    ) {
+        self.process_internal(encoder, queue, device, texture, texture, stack, base_params, None, None, true)
+    }
+
+    /// Process the effect stack in-place with automation support
+    ///
+    /// This is used for environment effects where we want to process effects
+    /// on a texture without requiring a separate output texture. Internally
+    /// uses ping-pong rendering and copies back to the original texture.
+    ///
+    /// # Arguments
+    /// * `encoder` - Command encoder
+    /// * `queue` - GPU queue
+    /// * `texture` - Texture view to process in-place
+    /// * `stack` - Effect stack definition
+    /// * `params` - Base effect parameters (timing, beat)
+    /// * `clock` - BPM clock for LFO/Beat automation
+    /// * `audio_manager` - Audio manager for FFT automation
+    pub fn process_in_place_with_automation(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        queue: &wgpu::Queue,
+        device: &wgpu::Device,
+        texture: &wgpu::TextureView,
+        stack: &EffectStack,
+        base_params: &EffectParams,
+        clock: &super::automation::BpmClock,
+        audio_manager: Option<&crate::audio::AudioManager>,
+    ) {
+        // Use the same texture for input/output but flag as in_place
+        // so process_internal knows to use ping-pong and copy back
+        self.process_internal(encoder, queue, device, texture, texture, stack, base_params, Some(clock), audio_manager, true)
     }
 
     /// Internal process implementation
+    ///
+    /// # Arguments
+    /// * `in_place` - When true, input and output are the same texture, requiring
+    ///                special handling to avoid read/write conflicts
     fn process_internal(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -383,29 +478,47 @@ impl EffectStackRuntime {
         base_params: &EffectParams,
         clock: Option<&super::automation::BpmClock>,
         audio_manager: Option<&crate::audio::AudioManager>,
+        in_place: bool,
     ) {
         // Get active effects (not bypassed, respecting solo)
         let active_effects: Vec<&EffectInstance> = stack.active_effects().collect();
 
         if active_effects.is_empty() {
-            // No effects: copy input to output (no size transformation needed)
-            self.copy_texture(encoder, device, queue, input, output, false, (1.0, 1.0));
+            // No effects: copy input to output (unless in_place, then nothing to do)
+            if !in_place {
+                self.copy_texture(encoder, device, queue, input, output, false, (1.0, 1.0));
+            }
             return;
         }
 
         let pool = match &self.texture_pool {
             Some(p) => p,
             None => {
-                // No texture pool: just copy (no size transformation needed)
-                self.copy_texture(encoder, device, queue, input, output, false, (1.0, 1.0));
+                // No texture pool: just copy if not in_place
+                if !in_place {
+                    self.copy_texture(encoder, device, queue, input, output, false, (1.0, 1.0));
+                }
                 return;
             }
         };
 
         // Process effect chain
+        // For in_place processing, we always use the pool and copy back at the end
         for (i, effect) in active_effects.iter().enumerate() {
             // Determine input/output for this effect
-            let (effect_input, effect_output) = if active_effects.len() == 1 {
+            let (effect_input, effect_output) = if in_place {
+                // In-place mode: always use pool to avoid read/write conflicts
+                if active_effects.len() == 1 {
+                    // Single effect: input -> pool[1], then we'll copy pool[1] -> output
+                    (input, pool.get_views(0).1)
+                } else if i == 0 {
+                    // First effect: input -> pool[1]
+                    (input, pool.get_views(i).1)
+                } else {
+                    // Subsequent effects: ping-pong within pool
+                    pool.get_views(i)
+                }
+            } else if active_effects.len() == 1 {
                 // Single effect: input -> output directly
                 (input, output)
             } else if i == 0 {
@@ -422,7 +535,16 @@ impl EffectStackRuntime {
             // Build params for this effect, with automation if available
             let mut params = *base_params;
             if let Some(clk) = clock {
-                params.pack_parameters_with_automation(&effect.parameters, clk, audio_manager);
+                params.pack_parameters_with_automation_and_envelopes(
+                    &effect.parameters,
+                    clk,
+                    audio_manager,
+                    base_params.delta_time,
+                    &mut self.fft_envelope_states,
+                    &mut self.beat_envelope_states,
+                    &mut self.timeline_envelope_states,
+                    effect.id,
+                );
             } else {
                 params.pack_parameters(&effect.parameters);
             }
@@ -435,6 +557,19 @@ impl EffectStackRuntime {
                     gpu.process(encoder, device, effect_input, effect_output, &params, queue);
                 }
             }
+        }
+
+        // For in_place mode, copy result back from pool to output texture
+        if in_place && !active_effects.is_empty() {
+            // Determine which pool texture has the final result
+            let final_view = if active_effects.len() == 1 {
+                // Single effect wrote to pool[1]
+                pool.get_views(0).1
+            } else {
+                // Multi-effect: result is in alternating buffer based on count
+                pool.output_view(active_effects.len())
+            };
+            self.copy_texture(encoder, device, queue, final_view, output, false, (1.0, 1.0));
         }
     }
 

@@ -328,6 +328,42 @@ impl ImmersiveApp {
                         window_registry.mark_closed(window_id);
                     }
                 }
+                DockAction::ClosePanel { panel_id } => {
+                    tracing::info!("Closing panel: {}", panel_id);
+                    // Close the window if it's undocked
+                    if let Some(window_id) = window_registry.get_panel_window_id(&panel_id) {
+                        window_registry.mark_closed(window_id);
+                    }
+                }
+                DockAction::BreakoutEnvironment { position, size } => {
+                    tracing::info!("Breaking out environment viewport to separate window");
+
+                    // Create the window for the environment viewport
+                    let window_attrs = WindowAttributes::default()
+                        .with_title("Immersive Environment")
+                        .with_inner_size(winit::dpi::LogicalSize::new(size.0 as f64, size.1 as f64))
+                        .with_position(winit::dpi::LogicalPosition::new(position.0 as f64, position.1 as f64));
+
+                    match event_loop.create_window(window_attrs) {
+                        Ok(window) => {
+                            let window = Arc::new(window);
+                            window_registry.register_environment_window(window.clone(), gpu);
+                            app.environment_broken_out = true;
+                            tracing::info!("Environment viewport window created");
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to create environment viewport window: {}", e);
+                        }
+                    }
+                }
+                DockAction::RedockEnvironment => {
+                    tracing::info!("Returning environment viewport to main window");
+                    // Close the environment window if it exists
+                    if let Some(window_id) = window_registry.environment_window_id() {
+                        window_registry.mark_closed(window_id);
+                    }
+                    app.environment_broken_out = false;
+                }
             }
         }
     }
@@ -552,7 +588,6 @@ impl ImmersiveApp {
             return;
         }
 
-        let scale_factor = entry.window.scale_factor() as f32;
         let size = entry.window.inner_size();
 
         // Now get mutable access
@@ -572,35 +607,47 @@ impl ImmersiveApp {
 
         let view = surface_texture.texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        // Begin egui pass for this window using the persistent context
-        let mut raw_input = entry.egui_state.take_egui_input(&entry.window);
-
-        // Explicitly set the screen rect to ensure egui knows the window size
-        // This is needed because the initial window creation might not have triggered resize events
-        let logical_width = size.width as f32 / scale_factor;
-        let logical_height = size.height as f32 / scale_factor;
-        raw_input.screen_rect = Some(egui::Rect::from_min_size(
-            egui::Pos2::ZERO,
-            egui::vec2(logical_width, logical_height),
-        ));
-
         // Use the persistent egui context for this panel window
         let egui_ctx = &entry.egui_ctx;
-        egui_ctx.set_pixels_per_point(scale_factor);
 
+        // Begin egui pass for this window using the persistent context
+        // Note: Don't call set_pixels_per_point() - let egui_winit handle it via raw_input.pixels_per_point
+        // (calling it would cause zoom_factor to be derived as ppp/native, leading to double-scaling)
+        let raw_input = entry.egui_state.take_egui_input(&entry.window);
         egui_ctx.begin_pass(raw_input);
+
+        // For Preview Monitor panel, register the preview texture with this window's egui_renderer
+        // since egui texture IDs are renderer-specific and not transferable between windows
+        use immersive_server::ui::dock::panel_ids;
+        let preview_texture_id = if panel_id == panel_ids::PREVIEW_MONITOR {
+            app.preview_texture_view().map(|view| {
+                gpu_context.egui_renderer.register_native_texture(
+                    &gpu.device,
+                    view,
+                    wgpu::FilterMode::Linear,
+                )
+            })
+        } else {
+            None
+        };
 
         // Render panel content using App's public method
         // Use a frame with no margins that fills the entire window
         let mut should_redock = false;
+        let mut should_close = false;
         let panel_frame = egui::Frame::NONE
             .fill(egui::Color32::from_gray(30))
             .inner_margin(egui::Margin::same(8));
         egui::CentralPanel::default()
             .frame(panel_frame)
             .show(egui_ctx, |ui| {
-                should_redock = app.render_undocked_panel(&panel_id, ui);
+                (should_redock, should_close) = app.render_undocked_panel(&panel_id, ui, preview_texture_id);
             });
+
+        // Clean up the temporary texture registration for Preview Monitor
+        if let Some(tex_id) = preview_texture_id {
+            gpu_context.egui_renderer.free_texture(&tex_id);
+        }
 
         let full_output = egui_ctx.end_pass();
 
@@ -608,9 +655,11 @@ impl ImmersiveApp {
         entry.egui_state.handle_platform_output(&entry.window, full_output.platform_output);
 
         // Tessellate and render
+        // Use full_output.pixels_per_point to match what egui_winit uses for input coordinate conversion
+        // (egui_winit includes zoom_factor, not just scale_factor)
         let screen_descriptor = egui_wgpu::ScreenDescriptor {
             size_in_pixels: [size.width, size.height],
-            pixels_per_point: scale_factor,
+            pixels_per_point: full_output.pixels_per_point,
         };
 
         let clipped_primitives = egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
@@ -674,6 +723,11 @@ impl ImmersiveApp {
         // Handle redock request after rendering
         if should_redock {
             app.dock_manager.request_redock(&panel_id);
+        }
+
+        // Handle close request
+        if should_close {
+            app.dock_manager.request_close(&panel_id);
         }
     }
 
@@ -754,6 +808,43 @@ impl ImmersiveApp {
 
         // Submit and present
         gpu.queue.submit(std::iter::once(encoder.finish()));
+        surface_texture.present();
+    }
+
+    /// Render the environment viewport to its own window
+    fn render_environment_window(
+        window_id: winit::window::WindowId,
+        window_registry: &mut WindowRegistry,
+        app: &mut App,
+    ) {
+        // Get the window entry
+        let Some(entry) = window_registry.get(window_id) else {
+            return;
+        };
+
+        // Get GPU context reference
+        let Some(gpu_context) = entry.gpu_context.as_ref() else {
+            return;
+        };
+
+        // Get the surface texture
+        let surface_texture = match gpu_context.surface.get_current_texture() {
+            Ok(tex) => tex,
+            Err(e) => {
+                tracing::warn!("Failed to get environment window surface: {:?}", e);
+                return;
+            }
+        };
+
+        let surface_view = surface_texture.texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // Get the window size for viewport calculations
+        let size = entry.window.inner_size();
+
+        // Render the environment to this window using App's copy pipeline
+        app.render_environment_to_surface(&surface_view, size.width, size.height);
+
+        // Present
         surface_texture.present();
     }
 }
@@ -907,12 +998,125 @@ impl ApplicationHandler for ImmersiveApp {
         // Check if this is the main window or a panel window
         let is_main_window = window.id() == window_id;
 
-        // Handle non-main window events (panel windows and monitor windows)
+        // Handle non-main window events (panel windows, monitor windows, environment viewport)
         if !is_main_window {
             // Determine what kind of window this is
             let is_monitor = window_registry.get(window_id).map(|e| e.is_monitor()).unwrap_or(false);
+            let is_environment_viewport = window_registry.get(window_id).map(|e| e.is_environment_viewport()).unwrap_or(false);
 
-            if is_monitor {
+            if is_environment_viewport {
+                // Handle environment viewport window events
+                match event {
+                    WindowEvent::CloseRequested => {
+                        // Environment window closed - return to main window
+                        tracing::info!("Environment viewport window closed, returning to main window");
+                        app.environment_broken_out = false;
+                        window_registry.mark_closed(window_id);
+                    }
+                    WindowEvent::Resized(new_size) => {
+                        // Update environment window GPU context
+                        let gpu = app.gpu_context();
+                        if let Some(entry) = window_registry.get_mut(window_id) {
+                            entry.resize(&gpu, new_size);
+                        }
+                    }
+                    WindowEvent::RedrawRequested => {
+                        // Render the environment viewport
+                        Self::render_environment_window(window_id, window_registry, app);
+                    }
+                    WindowEvent::KeyboardInput { event, .. } => {
+                        // Handle Escape to close environment window
+                        if event.state == ElementState::Pressed {
+                            if let PhysicalKey::Code(KeyCode::Escape) = event.physical_key {
+                                tracing::info!("Environment viewport window closed via Escape");
+                                app.environment_broken_out = false;
+                                window_registry.mark_closed(window_id);
+                            }
+                        }
+                    }
+                    // Handle mouse input for viewport panning
+                    WindowEvent::MouseInput { state, button, .. } => {
+                        if button == MouseButton::Right {
+                            // Get cursor position from window entry
+                            let cursor_pos = window_registry
+                                .get(window_id)
+                                .map(|e| e.cursor_position())
+                                .unwrap_or((0.0, 0.0));
+
+                            match state {
+                                ElementState::Pressed => {
+                                    tracing::debug!(
+                                        target: "viewport",
+                                        context = "undocked_env",
+                                        x = cursor_pos.0,
+                                        y = cursor_pos.1,
+                                        "right_mouse_down"
+                                    );
+                                    app.on_right_mouse_down(cursor_pos.0, cursor_pos.1);
+                                }
+                                ElementState::Released => {
+                                    tracing::debug!(target: "viewport", context = "undocked_env", "right_mouse_up");
+                                    app.on_right_mouse_up();
+                                }
+                            }
+                            // Request redraw to show pan changes
+                            if let Some(entry) = window_registry.get_mut(window_id) {
+                                entry.window.request_redraw();
+                            }
+                        }
+                    }
+                    // Handle cursor movement for pan tracking
+                    WindowEvent::CursorMoved { position, .. } => {
+                        // Update cursor position in window entry
+                        if let Some(entry) = window_registry.get_mut(window_id) {
+                            entry.set_cursor_position(position.x as f32, position.y as f32);
+                        }
+
+                        tracing::trace!(
+                            target: "viewport",
+                            context = "undocked_env",
+                            x = position.x,
+                            y = position.y,
+                            "cursor_moved"
+                        );
+
+                        // Use the same approach as main window - on_mouse_move handles dragging internally
+                        app.on_mouse_move(position.x as f32, position.y as f32);
+
+                        // Request redraw to update the viewport
+                        if let Some(entry) = window_registry.get_mut(window_id) {
+                            entry.window.request_redraw();
+                        }
+                    }
+                    // Handle scroll wheel for zooming
+                    WindowEvent::MouseWheel { delta, .. } => {
+                        let scroll_amount = match delta {
+                            MouseScrollDelta::LineDelta(_, y) => y,
+                            MouseScrollDelta::PixelDelta(pos) => (pos.y / 50.0) as f32,
+                        };
+
+                        if scroll_amount.abs() > 0.001 {
+                            tracing::debug!(
+                                target: "viewport",
+                                context = "undocked_env",
+                                delta = scroll_amount,
+                                "scroll"
+                            );
+                            app.on_scroll(scroll_amount);
+                            // Request redraw
+                            if let Some(entry) = window_registry.get_mut(window_id) {
+                                entry.window.request_redraw();
+                            }
+                        }
+                    }
+                    _ => {
+                        // Forward other events to egui for viewport controls
+                        if let Some(entry) = window_registry.get_mut(window_id) {
+                            let _ = entry.egui_state.on_window_event(&entry.window, &event);
+                        }
+                    }
+                }
+            } else if is_monitor {
                 // Handle monitor window events
                 match event {
                     WindowEvent::CloseRequested => {
@@ -997,6 +1201,24 @@ impl ApplicationHandler for ImmersiveApp {
                                     panel.undocked_geometry.set_size(new_size.width as f32, new_size.height as f32);
                                 }
                             }
+                        }
+                    }
+                    WindowEvent::Focused(gained) => {
+                        // Track which window is focused
+                        if gained {
+                            window_registry.set_focused(window_id);
+                        }
+                        // Forward to egui
+                        if let Some(entry) = window_registry.get_mut(window_id) {
+                            let _ = entry.egui_state.on_window_event(&entry.window, &event);
+                        }
+                    }
+                    WindowEvent::CursorMoved { position, .. } => {
+                        // Track cursor position for this window
+                        if let Some(entry) = window_registry.get_mut(window_id) {
+                            entry.cursor_pos = Some((position.x as f32, position.y as f32));
+                            // Forward to egui
+                            let _ = entry.egui_state.on_window_event(&entry.window, &event);
                         }
                     }
                     WindowEvent::RedrawRequested => {
@@ -1463,9 +1685,21 @@ impl ApplicationHandler for ImmersiveApp {
 fn main() {
     // Initialize logging with tracing
     use immersive_server::telemetry::{init_logging, LogConfig};
-    if let Err(e) = init_logging(&LogConfig::default()) {
-        eprintln!("Failed to initialize logging: {}", e);
-    }
+    let log_config = LogConfig {
+        console_enabled: true,
+        file_enabled: false,
+        file_path: None,
+        json_format: false,
+        default_level: "info".to_string(),
+    };
+    // Keep the guard alive for the program duration
+    let _log_guard = match init_logging(&log_config) {
+        Ok(guard) => guard,
+        Err(e) => {
+            eprintln!("Failed to initialize logging: {}", e);
+            None
+        }
+    };
 
     tracing::info!("Immersive Server v0.1.0");
 

@@ -440,6 +440,9 @@ pub struct LfoSource {
     pub sync_to_bpm: bool,
     /// Beats per cycle (when sync_to_bpm is true)
     pub beats: f32,
+    /// Output range limits
+    #[serde(default)]
+    pub range: AutomationRange,
 }
 
 impl Default for LfoSource {
@@ -452,6 +455,7 @@ impl Default for LfoSource {
             offset: 0.0,
             sync_to_bpm: false,
             beats: 4.0,
+            range: AutomationRange::default(),
         }
     }
 }
@@ -501,6 +505,9 @@ pub struct BeatSource {
     pub sustain: f32,
     /// Release time in milliseconds
     pub release_ms: f32,
+    /// Output range limits
+    #[serde(default)]
+    pub range: AutomationRange,
 }
 
 impl Default for BeatSource {
@@ -511,6 +518,7 @@ impl Default for BeatSource {
             decay_ms: 100.0,
             sustain: 0.5,
             release_ms: 200.0,
+            range: AutomationRange::default(),
         }
     }
 }
@@ -528,6 +536,9 @@ pub struct FftSource {
     pub attack_ms: f32,
     /// Release time in ms (how fast value falls)
     pub release_ms: f32,
+    /// Output range limits
+    #[serde(default)]
+    pub range: AutomationRange,
 }
 
 impl Default for FftSource {
@@ -538,6 +549,7 @@ impl Default for FftSource {
             smoothing: 0.3,
             attack_ms: 10.0,
             release_ms: 100.0,
+            range: AutomationRange::default(),
         }
     }
 }
@@ -552,6 +564,160 @@ impl FftSource {
     }
 }
 
+/// Range limits for automation output (normalized 0.0-1.0)
+///
+/// Remaps the 0.0-1.0 automation output to a custom range.
+/// For example, min_limit=0.25, max_limit=0.75 means automation
+/// will only modulate the parameter between 25% and 75% of its range.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct AutomationRange {
+    /// Lower bound (0.0-1.0, normalized to parameter range)
+    pub min_limit: f32,
+    /// Upper bound (0.0-1.0, normalized to parameter range)
+    pub max_limit: f32,
+}
+
+impl Default for AutomationRange {
+    fn default() -> Self {
+        Self {
+            min_limit: 0.0,
+            max_limit: 1.0,
+        }
+    }
+}
+
+impl AutomationRange {
+    /// Remap a 0-1 value through this range
+    pub fn remap(&self, value: f32) -> f32 {
+        self.min_limit + value * (self.max_limit - self.min_limit)
+    }
+}
+
+/// Direction of timeline ramp
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum TimelineDirection {
+    /// Ramp from 0.0 to 1.0
+    #[default]
+    RampUp,
+    /// Ramp from 1.0 to 0.0
+    RampDown,
+}
+
+impl TimelineDirection {
+    /// Get all available directions
+    pub fn all() -> &'static [Self] {
+        &[Self::RampUp, Self::RampDown]
+    }
+
+    /// Get display name
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::RampUp => "Up",
+            Self::RampDown => "Down",
+        }
+    }
+}
+
+/// Behavior when timeline completes
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum TimelineMode {
+    /// Restart from beginning when complete
+    #[default]
+    Loop,
+    /// Stop at end value and hold
+    PlayOnceAndHold,
+}
+
+impl TimelineMode {
+    /// Get all available modes
+    pub fn all() -> &'static [Self] {
+        &[Self::Loop, Self::PlayOnceAndHold]
+    }
+
+    /// Get display name
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Loop => "Loop",
+            Self::PlayOnceAndHold => "Once",
+        }
+    }
+}
+
+/// Easing function for timeline
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum TimelineEasing {
+    /// Linear interpolation
+    #[default]
+    Linear,
+    /// Slow start, fast end (quadratic)
+    EaseIn,
+    /// Fast start, slow end (quadratic)
+    EaseOut,
+    /// Slow start and end (quadratic)
+    EaseInOut,
+}
+
+impl TimelineEasing {
+    /// Get all available easing functions
+    pub fn all() -> &'static [Self] {
+        &[Self::Linear, Self::EaseIn, Self::EaseOut, Self::EaseInOut]
+    }
+
+    /// Get display name
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Linear => "Linear",
+            Self::EaseIn => "Ease In",
+            Self::EaseOut => "Ease Out",
+            Self::EaseInOut => "Ease In/Out",
+        }
+    }
+
+    /// Apply easing function to a 0-1 progress value
+    pub fn apply(&self, t: f32) -> f32 {
+        match self {
+            Self::Linear => t,
+            Self::EaseIn => t * t,
+            Self::EaseOut => 1.0 - (1.0 - t) * (1.0 - t),
+            Self::EaseInOut => {
+                if t < 0.5 {
+                    2.0 * t * t
+                } else {
+                    1.0 - (-2.0 * t + 2.0).powi(2) / 2.0
+                }
+            }
+        }
+    }
+}
+
+/// Timeline automation source - ramps up or down over time
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimelineSource {
+    /// Duration of the ramp in milliseconds (100-60000)
+    pub duration_ms: f32,
+    /// Direction of the ramp
+    pub direction: TimelineDirection,
+    /// Behavior when complete
+    pub mode: TimelineMode,
+    /// Easing function
+    pub easing: TimelineEasing,
+    /// Output range limits
+    #[serde(default)]
+    pub range: AutomationRange,
+}
+
+impl Default for TimelineSource {
+    fn default() -> Self {
+        Self {
+            duration_ms: 1000.0,
+            direction: TimelineDirection::RampUp,
+            mode: TimelineMode::Loop,
+            easing: TimelineEasing::Linear,
+            range: AutomationRange::default(),
+        }
+    }
+}
+
 /// All automation source types
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
@@ -562,7 +728,8 @@ pub enum AutomationSource {
     Beat(BeatSource),
     /// FFT audio reactivity
     Fft(FftSource),
-    // Future: Osc { address: String }
+    /// Time-based ramp (up/down, loop/hold)
+    Timeline(TimelineSource),
 }
 
 /// Effect instance in the stack

@@ -259,8 +259,11 @@ impl AudioSource for SystemAudioInput {
         let mut guard = self.state.buffer.lock().ok()?;
         let available = guard.available();
 
-        if available < 1024 {
-            // Minimum samples for useful FFT
+        // FFT needs 2048 mono samples. For stereo input, we need 2048 * 2 = 4096 interleaved samples
+        const FFT_MIN_SAMPLES: usize = 2048 * 2;
+        if available < FFT_MIN_SAMPLES {
+            // Still apply peak decay even without enough samples
+            guard.decay_peak_level();
             return None;
         }
 
@@ -270,11 +273,22 @@ impl AudioSource for SystemAudioInput {
         let mut samples = Vec::new();
         guard.read(&mut samples);
 
+        // Apply peak decay after reading (once per update frame)
+        guard.decay_peak_level();
+
         Some(AudioBuffer {
             samples,
             sample_rate,
             channels,
         })
+    }
+
+    fn get_peak_level(&self) -> f32 {
+        self.state
+            .buffer
+            .lock()
+            .map(|mut b| b.take_peak_level())
+            .unwrap_or(0.0)
     }
 
     fn start(&self) -> Result<(), String> {

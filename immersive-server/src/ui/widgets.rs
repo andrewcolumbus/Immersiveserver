@@ -1,29 +1,129 @@
 //! Reusable UI widgets with consistent behavior
 //!
 //! Provides slider and DragValue variants that instantly reset to default on right-click.
+//! Use the `Resettable` builder for flexible widget configuration, or the convenience
+//! functions for common cases.
 
 use egui::{DragValue, Response, Slider, Ui, PointerButton};
 use std::ops::RangeInclusive;
 
-/// Slider that resets to default on right-click (instant, no menu)
+// ============================================================================
+// Resettable Widget Builder
+// ============================================================================
+
+/// Builder for widgets that reset to default on right-click.
 ///
-/// Returns the response. Check `response.changed()` to detect value changes
-/// (includes both drag changes and right-click resets).
+/// # Example
+/// ```ignore
+/// // Slider with suffix
+/// Resettable::slider(&mut value, 0.0..=1.0, 1.0)
+///     .suffix("%")
+///     .show(ui);
+///
+/// // DragValue with speed and range
+/// Resettable::drag(&mut value, 1.0)
+///     .speed(0.1)
+///     .range(0.0..=100.0)
+///     .show(ui);
+/// ```
+pub struct Resettable<'a, T: Copy + egui::emath::Numeric> {
+    value: &'a mut T,
+    default: T,
+    range: Option<RangeInclusive<T>>,
+    speed: Option<f64>,
+    suffix: Option<&'a str>,
+    is_slider: bool,
+}
+
+impl<'a, T: Copy + egui::emath::Numeric> Resettable<'a, T> {
+    /// Create a slider builder with right-click reset.
+    pub fn slider(value: &'a mut T, range: RangeInclusive<T>, default: T) -> Self {
+        Self {
+            value,
+            default,
+            range: Some(range),
+            speed: None,
+            suffix: None,
+            is_slider: true,
+        }
+    }
+
+    /// Create a DragValue builder with right-click reset.
+    pub fn drag(value: &'a mut T, default: T) -> Self {
+        Self {
+            value,
+            default,
+            range: None,
+            speed: None,
+            suffix: None,
+            is_slider: false,
+        }
+    }
+
+    /// Set the range (for DragValue; ignored for Slider which requires range in constructor).
+    pub fn range(mut self, range: RangeInclusive<T>) -> Self {
+        self.range = Some(range);
+        self
+    }
+
+    /// Set the drag speed.
+    pub fn speed(mut self, speed: f64) -> Self {
+        self.speed = Some(speed);
+        self
+    }
+
+    /// Set the suffix text (e.g., "%", "px").
+    pub fn suffix(mut self, suffix: &'a str) -> Self {
+        self.suffix = Some(suffix);
+        self
+    }
+
+    /// Show the widget and return the response.
+    pub fn show(self, ui: &mut Ui) -> Response {
+        let mut response = if self.is_slider {
+            let range = self.range.expect("Slider requires a range");
+            let mut slider = Slider::new(self.value, range);
+            if let Some(suffix) = self.suffix {
+                slider = slider.suffix(suffix);
+            }
+            ui.add(slider)
+        } else {
+            let mut drag = DragValue::new(self.value);
+            if let Some(range) = self.range {
+                drag = drag.range(range);
+            }
+            if let Some(speed) = self.speed {
+                drag = drag.speed(speed);
+            }
+            if let Some(suffix) = self.suffix {
+                drag = drag.suffix(suffix);
+            }
+            ui.add(drag)
+        };
+
+        if response.clicked_by(PointerButton::Secondary) {
+            *self.value = self.default;
+            response.mark_changed();
+        }
+        response
+    }
+}
+
+// ============================================================================
+// Convenience Functions (using the builder internally)
+// ============================================================================
+
+/// Slider that resets to default on right-click (instant, no menu).
 pub fn slider_with_reset(
     ui: &mut Ui,
     value: &mut f32,
     range: RangeInclusive<f32>,
     default: f32,
 ) -> Response {
-    let mut response = ui.add(Slider::new(value, range));
-    if response.clicked_by(PointerButton::Secondary) {
-        *value = default;
-        response.mark_changed();
-    }
-    response
+    Resettable::slider(value, range, default).show(ui)
 }
 
-/// Slider with text suffix that resets to default on right-click
+/// Slider with text suffix that resets to default on right-click.
 pub fn slider_with_reset_suffix(
     ui: &mut Ui,
     value: &mut f32,
@@ -31,87 +131,45 @@ pub fn slider_with_reset_suffix(
     default: f32,
     suffix: &str,
 ) -> Response {
-    let mut response = ui.add(Slider::new(value, range).suffix(suffix));
-    if response.clicked_by(PointerButton::Secondary) {
-        *value = default;
-        response.mark_changed();
-    }
-    response
+    Resettable::slider(value, range, default).suffix(suffix).show(ui)
 }
 
-/// DragValue (f32) that resets to default on right-click (instant, no menu)
-pub fn drag_value_with_reset(
-    ui: &mut Ui,
-    value: &mut f32,
-    default: f32,
-) -> Response {
-    let mut response = ui.add(DragValue::new(value));
-    if response.clicked_by(PointerButton::Secondary) {
-        *value = default;
-        response.mark_changed();
-    }
-    response
+/// DragValue (f32) that resets to default on right-click.
+pub fn drag_value_with_reset(ui: &mut Ui, value: &mut f32, default: f32) -> Response {
+    Resettable::drag(value, default).show(ui)
 }
 
-/// DragValue (f32) with speed that resets to default on right-click
+/// DragValue (f32) with speed that resets to default on right-click.
 pub fn drag_value_with_reset_speed(
     ui: &mut Ui,
     value: &mut f32,
     default: f32,
     speed: f64,
 ) -> Response {
-    let mut response = ui.add(DragValue::new(value).speed(speed));
-    if response.clicked_by(PointerButton::Secondary) {
-        *value = default;
-        response.mark_changed();
-    }
-    response
+    Resettable::drag(value, default).speed(speed).show(ui)
 }
 
-/// DragValue (f32) with suffix that resets to default on right-click
+/// DragValue (f32) with suffix that resets to default on right-click.
 pub fn drag_value_with_reset_suffix(
     ui: &mut Ui,
     value: &mut f32,
     default: f32,
     suffix: &str,
 ) -> Response {
-    let mut response = ui.add(DragValue::new(value).suffix(suffix));
-    if response.clicked_by(PointerButton::Secondary) {
-        *value = default;
-        response.mark_changed();
-    }
-    response
+    Resettable::drag(value, default).suffix(suffix).show(ui)
 }
 
-/// DragValue (i32) that resets to default on right-click
-pub fn drag_value_i32_with_reset(
-    ui: &mut Ui,
-    value: &mut i32,
-    default: i32,
-) -> Response {
-    let mut response = ui.add(DragValue::new(value));
-    if response.clicked_by(PointerButton::Secondary) {
-        *value = default;
-        response.mark_changed();
-    }
-    response
+/// DragValue (i32) that resets to default on right-click.
+pub fn drag_value_i32_with_reset(ui: &mut Ui, value: &mut i32, default: i32) -> Response {
+    Resettable::drag(value, default).show(ui)
 }
 
-/// DragValue (u32) that resets to default on right-click
-pub fn drag_value_u32_with_reset(
-    ui: &mut Ui,
-    value: &mut u32,
-    default: u32,
-) -> Response {
-    let mut response = ui.add(DragValue::new(value));
-    if response.clicked_by(PointerButton::Secondary) {
-        *value = default;
-        response.mark_changed();
-    }
-    response
+/// DragValue (u32) that resets to default on right-click.
+pub fn drag_value_u32_with_reset(ui: &mut Ui, value: &mut u32, default: u32) -> Response {
+    Resettable::drag(value, default).show(ui)
 }
 
-/// DragValue (f32) with range and suffix that resets to default on right-click
+/// DragValue (f32) with range and suffix that resets to default on right-click.
 pub fn drag_value_with_reset_range_suffix(
     ui: &mut Ui,
     value: &mut f32,
@@ -119,38 +177,33 @@ pub fn drag_value_with_reset_range_suffix(
     range: RangeInclusive<f32>,
     suffix: &str,
 ) -> Response {
-    let mut response = ui.add(DragValue::new(value).range(range).suffix(suffix));
-    if response.clicked_by(PointerButton::Secondary) {
-        *value = default;
-        response.mark_changed();
-    }
-    response
+    Resettable::drag(value, default).range(range).suffix(suffix).show(ui)
 }
 
-/// Add right-click reset behavior to any Response
-/// Call this after adding any widget, passing the value and default
-pub fn add_reset_on_right_click<T: Copy>(
-    response: &mut Response,
-    value: &mut T,
-    default: T,
-) {
+// ============================================================================
+// Generic Reset Helper
+// ============================================================================
+
+/// Add right-click reset behavior to any Response.
+/// Call this after adding any widget, passing the value and default.
+pub fn add_reset_on_right_click<T: Copy>(response: &mut Response, value: &mut T, default: T) {
     if response.clicked_by(PointerButton::Secondary) {
         *value = default;
         response.mark_changed();
     }
 }
 
-/// Add right-click reset behavior (f32 version for convenience)
+/// Add right-click reset behavior (f32 version for convenience).
 pub fn add_reset_f32(response: &mut Response, value: &mut f32, default: f32) {
     add_reset_on_right_click(response, value, default);
 }
 
-/// Add right-click reset behavior (i32 version for convenience)
+/// Add right-click reset behavior (i32 version for convenience).
 pub fn add_reset_i32(response: &mut Response, value: &mut i32, default: i32) {
     add_reset_on_right_click(response, value, default);
 }
 
-/// Add right-click reset behavior (u32 version for convenience)
+/// Add right-click reset behavior (u32 version for convenience).
 pub fn add_reset_u32(response: &mut Response, value: &mut u32, default: u32) {
     add_reset_on_right_click(response, value, default);
 }
@@ -300,4 +353,157 @@ pub fn draw_texture_or_placeholder(
     } else {
         draw_texture_placeholder(ui, rect, placeholder_message);
     }
+}
+
+// ============================================================================
+// SliderLimit Widget - Dual-Handle Range Selection
+// ============================================================================
+
+/// A dual-handle range slider for selecting min/max limits.
+///
+/// Visual design: Two triangular handles (▲) on a track, with the region
+/// between them highlighted. Users can drag either handle independently.
+///
+/// # Example
+/// ```ignore
+/// let response = SliderLimit::new(&mut min, &mut max, 0.0..=1.0).show(ui);
+/// if response.changed() {
+///     // min or max was modified
+/// }
+/// ```
+pub struct SliderLimit<'a> {
+    min: &'a mut f32,
+    max: &'a mut f32,
+    range: RangeInclusive<f32>,
+    width: Option<f32>,
+}
+
+impl<'a> SliderLimit<'a> {
+    /// Create a new SliderLimit widget
+    pub fn new(min: &'a mut f32, max: &'a mut f32, range: RangeInclusive<f32>) -> Self {
+        Self {
+            min,
+            max,
+            range,
+            width: None,
+        }
+    }
+
+    /// Set the width of the slider
+    pub fn width(mut self, width: f32) -> Self {
+        self.width = Some(width);
+        self
+    }
+
+    /// Show the widget and return the response
+    pub fn show(self, ui: &mut Ui) -> Response {
+        let width = self.width.unwrap_or(ui.available_width().min(200.0));
+        let height = 16.0;
+        let handle_size = 6.0;
+        let track_padding = handle_size;
+
+        let (rect, mut response) = ui.allocate_exact_size(
+            egui::vec2(width, height),
+            egui::Sense::click_and_drag()
+        );
+
+        if ui.is_rect_visible(rect) {
+            let painter = ui.painter();
+
+            let track_left = rect.left() + track_padding;
+            let track_right = rect.right() - track_padding;
+            let track_width = track_right - track_left;
+            let track_y = rect.center().y;
+
+            let range_min = *self.range.start();
+            let range_max = *self.range.end();
+            let range_span = range_max - range_min;
+
+            // Normalize values to 0-1
+            let min_norm = (*self.min - range_min) / range_span;
+            let max_norm = (*self.max - range_min) / range_span;
+
+            let min_x = track_left + min_norm * track_width;
+            let max_x = track_left + max_norm * track_width;
+
+            // Draw track background
+            painter.line_segment(
+                [egui::pos2(track_left, track_y), egui::pos2(track_right, track_y)],
+                egui::Stroke::new(2.0, egui::Color32::from_gray(50))
+            );
+
+            // Draw highlighted region between handles
+            painter.line_segment(
+                [egui::pos2(min_x, track_y), egui::pos2(max_x, track_y)],
+                egui::Stroke::new(3.0, egui::Color32::from_rgb(80, 120, 180))
+            );
+
+            // Determine which handle is being hovered/dragged
+            let pointer_pos = response.interact_pointer_pos();
+            let dist_to_min = pointer_pos.map(|p| (p.x - min_x).abs()).unwrap_or(f32::MAX);
+            let dist_to_max = pointer_pos.map(|p| (p.x - max_x).abs()).unwrap_or(f32::MAX);
+            let hovering_min = dist_to_min < dist_to_max && dist_to_min < handle_size * 2.5;
+            let hovering_max = dist_to_max <= dist_to_min && dist_to_max < handle_size * 2.5;
+
+            // Draw triangular handles (pointing up)
+            let draw_handle = |x: f32, hovered: bool| {
+                let color = if hovered {
+                    egui::Color32::WHITE
+                } else {
+                    egui::Color32::from_gray(180)
+                };
+
+                // Triangle pointing up
+                let top = egui::pos2(x, track_y - handle_size);
+                let left = egui::pos2(x - handle_size * 0.7, track_y + 1.0);
+                let right = egui::pos2(x + handle_size * 0.7, track_y + 1.0);
+
+                painter.add(egui::Shape::convex_polygon(
+                    vec![top, right, left],
+                    color,
+                    egui::Stroke::new(1.0, egui::Color32::from_gray(60))
+                ));
+            };
+
+            draw_handle(min_x, hovering_min);
+            draw_handle(max_x, hovering_max);
+
+            // Handle dragging
+            if response.dragged() {
+                if let Some(pos) = pointer_pos {
+                    let new_norm = ((pos.x - track_left) / track_width).clamp(0.0, 1.0);
+                    let new_value = range_min + new_norm * range_span;
+
+                    // Move the closer handle
+                    if dist_to_min < dist_to_max {
+                        // Dragging min handle - can't exceed max
+                        *self.min = new_value.min(*self.max - 0.01);
+                    } else {
+                        // Dragging max handle - can't go below min
+                        *self.max = new_value.max(*self.min + 0.01);
+                    }
+                    response.mark_changed();
+                }
+            }
+
+            // Right-click to reset to full range
+            if response.clicked_by(PointerButton::Secondary) {
+                *self.min = range_min;
+                *self.max = range_max;
+                response.mark_changed();
+            }
+        }
+
+        response
+    }
+}
+
+/// Convenience function for slider_limit widget
+pub fn slider_limit(
+    ui: &mut Ui,
+    min: &mut f32,
+    max: &mut f32,
+    range: RangeInclusive<f32>,
+) -> Response {
+    SliderLimit::new(min, max, range).show(ui)
 }

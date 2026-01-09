@@ -9,6 +9,7 @@ use tracing_subscriber::{
     prelude::*,
     filter::EnvFilter,
 };
+use tracing_appender::non_blocking::WorkerGuard;
 
 /// Logging configuration
 #[derive(Debug, Clone)]
@@ -39,6 +40,9 @@ impl Default for LogConfig {
 
 /// Initialize the logging system with the given configuration
 ///
+/// Returns a guard that must be kept alive for the duration of the program
+/// to ensure file logging is properly flushed.
+///
 /// # Environment Variables
 ///
 /// - `IMMERSIVE_LOG`: Set log level filter (e.g., "debug", "info,immersive_server=debug")
@@ -50,9 +54,10 @@ impl Default for LogConfig {
 /// use immersive_server::telemetry::{init_logging, LogConfig};
 ///
 /// let config = LogConfig::default();
-/// init_logging(&config).expect("Failed to initialize logging");
+/// let _guard = init_logging(&config).expect("Failed to initialize logging");
+/// // Keep _guard alive for the program duration
 /// ```
-pub fn init_logging(config: &LogConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub fn init_logging(config: &LogConfig) -> Result<Option<WorkerGuard>, Box<dyn std::error::Error + Send + Sync>> {
     // Build the environment filter
     // Check IMMERSIVE_LOG first, then fall back to RUST_LOG, then to config default
     let env_filter = EnvFilter::try_from_env("IMMERSIVE_LOG")
@@ -64,10 +69,46 @@ pub fn init_logging(config: &LogConfig) -> Result<(), Box<dyn std::error::Error 
         .map(|v| v.to_lowercase() == "json")
         .unwrap_or(config.json_format);
 
+    let mut file_guard: Option<WorkerGuard> = None;
+
     // Build the subscriber with layers
     let subscriber = tracing_subscriber::registry().with(env_filter);
 
-    if config.console_enabled {
+    if config.file_enabled {
+        // Setup file logging with tracing-appender
+        let log_path = config.file_path.clone().unwrap_or_else(|| PathBuf::from("viewport_debug.log"));
+        let file = std::fs::File::create(&log_path)?;
+        let (non_blocking, guard) = tracing_appender::non_blocking(file);
+        file_guard = Some(guard);
+
+        let file_layer = fmt::layer()
+            .with_writer(non_blocking)
+            .with_target(true)
+            .with_thread_ids(false)
+            .with_file(true)
+            .with_line_number(true)
+            .with_ansi(false);  // No ANSI colors in file
+
+        if config.console_enabled {
+            // Both console and file
+            let console_layer = fmt::layer()
+                .with_target(true)
+                .with_thread_ids(false)
+                .with_file(false)
+                .with_line_number(false)
+                .compact();
+
+            subscriber
+                .with(file_layer)
+                .with(console_layer)
+                .init();
+        } else {
+            // File only
+            subscriber.with(file_layer).init();
+        }
+
+        eprintln!("Logging to file: {}", log_path.display());
+    } else if config.console_enabled {
         if use_json {
             // JSON format for production/log aggregation
             let json_layer = fmt::layer()
@@ -99,19 +140,23 @@ pub fn init_logging(config: &LogConfig) -> Result<(), Box<dyn std::error::Error 
         target: "immersive_server",
         version = env!("CARGO_PKG_VERSION"),
         json_format = use_json,
+        file_enabled = config.file_enabled,
         "Logging initialized"
     );
 
-    Ok(())
+    Ok(file_guard)
 }
 
 /// Initialize logging from environment with sensible defaults
 ///
 /// This is a convenience function that uses default LogConfig
 /// and is suitable for most use cases.
-pub fn init_logging_default() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub fn init_logging_default() -> Result<Option<WorkerGuard>, Box<dyn std::error::Error + Send + Sync>> {
     init_logging(&LogConfig::default())
 }
+
+// Re-export WorkerGuard so callers can store it
+pub use tracing_appender::non_blocking::WorkerGuard as LogGuard;
 
 #[cfg(test)]
 mod tests {

@@ -5,6 +5,8 @@ use super::source::{AudioSource, AudioSourceState};
 use super::system_input::SystemAudioInput;
 use super::types::{AudioBand, AudioSourceId, FftData};
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::Write;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -26,6 +28,10 @@ pub struct AudioManager {
     band_sensitivity: HashMap<AudioBand, f32>,
     /// Whether system audio is initialized
     system_audio_initialized: bool,
+    /// Debug log file for FFT values
+    fft_log_file: Option<File>,
+    /// Last time we logged FFT values
+    last_log_time: Instant,
 }
 
 impl Default for AudioManager {
@@ -42,6 +48,14 @@ impl AudioManager {
             band_sensitivity.insert(*band, 1.0);
         }
 
+        // Create debug log file
+        let fft_log_file = File::create("fft_debug.csv")
+            .map(|mut f| {
+                writeln!(f, "time_sec,input_peak,fft_full,fft_low,fft_mid,fft_high").ok();
+                f
+            })
+            .ok();
+
         Self {
             sources: HashMap::new(),
             analyzers: HashMap::new(),
@@ -51,6 +65,8 @@ impl AudioManager {
             master_sensitivity: 1.0,
             band_sensitivity,
             system_audio_initialized: false,
+            fft_log_file,
+            last_log_time: Instant::now(),
         }
     }
 
@@ -141,12 +157,15 @@ impl AudioManager {
     pub fn update(&mut self) {
         let now = Instant::now();
         let delta = now.duration_since(self.last_update);
-        self.last_update = now;
 
         // Limit update rate (~60Hz max)
         if delta < Duration::from_millis(16) {
             return;
         }
+
+        // Only update last_update AFTER the rate-limit check passes
+        // (Otherwise at >60 FPS, the check would always fail after the first update)
+        self.last_update = now;
 
         // Process each source
         let source_ids: Vec<_> = self.sources.keys().cloned().collect();
@@ -156,23 +175,56 @@ impl AudioManager {
                 None => continue,
             };
 
-            if !source.is_active() {
+            let is_active = source.is_active();
+            if !is_active {
+                tracing::debug!("[AUDIO] Source {:?} is not active, skipping", id);
                 continue;
             }
 
             // Get available samples
-            if let Some(buffer) = source.take_samples() {
-                // Get or create analyzer
-                if let Some(analyzer) = self.analyzers.get_mut(&id) {
-                    analyzer.set_sample_rate(buffer.sample_rate);
-                    let fft = analyzer.analyze(&buffer);
+            match source.take_samples() {
+                Some(buffer) => {
+                    let sample_count = buffer.samples.len();
+                    // Get or create analyzer
+                    if let Some(analyzer) = self.analyzers.get_mut(&id) {
+                        analyzer.set_sample_rate(buffer.sample_rate);
+                        let fft = analyzer.analyze(&buffer);
 
-                    // Store FFT data
-                    if let Ok(mut data) = self.fft_data.write() {
-                        data.insert(id.clone(), fft);
+                        tracing::debug!(
+                            "[AUDIO] Source {:?}: {} samples, fft=({:.3}, {:.3}, {:.3})",
+                            id, sample_count, fft.low, fft.mid, fft.high
+                        );
+
+                        // Store FFT data
+                        if let Ok(mut data) = self.fft_data.write() {
+                            data.insert(id.clone(), fft);
+                        }
                     }
                 }
+                None => {
+                    tracing::debug!("[AUDIO] Source {:?}: no samples available", id);
+                }
             }
+        }
+
+        // Log FFT values to file (10x/sec for debugging)
+        if self.last_log_time.elapsed() >= Duration::from_millis(100) {
+            // Get values before borrowing file
+            let peak = self.primary_source.as_ref()
+                .and_then(|id| self.sources.get(id))
+                .map(|s| s.get_peak_level())
+                .unwrap_or(0.0);
+            let fft_data = self.get_primary_fft_data();
+
+            if let Some(ref mut file) = self.fft_log_file {
+                if let Some(fft) = fft_data {
+                    let elapsed = self.last_log_time.elapsed().as_secs_f32();
+                    let _ = writeln!(file, "{:.3},{:.4},{:.4},{:.4},{:.4},{:.4}",
+                        elapsed, peak, fft.full, fft.low, fft.mid, fft.high);
+                    let _ = file.flush();
+                }
+            }
+            self.last_log_time = Instant::now();
         }
     }
 
@@ -381,6 +433,31 @@ impl AudioManager {
         self.get_primary_fft_data()
             .map(|fft| (fft.low, fft.mid, fft.high))
             .unwrap_or((0.0, 0.0, 0.0))
+    }
+
+    /// Get per-band levels with gain applied (low, mid, high)
+    pub fn get_band_levels_with_gain(&self, gain: f32) -> (f32, f32, f32) {
+        self.get_primary_fft_data()
+            .map(|fft| {
+                (
+                    (fft.low * gain).min(1.0),
+                    (fft.mid * gain).min(1.0),
+                    (fft.high * gain).min(1.0),
+                )
+            })
+            .unwrap_or((0.0, 0.0, 0.0))
+    }
+
+    /// Get raw input peak level from primary source (before FFT, 0.0-1.0)
+    pub fn get_raw_input_level(&self) -> f32 {
+        let id = match self.primary_source.as_ref() {
+            Some(id) => id,
+            None => return 0.0,
+        };
+        self.sources
+            .get(id)
+            .map(|s| s.get_peak_level())
+            .unwrap_or(0.0)
     }
 
     /// Clear all audio sources

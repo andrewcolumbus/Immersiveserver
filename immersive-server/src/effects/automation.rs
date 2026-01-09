@@ -5,7 +5,7 @@
 
 use std::time::Instant;
 
-use super::types::{AutomationSource, BeatSource, BeatTrigger, FftSource, LfoShape, LfoSource, Parameter};
+use super::types::{AutomationSource, BeatSource, BeatTrigger, FftSource, LfoShape, LfoSource, Parameter, TimelineSource, TimelineMode, TimelineDirection};
 use crate::audio::AudioManager;
 
 /// Global BPM clock for synchronizing automation
@@ -420,6 +420,87 @@ impl FftEnvelopeState {
     }
 }
 
+/// Timeline envelope state for time-based ramps
+#[derive(Debug, Clone)]
+pub struct TimelineEnvelopeState {
+    /// Start time of the timeline (set on first evaluation)
+    start_time: Option<Instant>,
+    /// Current normalized value (0.0-1.0)
+    current_value: f32,
+    /// Whether the timeline has completed (for PlayOnceAndHold)
+    completed: bool,
+}
+
+impl Default for TimelineEnvelopeState {
+    fn default() -> Self {
+        Self {
+            start_time: None,
+            current_value: 0.0,
+            completed: false,
+        }
+    }
+}
+
+impl TimelineEnvelopeState {
+    /// Create new timeline envelope state
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Update the timeline envelope
+    pub fn update(&mut self, source: &TimelineSource) {
+        let now = Instant::now();
+
+        // Initialize start time on first update
+        let start = self.start_time.get_or_insert(now);
+
+        // If already completed in PlayOnceAndHold mode, keep the final value
+        if self.completed {
+            return;
+        }
+
+        let elapsed_ms = now.duration_since(*start).as_secs_f32() * 1000.0;
+        let duration = source.duration_ms.max(1.0);
+
+        let progress = match source.mode {
+            TimelineMode::Loop => (elapsed_ms % duration) / duration,
+            TimelineMode::PlayOnceAndHold => {
+                let p = (elapsed_ms / duration).min(1.0);
+                if p >= 1.0 {
+                    self.completed = true;
+                }
+                p
+            }
+        };
+
+        // Apply easing
+        let eased = source.easing.apply(progress);
+
+        // Apply direction
+        self.current_value = match source.direction {
+            TimelineDirection::RampUp => eased,
+            TimelineDirection::RampDown => 1.0 - eased,
+        };
+    }
+
+    /// Get the current envelope value (0-1)
+    pub fn value(&self) -> f32 {
+        self.current_value
+    }
+
+    /// Reset the timeline (restart from beginning)
+    pub fn reset(&mut self) {
+        self.start_time = None;
+        self.current_value = 0.0;
+        self.completed = false;
+    }
+
+    /// Check if the timeline has completed (only relevant for PlayOnceAndHold)
+    pub fn is_completed(&self) -> bool {
+        self.completed
+    }
+}
+
 /// Evaluate automation for a parameter
 ///
 /// Returns the automated value, or the base value if no automation
@@ -455,6 +536,10 @@ pub fn evaluate_parameter(
         }
         Some(AutomationSource::Fft(_)) => {
             // FFT automation requires audio manager - use evaluate_parameter_with_audio
+            base_value
+        }
+        Some(AutomationSource::Timeline(_)) => {
+            // Timeline automation requires timeline envelope state
             base_value
         }
     }
@@ -510,6 +595,11 @@ pub fn evaluate_parameter_with_audio(
             } else {
                 base_value
             }
+        }
+        Some(AutomationSource::Timeline(_)) => {
+            // Timeline automation requires timeline envelope state
+            // Use pack_parameters_with_automation_and_envelopes for full support
+            base_value
         }
     }
 }

@@ -29,6 +29,8 @@ pub enum WindowType {
         /// The output/display index
         output_id: u32,
     },
+    /// Environment viewport in its own window (breakout from main)
+    EnvironmentViewport,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -52,6 +54,8 @@ pub struct WindowEntry {
     pub needs_redraw: bool,
     /// Whether the window has been closed (pending cleanup)
     pub closed: bool,
+    /// Current cursor position within this window (physical pixels)
+    pub cursor_pos: Option<(f32, f32)>,
 }
 
 impl WindowEntry {
@@ -74,6 +78,7 @@ impl WindowEntry {
             egui_state,
             needs_redraw: true,
             closed: false,
+            cursor_pos: None,
         }
     }
 
@@ -87,7 +92,7 @@ impl WindowEntry {
 
         // Create a new egui context for this panel window
         let egui_ctx = egui::Context::default();
-        egui_ctx.set_pixels_per_point(window.scale_factor() as f32);
+        egui_ctx.set_zoom_factor(1.0);
 
         let egui_state = egui_winit::State::new(
             egui_ctx.clone(),
@@ -106,6 +111,7 @@ impl WindowEntry {
             egui_state,
             needs_redraw: true,
             closed: false,
+            cursor_pos: None,
         }
     }
 
@@ -137,6 +143,39 @@ impl WindowEntry {
             egui_state,
             needs_redraw: true,
             closed: false,
+            cursor_pos: None,
+        }
+    }
+
+    /// Create a new window entry for an environment viewport window
+    ///
+    /// Environment viewport windows display the compositor environment when
+    /// the environment panel is undocked from the main window.
+    pub fn new_environment(window: Arc<Window>, gpu: &GpuContext) -> Self {
+        let gpu_context = WindowGpuContext::new(gpu, window.clone());
+
+        // Create egui context (minimal, for viewport controls)
+        let egui_ctx = egui::Context::default();
+        egui_ctx.set_pixels_per_point(window.scale_factor() as f32);
+
+        let egui_state = egui_winit::State::new(
+            egui_ctx.clone(),
+            egui::ViewportId::from_hash_of("environment_viewport"),
+            &window,
+            Some(window.scale_factor() as f32),
+            None,
+            None,
+        );
+
+        Self {
+            window,
+            window_type: WindowType::EnvironmentViewport,
+            gpu_context: Some(gpu_context),
+            egui_ctx,
+            egui_state,
+            needs_redraw: true,
+            closed: false,
+            cursor_pos: None,
         }
     }
 
@@ -166,6 +205,11 @@ impl WindowEntry {
         matches!(self.window_type, WindowType::Monitor { .. })
     }
 
+    /// Check if this is an environment viewport window
+    pub fn is_environment_viewport(&self) -> bool {
+        matches!(self.window_type, WindowType::EnvironmentViewport)
+    }
+
     /// Mark the window as needing a redraw
     pub fn request_redraw(&mut self) {
         self.needs_redraw = true;
@@ -183,6 +227,16 @@ impl WindowEntry {
             gpu_ctx.resize(gpu, new_size);
         }
     }
+
+    /// Get the current cursor position within this window
+    pub fn cursor_position(&self) -> (f32, f32) {
+        self.cursor_pos.unwrap_or((0.0, 0.0))
+    }
+
+    /// Set the cursor position within this window
+    pub fn set_cursor_position(&mut self, x: f32, y: f32) {
+        self.cursor_pos = Some((x, y));
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -199,8 +253,12 @@ pub struct WindowRegistry {
     monitor_to_window: HashMap<u32, WindowId>,
     /// The main window's ID
     main_window_id: Option<WindowId>,
+    /// The environment viewport window's ID (when broken out from main)
+    environment_window_id: Option<WindowId>,
     /// Next viewport ID for egui (incremented for each new panel window)
     next_viewport_id: u64,
+    /// Currently focused window
+    focused_window: Option<WindowId>,
 }
 
 impl Default for WindowRegistry {
@@ -217,7 +275,9 @@ impl WindowRegistry {
             panel_to_window: HashMap::new(),
             monitor_to_window: HashMap::new(),
             main_window_id: None,
+            environment_window_id: None,
             next_viewport_id: 1,
+            focused_window: None,
         }
     }
 
@@ -254,6 +314,37 @@ impl WindowRegistry {
             .insert(id, WindowEntry::new_monitor(window, output_id, gpu));
     }
 
+    /// Register the environment viewport window (when broken out from main)
+    pub fn register_environment_window(
+        &mut self,
+        window: Arc<Window>,
+        gpu: &GpuContext,
+    ) {
+        let id = window.id();
+        self.environment_window_id = Some(id);
+        self.windows.insert(id, WindowEntry::new_environment(window, gpu));
+    }
+
+    /// Get the environment viewport window
+    pub fn environment_window(&self) -> Option<&WindowEntry> {
+        self.environment_window_id.and_then(|id| self.windows.get(&id))
+    }
+
+    /// Get the environment viewport window mutably
+    pub fn environment_window_mut(&mut self) -> Option<&mut WindowEntry> {
+        self.environment_window_id.and_then(|id| self.windows.get_mut(&id))
+    }
+
+    /// Get the environment viewport window ID
+    pub fn environment_window_id(&self) -> Option<WindowId> {
+        self.environment_window_id
+    }
+
+    /// Check if the environment is in its own window (broken out)
+    pub fn is_environment_broken_out(&self) -> bool {
+        self.environment_window_id.is_some()
+    }
+
     /// Unregister a window by its ID
     pub fn unregister_window(&mut self, window_id: WindowId) -> Option<WindowEntry> {
         if let Some(entry) = self.windows.remove(&window_id) {
@@ -268,6 +359,10 @@ impl WindowRegistry {
             // Clear main window ID if this was the main window
             if self.main_window_id == Some(window_id) {
                 self.main_window_id = None;
+            }
+            // Clear environment window ID if this was the environment window
+            if self.environment_window_id == Some(window_id) {
+                self.environment_window_id = None;
             }
             Some(entry)
         } else {
@@ -305,11 +400,31 @@ impl WindowRegistry {
         self.main_window_id == Some(window_id)
     }
 
+    /// Set the currently focused window
+    pub fn set_focused(&mut self, window_id: WindowId) {
+        self.focused_window = Some(window_id);
+    }
+
+    /// Get the currently focused window ID
+    pub fn focused_window_id(&self) -> Option<WindowId> {
+        self.focused_window
+    }
+
+    /// Check if a window is currently focused
+    pub fn is_focused(&self, window_id: WindowId) -> bool {
+        self.focused_window == Some(window_id)
+    }
+
     /// Get the window hosting a specific panel
     pub fn get_panel_window(&self, panel_id: &str) -> Option<&WindowEntry> {
         self.panel_to_window
             .get(panel_id)
             .and_then(|id| self.windows.get(id))
+    }
+
+    /// Get the window ID for a specific panel
+    pub fn get_panel_window_id(&self, panel_id: &str) -> Option<WindowId> {
+        self.panel_to_window.get(panel_id).copied()
     }
 
     /// Get the window hosting a specific panel mutably
@@ -319,11 +434,6 @@ impl WindowRegistry {
         } else {
             None
         }
-    }
-
-    /// Get the window ID for a panel
-    pub fn get_panel_window_id(&self, panel_id: &str) -> Option<WindowId> {
-        self.panel_to_window.get(panel_id).copied()
     }
 
     /// Get the window for a specific monitor output

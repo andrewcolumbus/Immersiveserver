@@ -40,6 +40,7 @@ impl EffectDefinition for SlideDefinition {
                     offset: 0.0,
                     sync_to_bpm: false,
                     beats: 4.0, // unused when not synced
+                    range: crate::effects::AutomationRange::default(),
                 }));
                 param
             },

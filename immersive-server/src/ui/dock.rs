@@ -697,6 +697,19 @@ pub enum DockAction {
     RedockPanel {
         panel_id: String,
     },
+    /// Request to close a panel (close its window if undocked, hide panel)
+    ClosePanel {
+        panel_id: String,
+    },
+    /// Request to break out the environment viewport to its own window
+    BreakoutEnvironment {
+        /// Position for the new window (screen coordinates)
+        position: (f32, f32),
+        /// Size for the new window
+        size: (f32, f32),
+    },
+    /// Request to return the environment viewport to the main window
+    RedockEnvironment,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -846,14 +859,58 @@ impl DockManager {
         }
 
         // Detect which dock zone we're hovering over
-        // Note: Only Left/Right are supported for docking. Top/Bottom zones are
-        // disabled because they don't have rendering implementations yet.
         let margin = 80.0; // Size of magnetic zone at edges
 
-        self.hover_zone = if pos.0 < margin {
+        let in_left = pos.0 < margin;
+        let in_right = pos.0 > window_size.0 - margin;
+        let in_top = pos.1 < margin;
+        let in_bottom = pos.1 > window_size.1 - margin;
+
+        // Check which zones already have docked panels for corner priority
+        let has_left = !self.panels_in_zone(DockZone::Left).is_empty();
+        let has_right = !self.panels_in_zone(DockZone::Right).is_empty();
+        let has_top = !self.panels_in_zone(DockZone::Top).is_empty();
+        let has_bottom = !self.panels_in_zone(DockZone::Bottom).is_empty();
+
+        // Determine zone with dynamic corner priority:
+        // - If in a corner, prefer the zone that already has panels
+        // - If neither zone in corner has panels, prefer Left/Right over Top/Bottom
+        self.hover_zone = if in_left && in_top {
+            // Top-left corner
+            if has_top && !has_left {
+                Some(DockZone::Top)
+            } else {
+                Some(DockZone::Left)
+            }
+        } else if in_right && in_top {
+            // Top-right corner
+            if has_top && !has_right {
+                Some(DockZone::Top)
+            } else {
+                Some(DockZone::Right)
+            }
+        } else if in_left && in_bottom {
+            // Bottom-left corner
+            if has_bottom && !has_left {
+                Some(DockZone::Bottom)
+            } else {
+                Some(DockZone::Left)
+            }
+        } else if in_right && in_bottom {
+            // Bottom-right corner
+            if has_bottom && !has_right {
+                Some(DockZone::Bottom)
+            } else {
+                Some(DockZone::Right)
+            }
+        } else if in_left {
             Some(DockZone::Left)
-        } else if pos.0 > window_size.0 - margin {
+        } else if in_right {
             Some(DockZone::Right)
+        } else if in_top {
+            Some(DockZone::Top)
+        } else if in_bottom {
+            Some(DockZone::Bottom)
         } else {
             None // Floating zone
         };
@@ -1290,6 +1347,26 @@ impl DockManager {
         }
     }
 
+    /// Request to close a panel (and its window if undocked)
+    pub fn request_close(&mut self, panel_id: &str) {
+        if let Some(panel) = self.get_panel_mut(panel_id) {
+            panel.open = false;
+            let panel_id = panel_id.to_string();
+            // Queue action for main.rs to close the window if undocked
+            self.pending_actions.push(DockAction::ClosePanel { panel_id });
+        }
+    }
+
+    /// Request to break out the environment viewport to its own window
+    pub fn request_environment_breakout(&mut self, position: (f32, f32), size: (f32, f32)) {
+        self.pending_actions.push(DockAction::BreakoutEnvironment { position, size });
+    }
+
+    /// Request to return the environment viewport to the main window
+    pub fn request_environment_redock(&mut self) {
+        self.pending_actions.push(DockAction::RedockEnvironment);
+    }
+
     /// Take all pending dock actions (drains the queue)
     pub fn take_pending_actions(&mut self) -> Vec<DockAction> {
         std::mem::take(&mut self.pending_actions)
@@ -1417,8 +1494,25 @@ impl DockManager {
                     DockZone::Right,
                 );
 
-                // Note: Top/Bottom dock zones are disabled because they don't
-                // have rendering implementations. Only Left/Right are supported.
+                // Top zone (between left and right margins)
+                draw_zone(
+                    ui,
+                    egui::Rect::from_min_size(
+                        egui::pos2(screen_rect.left() + margin, screen_rect.top()),
+                        egui::vec2(screen_rect.width() - 2.0 * margin, margin),
+                    ),
+                    DockZone::Top,
+                );
+
+                // Bottom zone (between left and right margins)
+                draw_zone(
+                    ui,
+                    egui::Rect::from_min_size(
+                        egui::pos2(screen_rect.left() + margin, screen_rect.bottom() - margin),
+                        egui::vec2(screen_rect.width() - 2.0 * margin, margin),
+                    ),
+                    DockZone::Bottom,
+                );
             });
     }
 }
@@ -1427,6 +1521,7 @@ impl DockManager {
 pub mod panel_ids {
     pub const CLIP_GRID: &str = "clip_grid";
     pub const EFFECTS_BROWSER: &str = "effects_browser";
+    pub const ENVIRONMENT: &str = "environment";
     pub const FILES: &str = "files";
     pub const PERFORMANCE: &str = "performance";
     pub const PREVIS: &str = "previs";

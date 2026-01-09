@@ -359,6 +359,7 @@ impl PreviewMonitorPanel {
             &mut self.viewport,
             content_size,
             &ViewportConfig::default(),
+            "preview_monitor",
         );
 
         // Compute UV rect and destination rect for rendering (handles zoom-out clamping)

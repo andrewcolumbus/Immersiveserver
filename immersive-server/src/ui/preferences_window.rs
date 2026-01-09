@@ -758,61 +758,70 @@ impl PreferencesWindow {
 
         ui.add_space(8.0);
 
-        // Level meter
-        if let Some(manager) = audio_manager {
-            let (low, mid, high) = manager.get_band_levels();
-
+        // Audio meters and gain control (only show when audio source is enabled)
+        if let Some(manager) = audio_manager.filter(|_| settings.audio_source.is_enabled()) {
+            // Raw input level meter (before FFT) - to verify signal
+            let input_level = manager.get_raw_input_level();
             ui.horizontal(|ui| {
-                ui.label("Level:");
+                ui.label("Input:");
 
                 let meter_width = ui.available_width().min(200.0);
-                let meter_height = 16.0;
+                let meter_height = 12.0;
 
-                let (rect, _response) =
+                let (rect, _) =
                     ui.allocate_exact_size(egui::vec2(meter_width, meter_height), egui::Sense::hover());
 
                 if ui.is_rect_visible(rect) {
                     let painter = ui.painter();
-
                     // Background
                     painter.rect_filled(rect, 2.0, egui::Color32::from_gray(30));
+                    // Input level bar (green)
+                    let level_width = rect.width() * input_level.clamp(0.0, 1.0);
+                    let level_rect = egui::Rect::from_min_size(rect.min, egui::vec2(level_width, meter_height));
+                    painter.rect_filled(level_rect, 2.0, egui::Color32::from_rgb(50, 200, 50));
+                }
+            });
 
-                    let segment_width = rect.width() / 3.0;
+            ui.add_space(4.0);
 
-                    // Low band (red/orange)
-                    let low_width = segment_width * low.clamp(0.0, 1.0);
-                    let low_rect = egui::Rect::from_min_size(rect.min, egui::vec2(low_width, meter_height));
-                    painter.rect_filled(low_rect, 2.0, egui::Color32::from_rgb(255, 100, 50));
+            // FFT level meter (single bar, with gain applied)
+            let fft_level = (manager.get_current_level() * settings.fft_gain).min(1.0);
 
-                    // Mid band (green)
-                    let mid_start = rect.min.x + segment_width;
-                    let mid_width = segment_width * mid.clamp(0.0, 1.0);
-                    let mid_rect = egui::Rect::from_min_size(
-                        egui::pos2(mid_start, rect.min.y),
-                        egui::vec2(mid_width, meter_height),
-                    );
-                    painter.rect_filled(mid_rect, 0.0, egui::Color32::from_rgb(50, 255, 100));
+            ui.horizontal(|ui| {
+                ui.label("FFT:");
 
-                    // High band (blue)
-                    let high_start = rect.min.x + 2.0 * segment_width;
-                    let high_width = segment_width * high.clamp(0.0, 1.0);
-                    let high_rect = egui::Rect::from_min_size(
-                        egui::pos2(high_start, rect.min.y),
-                        egui::vec2(high_width, meter_height),
-                    );
-                    painter.rect_filled(high_rect, 2.0, egui::Color32::from_rgb(50, 150, 255));
+                let meter_width = ui.available_width().min(200.0);
+                let meter_height = 12.0;
 
-                    // Segment dividers
-                    painter.vline(
-                        rect.min.x + segment_width,
-                        rect.y_range(),
-                        egui::Stroke::new(1.0, egui::Color32::from_gray(60)),
-                    );
-                    painter.vline(
-                        rect.min.x + 2.0 * segment_width,
-                        rect.y_range(),
-                        egui::Stroke::new(1.0, egui::Color32::from_gray(60)),
-                    );
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(meter_width, meter_height), egui::Sense::hover());
+
+                if ui.is_rect_visible(rect) {
+                    let painter = ui.painter();
+                    // Background
+                    painter.rect_filled(rect, 2.0, egui::Color32::from_gray(30));
+                    // FFT level bar (cyan)
+                    let level_width = rect.width() * fft_level.clamp(0.0, 1.0);
+                    let level_rect = egui::Rect::from_min_size(rect.min, egui::vec2(level_width, meter_height));
+                    painter.rect_filled(level_rect, 2.0, egui::Color32::from_rgb(50, 180, 220));
+                }
+            });
+
+            ui.add_space(8.0);
+
+            // FFT Gain slider
+            ui.horizontal(|ui| {
+                ui.label("FFT Gain:");
+                let mut gain = settings.fft_gain;
+                let mut response = ui.add(
+                    egui::Slider::new(&mut gain, 0.1..=4.0)
+                        .logarithmic(true)
+                        .suffix("x")
+                        .clamping(egui::SliderClamping::Always),
+                );
+                super::widgets::add_reset_f32(&mut response, &mut gain, 1.0);
+                if response.changed() {
+                    actions.push(PropertiesAction::SetFftGain { gain });
                 }
             });
 

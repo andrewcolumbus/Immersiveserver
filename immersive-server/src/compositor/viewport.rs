@@ -100,6 +100,13 @@ impl Viewport {
     /// Handle right mouse button press
     /// Returns true if this was a double-click (should reset)
     pub fn on_right_mouse_down(&mut self, pos: (f32, f32)) -> bool {
+        tracing::debug!(
+            target: "viewport",
+            pos_x = pos.0,
+            pos_y = pos.1,
+            "right_mouse_down"
+        );
+
         let now = std::time::Instant::now();
         let is_double_click = self
             .last_right_click
@@ -107,6 +114,7 @@ impl Viewport {
             .unwrap_or(false);
 
         if is_double_click {
+            tracing::debug!(target: "viewport", "double_click_reset");
             self.reset();
             self.last_right_click = None;
             self.is_dragging = false;
@@ -123,6 +131,7 @@ impl Viewport {
 
     /// Handle right mouse button release
     pub fn on_right_mouse_up(&mut self) {
+        tracing::debug!(target: "viewport", "right_mouse_up");
         self.is_dragging = false;
         self.last_drag_pos = None;
     }
@@ -136,6 +145,18 @@ impl Viewport {
         pos: (f32, f32),
         window_size: (f32, f32),
         env_size: (f32, f32),
+    ) {
+        self.on_mouse_move_with_sensitivity(pos, window_size, env_size, 1.0);
+    }
+
+    /// Handle mouse movement during drag with configurable sensitivity
+    /// `pan_sensitivity` divides the delta (higher = less sensitive)
+    pub fn on_mouse_move_with_sensitivity(
+        &mut self,
+        pos: (f32, f32),
+        window_size: (f32, f32),
+        env_size: (f32, f32),
+        pan_sensitivity: f32,
     ) {
         if !self.is_dragging {
             return;
@@ -155,9 +176,24 @@ impl Viewport {
         let base_scale = Self::compute_base_scale(window_size, env_size);
         let effective_scale = base_scale * self.zoom;
 
-        // Delta in normalized environment coordinates
-        let norm_delta_x = delta_x / (window_size.0 * effective_scale);
-        let norm_delta_y = delta_y / (window_size.1 * effective_scale);
+        // Delta in normalized environment coordinates, divided by sensitivity
+        let norm_delta_x = delta_x / (window_size.0 * effective_scale * pan_sensitivity);
+        let norm_delta_y = delta_y / (window_size.1 * effective_scale * pan_sensitivity);
+
+        tracing::debug!(
+            target: "viewport",
+            delta_x = format!("{:.1}", delta_x),
+            delta_y = format!("{:.1}", delta_y),
+            norm_delta_x = format!("{:.4}", norm_delta_x),
+            norm_delta_y = format!("{:.4}", norm_delta_y),
+            window_w = window_size.0,
+            window_h = window_size.1,
+            env_w = env_size.0,
+            env_h = env_size.1,
+            sensitivity = pan_sensitivity,
+            zoom = format!("{:.2}", self.zoom),
+            "pan_move"
+        );
 
         // Calculate bounds and apply resistance if past them
         let (min_offset, max_offset) = self.compute_offset_bounds(window_size, env_size);
@@ -185,35 +221,45 @@ impl Viewport {
         _env_size: (f32, f32),
     ) {
         let old_zoom = self.zoom;
-        
+
         // Calculate new zoom
         let zoom_factor = if delta > 0.0 {
             ZOOM_STEP.powf(delta.abs().min(3.0))
         } else {
             1.0 / ZOOM_STEP.powf(delta.abs().min(3.0))
         };
-        
+
         self.zoom = (self.zoom * zoom_factor).clamp(MIN_ZOOM, MAX_ZOOM);
-        
+
         if (self.zoom - old_zoom).abs() < 0.0001 {
             return;
         }
-        
+
+        tracing::debug!(
+            target: "viewport",
+            delta = format!("{:.2}", delta),
+            old_zoom = format!("{:.2}", old_zoom),
+            new_zoom = format!("{:.2}", self.zoom),
+            cursor_x = cursor_pos.0,
+            cursor_y = cursor_pos.1,
+            "scroll_zoom"
+        );
+
         // Cursor-centered zoom: adjust offset so cursor stays over same env point
         // The shader does: adjusted_uv = (in.uv - 0.5) / scale + 0.5 + offset
         // Positive offset shifts sampling RIGHT, which visually shifts content LEFT
         // So we need to NEGATE to get intuitive behavior
-        
+
         // Cursor position in normalized window coords (-0.5 to 0.5 from center)
         let cursor_norm_x = (cursor_pos.0 / window_size.0) - 0.5;
         let cursor_norm_y = (cursor_pos.1 / window_size.1) - 0.5;
-        
+
         // Calculate offset delta to keep cursor over same point
         // When zooming, the point under cursor moves by: cursor_norm * (1/new_scale - 1/old_scale)
         // We need to compensate by adjusting offset in the OPPOSITE direction
         let offset_delta_x = cursor_norm_x * (1.0 / self.zoom - 1.0 / old_zoom);
         let offset_delta_y = cursor_norm_y * (1.0 / self.zoom - 1.0 / old_zoom);
-        
+
         self.offset.0 -= offset_delta_x;
         self.offset.1 -= offset_delta_y;
     }

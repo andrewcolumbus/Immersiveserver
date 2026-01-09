@@ -35,6 +35,7 @@ impl ThumbnailMode {
 
 /// Audio source type for FFT analysis
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "type", content = "value")]
 pub enum AudioSourceType {
     /// No audio source (disabled)
     #[default]
@@ -220,6 +221,11 @@ pub struct EnvironmentSettings {
     /// Audio source for FFT analysis and audio-reactive effects
     #[serde(rename = "audioSource", default)]
     pub audio_source: AudioSourceType,
+
+    /// FFT analysis gain multiplier (0.0 - 4.0, default 1.0)
+    /// Higher values make the audio meter more sensitive
+    #[serde(rename = "fftGain", default = "default_fft_gain")]
+    pub fft_gain: f32,
 }
 
 /// Default show BPM setting
@@ -262,6 +268,11 @@ fn default_api_port() -> u16 {
     8080
 }
 
+/// Default FFT gain multiplier
+fn default_fft_gain() -> f32 {
+    1.0
+}
+
 impl Default for EnvironmentSettings {
     fn default() -> Self {
         Self {
@@ -296,6 +307,7 @@ impl Default for EnvironmentSettings {
             test_pattern_enabled: false,
             bgra_pipeline_enabled: false, // Default to RGBA for compatibility
             audio_source: AudioSourceType::default(),
+            fft_gain: default_fft_gain(),
         }
     }
 }

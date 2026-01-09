@@ -9,10 +9,11 @@ use egui::PointerButton;
 
 use crate::audio::AudioBand;
 use crate::compositor::{BlendMode, ClipSource, ClipTransition, Environment, Layer, LoopMode};
-use crate::effects::{AutomationSource, EffectRegistry, EffectStack, FftSource, LfoSource, LfoShape, BeatSource, BeatTrigger, ParameterValue};
+use crate::effects::{AutomationSource, AutomationRange, EffectManager, EffectRegistry, EffectStack, FftSource, LfoSource, LfoShape, BeatSource, BeatTrigger, TimelineSource, TimelineDirection, TimelineMode, TimelineEasing, ParameterValue};
 use crate::layer_runtime::LayerVideoInfo;
 use crate::settings::{EnvironmentSettings, ThumbnailMode};
 use crate::ui::effects_browser_panel::DraggableEffect;
+use crate::ui::CrossWindowDragState;
 use egui_widgets::{video_scrubber, ScrubberAction, ScrubberState};
 
 /// Payload for dragging effects within the stack for reordering
@@ -190,6 +191,8 @@ pub enum PropertiesAction {
     // Audio source actions
     /// Audio source changed for FFT analysis
     SetAudioSource { source_type: crate::settings::AudioSourceType },
+    /// FFT gain (sensitivity) changed
+    SetFftGain { gain: f32 },
 }
 
 /// Context for rendering effect stacks (determines which PropertiesAction variants to emit)
@@ -258,6 +261,9 @@ impl PropertiesPanel {
     /// Render the properties panel
     ///
     /// Returns a list of actions to be processed by the app.
+    ///
+    /// The `cross_window_drag` parameter enables receiving drag-drop from effects
+    /// that originate in separate OS windows (undocked panels).
     pub fn render(
         &mut self,
         ui: &mut egui::Ui,
@@ -273,8 +279,12 @@ impl PropertiesPanel {
         bpm_clock: &crate::effects::BpmClock,
         effect_time: f32,
         audio_manager: Option<&crate::audio::AudioManager>,
+        // Effect manager for envelope state access
+        effect_manager: &EffectManager,
         // Video info for each layer (for transport controls)
         layer_video_info: &HashMap<u32, LayerVideoInfo>,
+        // Cross-window drag state for effects from undocked panels
+        cross_window_drag: &mut CrossWindowDragState,
     ) -> Vec<PropertiesAction> {
         let mut actions = Vec::new();
 
@@ -308,13 +318,13 @@ impl PropertiesPanel {
             .show(ui, |ui| {
                 match self.active_tab {
                     PropertiesTab::Environment => {
-                        self.render_environment_tab(ui, environment, settings, omt_broadcasting, ndi_broadcasting, texture_sharing_active, api_server_running, effect_registry, &mut actions, bpm_clock, effect_time, audio_manager);
+                        self.render_environment_tab(ui, environment, settings, omt_broadcasting, ndi_broadcasting, texture_sharing_active, api_server_running, effect_registry, &mut actions, bpm_clock, effect_time, audio_manager, effect_manager, cross_window_drag);
                     }
                     PropertiesTab::Layer => {
-                        self.render_layer_tab(ui, layers, effect_registry, &mut actions, bpm_clock, effect_time, audio_manager);
+                        self.render_layer_tab(ui, layers, effect_registry, &mut actions, bpm_clock, effect_time, audio_manager, effect_manager, cross_window_drag);
                     }
                     PropertiesTab::Clip => {
-                        self.render_clip_tab(ui, layers, effect_registry, &mut actions, bpm_clock, effect_time, audio_manager, layer_video_info);
+                        self.render_clip_tab(ui, layers, effect_registry, &mut actions, bpm_clock, effect_time, audio_manager, effect_manager, layer_video_info, cross_window_drag);
                     }
                 }
             });
@@ -337,6 +347,8 @@ impl PropertiesPanel {
         bpm_clock: &crate::effects::BpmClock,
         effect_time: f32,
         audio_manager: Option<&crate::audio::AudioManager>,
+        effect_manager: &EffectManager,
+        cross_window_drag: &mut CrossWindowDragState,
     ) {
         ui.heading("Master Effects");
         ui.add_space(4.0);
@@ -347,30 +359,7 @@ impl PropertiesPanel {
         );
         ui.add_space(8.0);
 
-        self.render_effect_stack_generic(ui, EffectContext::Environment, environment.effects(), effect_registry, actions, bpm_clock, effect_time, audio_manager);
-
-        ui.add_space(16.0);
-        ui.separator();
-        ui.add_space(8.0);
-
-        // Info about where other settings moved
-        ui.label(
-            egui::RichText::new("Other environment settings have moved to Preferences")
-                .small()
-                .weak(),
-        );
-        #[cfg(target_os = "macos")]
-        ui.label(
-            egui::RichText::new("Immersive Server → Preferences (⌘,)")
-                .small()
-                .weak(),
-        );
-        #[cfg(not(target_os = "macos"))]
-        ui.label(
-            egui::RichText::new("Edit → Preferences")
-                .small()
-                .weak(),
-        );
+        self.render_effect_stack_generic(ui, EffectContext::Environment, environment.effects(), effect_registry, actions, bpm_clock, effect_time, audio_manager, effect_manager, cross_window_drag);
     }
 
     /// Render the Layer tab
@@ -383,6 +372,8 @@ impl PropertiesPanel {
         bpm_clock: &crate::effects::BpmClock,
         effect_time: f32,
         audio_manager: Option<&crate::audio::AudioManager>,
+        effect_manager: &EffectManager,
+        cross_window_drag: &mut CrossWindowDragState,
     ) {
         // Layer selector
         ui.horizontal(|ui| {
@@ -637,7 +628,7 @@ impl PropertiesPanel {
         ui.heading("Effects");
         ui.add_space(8.0);
 
-        self.render_effect_stack_generic(ui, EffectContext::Layer { layer_id }, &layer.effects, effect_registry, actions, bpm_clock, effect_time, audio_manager);
+        self.render_effect_stack_generic(ui, EffectContext::Layer { layer_id }, &layer.effects, effect_registry, actions, bpm_clock, effect_time, audio_manager, effect_manager, cross_window_drag);
     }
 
     /// Render an effect stack for any context (layer, clip, or environment)
@@ -655,9 +646,15 @@ impl PropertiesPanel {
         bpm_clock: &crate::effects::BpmClock,
         effect_time: f32,
         audio_manager: Option<&crate::audio::AudioManager>,
+        // Effect manager for envelope state access
+        effect_manager: &EffectManager,
+        // Cross-window drag state for effects from undocked panels
+        cross_window_drag: &mut CrossWindowDragState,
     ) {
         // Check what type of drag is happening
-        let is_dragging_new_effect = egui::DragAndDrop::payload::<DraggableEffect>(ui.ctx()).is_some();
+        // Check both egui's same-context payload AND cross-window drag state
+        let egui_payload = egui::DragAndDrop::payload::<DraggableEffect>(ui.ctx()).is_some();
+        let is_dragging_new_effect = egui_payload || cross_window_drag.is_dragging_effect();
         let dragged_reorder = egui::DragAndDrop::payload::<DraggedEffectReorder>(ui.ctx());
         let is_dragging_reorder = dragged_reorder.is_some();
 
@@ -828,7 +825,7 @@ impl PropertiesPanel {
                             // Render parameters if expanded and not bypassed
                             if effect.expanded && !effect.bypassed {
                                 for param in &effect.parameters {
-                                    self.render_effect_parameter_generic(ui, context, effect.id, param, actions, bpm_clock, effect_time, audio_manager);
+                                    self.render_effect_parameter_generic(ui, context, effect.id, param, actions, bpm_clock, effect_time, audio_manager, effect_manager);
                                 }
                             }
 
@@ -875,8 +872,16 @@ impl PropertiesPanel {
         }
 
         // Handle dropped new effect from browser
+        // Check both egui's same-context payload AND cross-window drag state
         if let Some(dragged_effect) = drop_response.inner.1 {
+            // Same-window drop via egui
             self.push_add_action(actions, context, dragged_effect.effect_type.clone());
+        } else if drop_response.response.hovered() && !ui.input(|i| i.pointer.any_down()) {
+            // Cross-window drop: drop zone is hovered AND mouse was released
+            // AND we have a cross-window dragged effect
+            if let Some(dragged_effect) = cross_window_drag.take_dragged_effect() {
+                self.push_add_action(actions, context, dragged_effect.effect_type.clone());
+            }
         }
 
         ui.add_space(4.0);
@@ -916,6 +921,7 @@ impl PropertiesPanel {
         bpm_clock: &crate::effects::BpmClock,
         effect_time: f32,
         audio_manager: Option<&crate::audio::AudioManager>,
+        effect_manager: &EffectManager,
     ) {
         const GEAR_WIDTH: f32 = 20.0;
         const LABEL_WIDTH: f32 = 76.0; // Reduced from 80 to accommodate gear
@@ -928,6 +934,7 @@ impl PropertiesPanel {
                     Some(AutomationSource::Lfo(_)) => egui::Color32::from_rgb(255, 200, 50), // Gold for LFO
                     Some(AutomationSource::Beat(_)) => egui::Color32::from_rgb(50, 200, 255), // Cyan for Beat
                     Some(AutomationSource::Fft(_)) => egui::Color32::from_rgb(255, 80, 200), // Magenta for FFT
+                    Some(AutomationSource::Timeline(_)) => egui::Color32::from_rgb(100, 255, 100), // Green for Timeline
                     None => egui::Color32::from_gray(100), // Gray when inactive
                 };
 
@@ -954,6 +961,7 @@ impl PropertiesPanel {
                             Some(AutomationSource::Lfo(_)) => "LFO modulation active (click to edit)",
                             Some(AutomationSource::Beat(_)) => "Beat modulation active (click to edit)",
                             Some(AutomationSource::Fft(_)) => "FFT modulation active (click to edit)",
+                            Some(AutomationSource::Timeline(_)) => "Timeline modulation active (click to edit)",
                             None => "Click to add modulation",
                         };
                         response.clone().on_hover_text(tooltip);
@@ -993,61 +1001,150 @@ impl PropertiesPanel {
                     let mut val = *value;
                     let min = param.meta.min.unwrap_or(0.0);
                     let max = param.meta.max.unwrap_or(1.0);
+                    let range = max - min;
 
-                    // Value display
+                    // Convert context to parameters for effect_manager lookup
+                    let (layer_id, clip_slot) = match context {
+                        EffectContext::Layer { layer_id } => (Some(layer_id), None),
+                        EffectContext::Clip { layer_id, slot } => (None, Some((layer_id, slot))),
+                        EffectContext::Environment => (None, None),
+                    };
+
+                    // Calculate display value (base value + modulation) BEFORE the label
+                    // This uses envelope states from effect_manager for FFT/Beat
+                    let display_val = if let Some(automation) = &param.automation {
+                        match automation {
+                            AutomationSource::Lfo(lfo) => {
+                                // LFO: evaluate directly (modulates around base value)
+                                let lfo_value = lfo.evaluate(bpm_clock, effect_time);
+                                (val + lfo_value * range * 0.5).clamp(min, max)
+                            }
+                            AutomationSource::Beat(_beat) => {
+                                // Beat: use envelope value from effect_manager (0-1 mapped to range)
+                                if let Some(env_val) = effect_manager.get_beat_envelope_value(layer_id, clip_slot, effect_id, &param.meta.name) {
+                                    min + env_val * range
+                                } else {
+                                    val // Fallback to base value if no envelope state yet
+                                }
+                            }
+                            AutomationSource::Fft(fft) => {
+                                // FFT: use smoothed envelope value from effect_manager (0-1 mapped to range)
+                                if let Some(env_val) = effect_manager.get_fft_envelope_value(layer_id, clip_slot, effect_id, &param.meta.name) {
+                                    min + env_val * range
+                                } else if let Some(am) = audio_manager {
+                                    // Fallback: raw value if no envelope state yet
+                                    let raw = am.get_band_value(fft.band) * fft.gain;
+                                    min + raw.min(1.0) * range
+                                } else {
+                                    val
+                                }
+                            }
+                            AutomationSource::Timeline(_timeline) => {
+                                // Timeline: use envelope value from effect_manager (0-1 mapped to range)
+                                if let Some(env_val) = effect_manager.get_timeline_envelope_value(layer_id, clip_slot, effect_id, &param.meta.name) {
+                                    min + env_val * range
+                                } else {
+                                    val // Fallback to base value if no envelope state yet
+                                }
+                            }
+                        }
+                    } else {
+                        val
+                    };
+
+                    // Value display - show modulated value when automation is active
+                    let label_value = if param.automation.is_some() { display_val } else { val };
                     ui.label(
-                        egui::RichText::new(format!("{:.1}", val))
+                        egui::RichText::new(format!("{:.1}", label_value))
                             .color(egui::Color32::from_gray(200))
                             .monospace()
                     );
 
-                    // Custom slider with visible track
+                    // Get automation range if present
+                    let automation_range = param.automation.as_ref().map(|auto| match auto {
+                        AutomationSource::Lfo(lfo) => lfo.range,
+                        AutomationSource::Beat(beat) => beat.range,
+                        AutomationSource::Fft(fft) => fft.range,
+                        AutomationSource::Timeline(timeline) => timeline.range,
+                    });
+
+                    // Custom slider with visible track and range handles
                     let slider_width = ui.available_width() - 20.0; // Leave room for × button
+                    let slider_height = if automation_range.is_some() { 24.0 } else { 18.0 }; // Taller when range handles shown
                     let (rect, response) = ui.allocate_exact_size(
-                        egui::vec2(slider_width, 18.0),
+                        egui::vec2(slider_width, slider_height),
                         egui::Sense::click_and_drag()
                     );
+
+                    // Track range handles drag state via ID
+                    let range_drag_id = ui.make_persistent_id(format!("range_drag_{}_{}", effect_id, &param.meta.name));
+                    let dragging_min = ui.memory(|mem| mem.data.get_temp::<bool>(range_drag_id.with("min")).unwrap_or(false));
+                    let dragging_max = ui.memory(|mem| mem.data.get_temp::<bool>(range_drag_id.with("max")).unwrap_or(false));
 
                     if ui.is_rect_visible(rect) {
                         let painter = ui.painter();
 
                         // Draw track (the line)
-                        let track_y = rect.center().y;
+                        let track_y = rect.center().y - 3.0; // Offset up to make room for triangles
                         let track_left = rect.left() + 6.0;
                         let track_right = rect.right() - 6.0;
+                        let track_width = track_right - track_left;
+
                         painter.line_segment(
                             [egui::pos2(track_left, track_y), egui::pos2(track_right, track_y)],
                             egui::Stroke::new(2.0, egui::Color32::from_gray(60))
                         );
 
-                        // Calculate display value (base value + modulation)
-                        let display_val = if let Some(automation) = &param.automation {
-                            let mod_value = match automation {
-                                AutomationSource::Lfo(lfo) => lfo.evaluate(bpm_clock, effect_time),
-                                AutomationSource::Beat(_) => 0.0,
-                                AutomationSource::Fft(fft) => {
-                                    if let Some(am) = audio_manager {
-                                        am.get_band_value(fft.band) * fft.gain
-                                    } else {
-                                        0.0
-                                    }
-                                }
-                            };
-                            (val + mod_value * (max - min)).clamp(min, max)
-                        } else {
-                            val
-                        };
+                        // Draw range region if automation with range is active
+                        if let Some(auto_range) = &automation_range {
+                            let range_left_x = track_left + auto_range.min_limit * track_width;
+                            let range_right_x = track_left + auto_range.max_limit * track_width;
+
+                            // Draw highlighted range region on track
+                            painter.line_segment(
+                                [egui::pos2(range_left_x, track_y), egui::pos2(range_right_x, track_y)],
+                                egui::Stroke::new(3.0, egui::Color32::from_rgb(80, 140, 200))
+                            );
+
+                            // Draw triangular range handles below track
+                            let triangle_y = track_y + 8.0;
+                            let triangle_size = 5.0;
+
+                            // Min handle (left triangle ▲)
+                            let min_color = if dragging_min { egui::Color32::WHITE } else { egui::Color32::from_rgb(100, 180, 255) };
+                            painter.add(egui::Shape::convex_polygon(
+                                vec![
+                                    egui::pos2(range_left_x, triangle_y - triangle_size),
+                                    egui::pos2(range_left_x - triangle_size, triangle_y + triangle_size),
+                                    egui::pos2(range_left_x + triangle_size, triangle_y + triangle_size),
+                                ],
+                                min_color,
+                                egui::Stroke::NONE,
+                            ));
+
+                            // Max handle (right triangle ▲)
+                            let max_color = if dragging_max { egui::Color32::WHITE } else { egui::Color32::from_rgb(100, 180, 255) };
+                            painter.add(egui::Shape::convex_polygon(
+                                vec![
+                                    egui::pos2(range_right_x, triangle_y - triangle_size),
+                                    egui::pos2(range_right_x - triangle_size, triangle_y + triangle_size),
+                                    egui::pos2(range_right_x + triangle_size, triangle_y + triangle_size),
+                                ],
+                                max_color,
+                                egui::Stroke::NONE,
+                            ));
+                        }
 
                         // Draw filled portion (left of handle)
                         let norm = (display_val - min) / (max - min);
-                        let handle_x = track_left + norm * (track_right - track_left);
+                        let handle_x = track_left + norm * track_width;
                         painter.line_segment(
                             [egui::pos2(track_left, track_y), egui::pos2(handle_x, track_y)],
                             egui::Stroke::new(2.0, egui::Color32::from_gray(120))
                         );
 
                         // Draw handle (circle)
-                        let handle_color = if response.dragged() || response.hovered() {
+                        let handle_color = if response.dragged() && !dragging_min && !dragging_max || response.hovered() {
                             egui::Color32::WHITE
                         } else {
                             egui::Color32::from_gray(200)
@@ -1056,23 +1153,128 @@ impl PropertiesPanel {
                         painter.circle_stroke(egui::pos2(handle_x, track_y), 6.0, egui::Stroke::new(1.0, egui::Color32::from_gray(80)));
                     }
 
-                    // Handle drag interaction
-                    if response.dragged() {
-                        if let Some(pos) = response.interact_pointer_pos() {
-                            let track_left = rect.left() + 6.0;
-                            let track_right = rect.right() - 6.0;
-                            let norm = ((pos.x - track_left) / (track_right - track_left)).clamp(0.0, 1.0);
-                            val = min + norm * (max - min);
-                            self.push_param_action(actions, context, effect_id, param.meta.name.clone(), ParameterValue::Float(val));
+                    // Handle interactions
+                    if let Some(pos) = response.interact_pointer_pos() {
+                        let track_left = rect.left() + 6.0;
+                        let track_right = rect.right() - 6.0;
+                        let track_width = track_right - track_left;
+                        let track_y = rect.center().y - 3.0;
+                        let triangle_y = track_y + 8.0;
+
+                        if response.drag_started() {
+                            // Check if clicking on range handles
+                            if let Some(auto_range) = &automation_range {
+                                let range_left_x = track_left + auto_range.min_limit * track_width;
+                                let range_right_x = track_left + auto_range.max_limit * track_width;
+
+                                let dist_to_min = ((pos.x - range_left_x).powi(2) + (pos.y - triangle_y).powi(2)).sqrt();
+                                let dist_to_max = ((pos.x - range_right_x).powi(2) + (pos.y - triangle_y).powi(2)).sqrt();
+
+                                // Only drag range handle if clicking in lower portion of widget
+                                if pos.y > track_y + 2.0 {
+                                    if dist_to_min < 12.0 && dist_to_min < dist_to_max {
+                                        ui.memory_mut(|mem| mem.data.insert_temp(range_drag_id.with("min"), true));
+                                    } else if dist_to_max < 12.0 {
+                                        ui.memory_mut(|mem| mem.data.insert_temp(range_drag_id.with("max"), true));
+                                    }
+                                }
+                            }
+                        }
+
+                        if response.dragged() {
+                            let norm = ((pos.x - track_left) / track_width).clamp(0.0, 1.0);
+
+                            if dragging_min || dragging_max {
+                                // Dragging range handles
+                                if let Some(auto_range) = automation_range {
+                                    let mut new_range = auto_range;
+                                    if dragging_min {
+                                        new_range.min_limit = norm.min(new_range.max_limit - 0.01);
+                                    } else if dragging_max {
+                                        new_range.max_limit = norm.max(new_range.min_limit + 0.01);
+                                    }
+
+                                    // Update the automation with new range
+                                    if let Some(automation) = &param.automation {
+                                        let new_automation = match automation {
+                                            AutomationSource::Lfo(lfo) => {
+                                                let mut new_lfo = lfo.clone();
+                                                new_lfo.range = new_range;
+                                                AutomationSource::Lfo(new_lfo)
+                                            }
+                                            AutomationSource::Beat(beat) => {
+                                                let mut new_beat = beat.clone();
+                                                new_beat.range = new_range;
+                                                AutomationSource::Beat(new_beat)
+                                            }
+                                            AutomationSource::Fft(fft) => {
+                                                let mut new_fft = fft.clone();
+                                                new_fft.range = new_range;
+                                                AutomationSource::Fft(new_fft)
+                                            }
+                                            AutomationSource::Timeline(timeline) => {
+                                                let mut new_timeline = timeline.clone();
+                                                new_timeline.range = new_range;
+                                                AutomationSource::Timeline(new_timeline)
+                                            }
+                                        };
+                                        self.push_automation_action(actions, context, effect_id, param.meta.name.clone(), Some(new_automation));
+                                    }
+                                }
+                            } else {
+                                // Normal slider drag
+                                val = min + norm * (max - min);
+                                self.push_param_action(actions, context, effect_id, param.meta.name.clone(), ParameterValue::Float(val));
+                            }
+                        }
+
+                        if response.drag_stopped() {
+                            ui.memory_mut(|mem| {
+                                mem.data.insert_temp(range_drag_id.with("min"), false);
+                                mem.data.insert_temp(range_drag_id.with("max"), false);
+                            });
                         }
                     }
 
-                    // Right-click instantly resets to default
-                    if response.clicked_by(PointerButton::Secondary) {
+                    // Right-click context menu for reset
+                    response.context_menu(|ui| {
                         if let ParameterValue::Float(default_val) = param.meta.default {
-                            self.push_param_action(actions, context, effect_id, param.meta.name.clone(), ParameterValue::Float(default_val));
+                            if ui.button(format!("Reset to {:.2}", default_val)).clicked() {
+                                self.push_param_action(actions, context, effect_id, param.meta.name.clone(), ParameterValue::Float(default_val));
+                                ui.close_menu();
+                            }
                         }
-                    }
+                        if automation_range.is_some() {
+                            if ui.button("Reset range to full").clicked() {
+                                if let Some(automation) = &param.automation {
+                                    let new_automation = match automation {
+                                        AutomationSource::Lfo(lfo) => {
+                                            let mut new_lfo = lfo.clone();
+                                            new_lfo.range = AutomationRange::default();
+                                            AutomationSource::Lfo(new_lfo)
+                                        }
+                                        AutomationSource::Beat(beat) => {
+                                            let mut new_beat = beat.clone();
+                                            new_beat.range = AutomationRange::default();
+                                            AutomationSource::Beat(new_beat)
+                                        }
+                                        AutomationSource::Fft(fft) => {
+                                            let mut new_fft = fft.clone();
+                                            new_fft.range = AutomationRange::default();
+                                            AutomationSource::Fft(new_fft)
+                                        }
+                                        AutomationSource::Timeline(timeline) => {
+                                            let mut new_timeline = timeline.clone();
+                                            new_timeline.range = AutomationRange::default();
+                                            AutomationSource::Timeline(new_timeline)
+                                        }
+                                    };
+                                    self.push_automation_action(actions, context, effect_id, param.meta.name.clone(), Some(new_automation));
+                                }
+                                ui.close_menu();
+                            }
+                        }
+                    });
 
                 }
                 ParameterValue::Int(value) => {
@@ -1342,6 +1544,7 @@ impl PropertiesPanel {
         let is_lfo = matches!(&param.automation, Some(AutomationSource::Lfo(_)));
         let is_beat = matches!(&param.automation, Some(AutomationSource::Beat(_)));
         let is_fft = matches!(&param.automation, Some(AutomationSource::Fft(_)));
+        let is_timeline = matches!(&param.automation, Some(AutomationSource::Timeline(_)));
 
         // None option
         if ui.selectable_label(param.automation.is_none(), "None").clicked() {
@@ -1371,6 +1574,14 @@ impl PropertiesPanel {
         if ui.selectable_label(is_fft, fft_label).clicked() {
             if !is_fft {
                 self.push_automation_action(actions, context, effect_id, param.meta.name.clone(), Some(AutomationSource::Fft(FftSource::default())));
+            }
+        }
+
+        // Timeline option
+        let timeline_label = egui::RichText::new("Timeline").color(egui::Color32::from_rgb(100, 255, 100));
+        if ui.selectable_label(is_timeline, timeline_label).clicked() {
+            if !is_timeline {
+                self.push_automation_action(actions, context, effect_id, param.meta.name.clone(), Some(AutomationSource::Timeline(TimelineSource::default())));
             }
         }
     }
@@ -1685,6 +1896,80 @@ impl PropertiesPanel {
                     self.push_automation_action(actions, context, effect_id, param.meta.name.clone(), Some(AutomationSource::Fft(fft)));
                 }
             }
+
+            AutomationSource::Timeline(timeline) => {
+                let mut timeline = timeline.clone();
+                let default_timeline = TimelineSource::default();
+                let mut changed = false;
+
+                // Compact row: Timeline label, Duration, Direction/Mode/Easing combo
+                ui.horizontal(|ui| {
+                    ui.add_space(indent);
+                    ui.label(egui::RichText::new("Timeline").small().color(egui::Color32::from_rgb(100, 255, 100)));
+
+                    // Duration (more compact)
+                    let dur_response = ui.add(egui::DragValue::new(&mut timeline.duration_ms).speed(10.0).range(100.0..=60000.0).suffix("ms").min_decimals(0).max_decimals(0));
+                    if dur_response.changed() {
+                        changed = true;
+                    }
+                    if dur_response.clicked_by(PointerButton::Secondary) {
+                        timeline.duration_ms = default_timeline.duration_ms;
+                        changed = true;
+                    }
+
+                    // Direction (smaller width)
+                    let dir_response = egui::ComboBox::from_id_salt(format!("timeline_dir_{}_{}", effect_id, &param.meta.name))
+                        .selected_text(timeline.direction.name())
+                        .width(40.0)
+                        .show_ui(ui, |ui| {
+                            for dir in TimelineDirection::all() {
+                                if ui.selectable_value(&mut timeline.direction, *dir, dir.name()).changed() {
+                                    changed = true;
+                                }
+                            }
+                        });
+                    if dir_response.response.clicked_by(PointerButton::Secondary) {
+                        timeline.direction = default_timeline.direction;
+                        changed = true;
+                    }
+
+                    // Mode (smaller width)
+                    let mode_response = egui::ComboBox::from_id_salt(format!("timeline_mode_{}_{}", effect_id, &param.meta.name))
+                        .selected_text(timeline.mode.name())
+                        .width(45.0)
+                        .show_ui(ui, |ui| {
+                            for mode in TimelineMode::all() {
+                                if ui.selectable_value(&mut timeline.mode, *mode, mode.name()).changed() {
+                                    changed = true;
+                                }
+                            }
+                        });
+                    if mode_response.response.clicked_by(PointerButton::Secondary) {
+                        timeline.mode = default_timeline.mode;
+                        changed = true;
+                    }
+
+                    // Easing (smaller width)
+                    let easing_response = egui::ComboBox::from_id_salt(format!("timeline_easing_{}_{}", effect_id, &param.meta.name))
+                        .selected_text(timeline.easing.name())
+                        .width(60.0)
+                        .show_ui(ui, |ui| {
+                            for easing in TimelineEasing::all() {
+                                if ui.selectable_value(&mut timeline.easing, *easing, easing.name()).changed() {
+                                    changed = true;
+                                }
+                            }
+                        });
+                    if easing_response.response.clicked_by(PointerButton::Secondary) {
+                        timeline.easing = default_timeline.easing;
+                        changed = true;
+                    }
+                });
+
+                if changed {
+                    self.push_automation_action(actions, context, effect_id, param.meta.name.clone(), Some(AutomationSource::Timeline(timeline)));
+                }
+            }
         }
     }
 
@@ -1699,8 +1984,11 @@ impl PropertiesPanel {
         bpm_clock: &crate::effects::BpmClock,
         effect_time: f32,
         audio_manager: Option<&crate::audio::AudioManager>,
+        // Effect manager for envelope state access
+        effect_manager: &EffectManager,
         // Video info for transport controls
         layer_video_info: &HashMap<u32, LayerVideoInfo>,
+        cross_window_drag: &mut CrossWindowDragState,
     ) {
         // Get selected layer
         let Some(layer_id) = self.selected_layer_id else {
@@ -2025,7 +2313,7 @@ impl PropertiesPanel {
         ui.heading("Clip Effects");
         ui.add_space(8.0);
 
-        self.render_effect_stack_generic(ui, EffectContext::Clip { layer_id, slot }, &clip.effects, effect_registry, actions, bpm_clock, effect_time, audio_manager);
+        self.render_effect_stack_generic(ui, EffectContext::Clip { layer_id, slot }, &clip.effects, effect_registry, actions, bpm_clock, effect_time, audio_manager, effect_manager, cross_window_drag);
     }
 }
 

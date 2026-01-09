@@ -117,6 +117,87 @@ impl EffectManager {
         self.bpm_clock.update();
     }
 
+    // ========== Envelope Value Accessors for UI ==========
+
+    /// Get the current FFT envelope value for a parameter (for UI display)
+    ///
+    /// Returns the smoothed FFT value after attack/release processing.
+    /// Returns None if no envelope state exists for this parameter.
+    pub fn get_fft_envelope_value(
+        &self,
+        layer_id: Option<u32>,
+        clip_slot: Option<(u32, usize)>,
+        effect_id: u32,
+        param_name: &str,
+    ) -> Option<f32> {
+        if let Some((lid, slot)) = clip_slot {
+            self.clip_runtimes
+                .get(&(lid, slot))
+                .and_then(|r| r.get_fft_envelope_value(effect_id, param_name))
+        } else if let Some(lid) = layer_id {
+            self.layer_runtimes
+                .get(&lid)
+                .and_then(|r| r.get_fft_envelope_value(effect_id, param_name))
+        } else {
+            self.environment_runtime
+                .as_ref()
+                .and_then(|r| r.get_fft_envelope_value(effect_id, param_name))
+        }
+    }
+
+    /// Get the current Beat envelope value for a parameter (for UI display)
+    ///
+    /// Returns the ADSR envelope value (0-1).
+    /// Returns None if no envelope state exists for this parameter.
+    pub fn get_beat_envelope_value(
+        &self,
+        layer_id: Option<u32>,
+        clip_slot: Option<(u32, usize)>,
+        effect_id: u32,
+        param_name: &str,
+    ) -> Option<f32> {
+        if let Some((lid, slot)) = clip_slot {
+            self.clip_runtimes
+                .get(&(lid, slot))
+                .and_then(|r| r.get_beat_envelope_value(effect_id, param_name))
+        } else if let Some(lid) = layer_id {
+            self.layer_runtimes
+                .get(&lid)
+                .and_then(|r| r.get_beat_envelope_value(effect_id, param_name))
+        } else {
+            self.environment_runtime
+                .as_ref()
+                .and_then(|r| r.get_beat_envelope_value(effect_id, param_name))
+        }
+    }
+
+    /// Get the current timeline envelope value for a parameter (for UI display)
+    ///
+    /// Looks up the timeline envelope state from the appropriate runtime (clip, layer, or environment).
+    /// Returns the time-based ramp value (0-1).
+    /// Returns None if no envelope state exists for this parameter.
+    pub fn get_timeline_envelope_value(
+        &self,
+        layer_id: Option<u32>,
+        clip_slot: Option<(u32, usize)>,
+        effect_id: u32,
+        param_name: &str,
+    ) -> Option<f32> {
+        if let Some((lid, slot)) = clip_slot {
+            self.clip_runtimes
+                .get(&(lid, slot))
+                .and_then(|r| r.get_timeline_envelope_value(effect_id, param_name))
+        } else if let Some(lid) = layer_id {
+            self.layer_runtimes
+                .get(&lid)
+                .and_then(|r| r.get_timeline_envelope_value(effect_id, param_name))
+        } else {
+            self.environment_runtime
+                .as_ref()
+                .and_then(|r| r.get_timeline_envelope_value(effect_id, param_name))
+        }
+    }
+
     /// Initialize GPU resources for a layer's effects
     pub fn init_layer_effects(
         &mut self,
@@ -498,8 +579,9 @@ impl EffectManager {
         let params = self.build_params();
 
         if let Some(runtime) = &mut self.environment_runtime {
-            // For environment effects, we process in-place using ping-pong
-            runtime.process_with_automation(encoder, queue, device, texture, texture, stack, &params, &self.bpm_clock, audio_manager);
+            // Use in-place processing to avoid texture read/write conflicts
+            // (same texture cannot be both RESOURCE and COLOR_TARGET in same pass)
+            runtime.process_in_place_with_automation(encoder, queue, device, texture, stack, &params, &self.bpm_clock, audio_manager);
             true
         } else {
             false

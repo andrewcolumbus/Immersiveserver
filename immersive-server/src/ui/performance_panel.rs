@@ -26,11 +26,7 @@ pub struct PerformancePanel {
     cached_ndi_stats: Vec<NdiStats>,
 }
 
-impl Default for PerformancePanel {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+crate::impl_panel_default!(PerformancePanel);
 
 impl PerformancePanel {
     /// Create a new performance panel

@@ -270,6 +270,41 @@ impl WindowGpuContext {
     pub fn size(&self) -> (u32, u32) {
         (self.config.width, self.config.height)
     }
+
+    /// Sync font textures from a shared egui::Context.
+    ///
+    /// When sharing an egui::Context between multiple windows, each window's
+    /// renderer needs to have the font textures uploaded. This method extracts
+    /// the current font image from the context and registers it with this
+    /// renderer.
+    pub fn sync_fonts_from_context(
+        &mut self,
+        egui_ctx: &egui::Context,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) {
+        // Get the font image from the shared context
+        egui_ctx.fonts(|fonts| {
+            let font_image = fonts.image();
+
+            // Create a full image delta (position [0,0] means full replacement)
+            let image_delta = egui::epaint::ImageDelta::full(
+                font_image.clone(),
+                egui::TextureOptions::LINEAR,
+            );
+
+            // Create a textures delta with just the font texture
+            let textures_delta = egui::TexturesDelta {
+                set: vec![(egui::TextureId::Managed(0), image_delta)],
+                free: vec![],
+            };
+
+            // Upload to our renderer
+            for (id, image_delta) in &textures_delta.set {
+                self.egui_renderer.update_texture(device, queue, *id, image_delta);
+            }
+        });
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

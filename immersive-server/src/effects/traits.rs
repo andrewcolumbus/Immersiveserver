@@ -5,6 +5,9 @@
 //! - `GpuEffectRuntime` - Runtime trait for GPU shader-based effects
 //! - `CpuEffectRuntime` - Runtime trait for CPU-based effects
 
+use std::collections::HashMap;
+
+use super::automation::{BeatEnvelopeState, FftEnvelopeState, TimelineEnvelopeState};
 use super::{Parameter, ParameterMeta, ParameterValue, EffectInstance};
 
 /// The type of effect processor
@@ -258,6 +261,169 @@ impl EffectParams {
                 } else {
                     base_value
                 }
+            }
+            Some(AutomationSource::Timeline(_timeline)) => {
+                // Timeline automation needs envelope state tracking
+                // For now, return base value (full envelope support requires state)
+                base_value
+            }
+        }
+    }
+
+    /// Pack parameters with full automation and envelope state support
+    ///
+    /// This variant properly evaluates FFT, Beat, and Timeline automation using persistent
+    /// envelope states, providing smooth attack/release behavior.
+    ///
+    /// # Arguments
+    /// * `parameters` - List of parameters to pack
+    /// * `clock` - BPM clock for LFO/Beat automation
+    /// * `audio_manager` - Audio manager for FFT automation
+    /// * `delta_time` - Time since last frame for envelope updates
+    /// * `fft_envelopes` - Mutable map of FFT envelope states
+    /// * `beat_envelopes` - Mutable map of Beat envelope states
+    /// * `timeline_envelopes` - Mutable map of Timeline envelope states
+    /// * `effect_id` - Effect instance ID for envelope state keying
+    pub fn pack_parameters_with_automation_and_envelopes(
+        &mut self,
+        parameters: &[Parameter],
+        clock: &super::automation::BpmClock,
+        audio_manager: Option<&crate::audio::AudioManager>,
+        delta_time: f32,
+        fft_envelopes: &mut HashMap<(u32, String), FftEnvelopeState>,
+        beat_envelopes: &mut HashMap<(u32, String), BeatEnvelopeState>,
+        timeline_envelopes: &mut HashMap<(u32, String), TimelineEnvelopeState>,
+        effect_id: u32,
+    ) -> usize {
+        let mut offset = 0;
+        for param in parameters {
+            // Get the evaluated value (with automation if present)
+            let evaluated = self.evaluate_param_value_with_envelopes(
+                param,
+                clock,
+                audio_manager,
+                delta_time,
+                fft_envelopes,
+                beat_envelopes,
+                timeline_envelopes,
+                effect_id,
+            );
+
+            match &param.value {
+                ParameterValue::Float(_) => {
+                    self.set_float(offset, evaluated);
+                    offset += 1;
+                }
+                ParameterValue::Int(_) => {
+                    self.set_float(offset, evaluated);
+                    offset += 1;
+                }
+                ParameterValue::Bool(_) => {
+                    self.set_bool(offset, evaluated > 0.5);
+                    offset += 1;
+                }
+                ParameterValue::Vec2(v) => {
+                    self.set_vec2(offset, [evaluated, v[1]]);
+                    offset += 2;
+                }
+                ParameterValue::Vec3(v) => {
+                    self.set_vec3(offset, [evaluated, v[1], v[2]]);
+                    offset += 3;
+                }
+                ParameterValue::Color(v) => {
+                    if param.automation.is_some() {
+                        let base = param.value.as_f32();
+                        let factor = if base > 0.0 { evaluated / base } else { evaluated };
+                        self.set_color(offset, [
+                            (v[0] * factor).min(1.0),
+                            (v[1] * factor).min(1.0),
+                            (v[2] * factor).min(1.0),
+                            v[3],
+                        ]);
+                    } else {
+                        self.set_color(offset, *v);
+                    }
+                    offset += 4;
+                }
+                ParameterValue::Enum { .. } => {
+                    self.set_float(offset, evaluated);
+                    offset += 1;
+                }
+                ParameterValue::String(_) => {
+                    // String parameters are not passed to shaders
+                }
+            }
+            if offset >= self.params.len() {
+                break;
+            }
+        }
+        offset
+    }
+
+    /// Evaluate a single parameter's value with full envelope state support
+    fn evaluate_param_value_with_envelopes(
+        &self,
+        param: &Parameter,
+        clock: &super::automation::BpmClock,
+        audio_manager: Option<&crate::audio::AudioManager>,
+        delta_time: f32,
+        fft_envelopes: &mut HashMap<(u32, String), FftEnvelopeState>,
+        beat_envelopes: &mut HashMap<(u32, String), BeatEnvelopeState>,
+        timeline_envelopes: &mut HashMap<(u32, String), TimelineEnvelopeState>,
+        effect_id: u32,
+    ) -> f32 {
+        use super::types::AutomationSource;
+
+        let base_value = param.value.as_f32();
+        let min = param.meta.min.unwrap_or(0.0);
+        let max = param.meta.max.unwrap_or(1.0);
+        let range = max - min;
+
+        match &param.automation {
+            None => base_value,
+            Some(AutomationSource::Lfo(lfo)) => {
+                // LFO: evaluate directly (no persistent state needed)
+                let lfo_value = lfo.evaluate(clock, self.time);
+                // Normalize LFO output (-1 to 1) to (0 to 1), then apply range limits
+                let normalized = (lfo_value + 1.0) / 2.0;
+                let ranged = lfo.range.remap(normalized);
+                // Map to parameter range
+                min + ranged * range
+            }
+            Some(AutomationSource::Beat(beat)) => {
+                // Beat: get or create envelope state, update it, and use its value
+                let key = (effect_id, param.meta.name.clone());
+                let envelope = beat_envelopes.entry(key).or_default();
+                envelope.update(beat, clock, delta_time);
+                // Apply range limits to envelope value (0-1)
+                let ranged = beat.range.remap(envelope.value());
+                // Map to parameter range
+                min + ranged * range
+            }
+            Some(AutomationSource::Fft(fft)) => {
+                if let Some(manager) = audio_manager {
+                    // FFT: get or create envelope state, update with raw value, use smoothed result
+                    let key = (effect_id, param.meta.name.clone());
+                    let envelope = fft_envelopes.entry(key).or_default();
+                    let raw = manager.get_band_value(fft.band);
+                    envelope.update(fft, raw, delta_time);
+                    // Apply range limits to envelope value (0-1 after gain)
+                    let ranged = fft.range.remap(envelope.value());
+                    // Map to parameter range
+                    min + ranged * range
+                } else {
+                    base_value
+                }
+            }
+            Some(AutomationSource::Timeline(timeline)) => {
+                // Timeline: get or create envelope state, update it, and use its value
+                let key = (effect_id, param.meta.name.clone());
+                let envelope = timeline_envelopes.entry(key).or_default();
+                envelope.update(timeline);
+                // Apply range limits to envelope value (0-1)
+                let ranged = timeline.range.remap(envelope.value());
+                // Map to parameter range
+                min + ranged * range
             }
         }
     }

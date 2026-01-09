@@ -2,34 +2,28 @@
 //!
 //! Extracts audio from OMT receiver streams and provides it to the FFT analyzer.
 
-use super::source::{AudioSource, AudioSourceState};
+use super::source::{AudioSource, AudioSourceState, BaseAudioSource};
 use super::types::{AudioBuffer, AudioSourceId};
 use std::sync::Arc;
 
-/// Buffer size in samples (~100ms at 48kHz stereo)
-const BUFFER_SIZE: usize = 48000 * 2 / 10;
-
 /// OMT audio source - extracts audio from OMT receiver
 pub struct OmtAudioSource {
-    id: AudioSourceId,
-    state: Arc<AudioSourceState>,
+    base: BaseAudioSource,
     source_address: String,
 }
 
 impl OmtAudioSource {
     /// Create a new OMT audio source
     pub fn new(address: &str) -> Self {
-        let state = Arc::new(AudioSourceState::new(BUFFER_SIZE, 48000, 2));
         Self {
-            id: AudioSourceId::Omt(address.to_string()),
-            state,
+            base: BaseAudioSource::new(AudioSourceId::Omt(address.to_string())),
             source_address: address.to_string(),
         }
     }
 
     /// Get the shared audio state (for passing to OMT receiver thread)
     pub fn state(&self) -> Arc<AudioSourceState> {
-        Arc::clone(&self.state)
+        self.base.state()
     }
 
     /// Get the source address
@@ -40,7 +34,7 @@ impl OmtAudioSource {
 
 impl AudioSource for OmtAudioSource {
     fn id(&self) -> &AudioSourceId {
-        &self.id
+        &self.base.id
     }
 
     fn display_name(&self) -> String {
@@ -48,55 +42,27 @@ impl AudioSource for OmtAudioSource {
     }
 
     fn sample_rate(&self) -> u32 {
-        self.state
-            .buffer
-            .lock()
-            .map(|b| b.sample_rate())
-            .unwrap_or(48000)
+        self.base.sample_rate()
     }
 
     fn channels(&self) -> u32 {
-        self.state
-            .buffer
-            .lock()
-            .map(|b| b.channels())
-            .unwrap_or(2)
+        self.base.channels()
     }
 
     fn is_active(&self) -> bool {
-        self.state.is_active()
+        self.base.is_active()
     }
 
     fn take_samples(&self) -> Option<AudioBuffer> {
-        let mut guard = self.state.buffer.lock().ok()?;
-        let available = guard.available();
-
-        if available < 1024 {
-            // Minimum samples for useful FFT
-            return None;
-        }
-
-        let sample_rate = guard.sample_rate();
-        let channels = guard.channels();
-
-        let mut samples = Vec::new();
-        guard.read(&mut samples);
-
-        Some(AudioBuffer {
-            samples,
-            sample_rate,
-            channels,
-        })
+        self.base.take_samples()
     }
 
     fn start(&self) -> Result<(), String> {
-        self.state.set_running(true);
-        Ok(())
+        self.base.start()
     }
 
     fn stop(&self) {
-        self.state.set_running(false);
-        self.state.set_active(false);
+        self.base.stop()
     }
 }
 

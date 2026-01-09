@@ -59,6 +59,9 @@ pub enum MenuItemId {
 
     // Windows
     AdvancedOutput,
+
+    // Environment viewport
+    BreakoutEnvironment,
 }
 
 impl MenuItemId {
@@ -84,6 +87,7 @@ impl MenuItemId {
             Self::LayoutReset => "layout_reset".into(),
             Self::HapConverter => "tools_hap_converter".into(),
             Self::AdvancedOutput => "view_advanced_output".into(),
+            Self::BreakoutEnvironment => "view_breakout_environment".into(),
         }
     }
 
@@ -108,6 +112,7 @@ impl MenuItemId {
             "layout_reset" => Some(Self::LayoutReset),
             "tools_hap_converter" => Some(Self::HapConverter),
             "view_advanced_output" => Some(Self::AdvancedOutput),
+            "view_breakout_environment" => Some(Self::BreakoutEnvironment),
             _ if s.starts_with("layout_preset_") => s
                 .strip_prefix("layout_preset_")
                 .and_then(|n| n.parse().ok())
@@ -166,6 +171,7 @@ impl MenuItemId {
             Self::LayoutReset => MenuItemAction::Menu(MenuAction::ResetLayout),
             Self::HapConverter => MenuItemAction::Menu(MenuAction::OpenHAPConverter),
             Self::AdvancedOutput => MenuItemAction::Menu(MenuAction::OpenAdvancedOutput),
+            Self::BreakoutEnvironment => MenuItemAction::Menu(MenuAction::BreakoutEnvironment),
         }
     }
 }
@@ -477,6 +483,12 @@ impl MenuBarDefinition {
                 MenuItem::Action {
                     id: MenuItemId::AdvancedOutput,
                     label: "Advanced Output...".into(),
+                    shortcut: None,
+                    enabled: true,
+                },
+                MenuItem::Action {
+                    id: MenuItemId::BreakoutEnvironment,
+                    label: "Breakout Environment".into(),
                     shortcut: None,
                     enabled: true,
                 },

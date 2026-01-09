@@ -8,6 +8,7 @@
 //! Effects are organized by category and can be searched.
 
 use crate::effects::EffectRegistry;
+use super::CrossWindowDragState;
 
 /// Represents an effect that can be dragged to a layer or clip
 #[derive(Debug, Clone)]
@@ -112,16 +113,26 @@ impl EffectsBrowserPanel {
     }
 
     /// Render the effects browser panel contents
+    ///
+    /// The `cross_window_drag` parameter enables drag-and-drop to work across
+    /// different OS windows (e.g., dragging from an undocked Effects Browser
+    /// to the docked Properties panel).
     pub fn render_contents(
         &mut self,
         ui: &mut egui::Ui,
         registry: &EffectRegistry,
+        cross_window_drag: &mut CrossWindowDragState,
     ) -> Vec<EffectsBrowserAction> {
         let actions = Vec::new();
 
         // Refresh cache if needed
         if self.cache_dirty {
             self.refresh_cache(registry);
+        }
+
+        // Clear cross-window drag state if mouse button is released
+        if !ui.input(|i| i.pointer.any_down()) {
+            cross_window_drag.clear();
         }
 
         // Search box
@@ -170,7 +181,7 @@ impl EffectsBrowserPanel {
                         egui::RichText::new(format!("📁 {}", category)).strong(),
                         |ui| {
                             for effect in filtered_effects {
-                                Self::render_effect_item(ui, effect);
+                                Self::render_effect_item(ui, effect, cross_window_drag);
                             }
                         },
                     )
@@ -203,7 +214,11 @@ impl EffectsBrowserPanel {
     }
 
     /// Render a single effect item (draggable)
-    fn render_effect_item(ui: &mut egui::Ui, effect: &DraggableEffect) {
+    fn render_effect_item(
+        ui: &mut egui::Ui,
+        effect: &DraggableEffect,
+        cross_window_drag: &mut CrossWindowDragState,
+    ) {
         let effect_id = egui::Id::new(&effect.effect_type).with("effect_browser_item");
 
         // Effect icon based on category
@@ -217,15 +232,20 @@ impl EffectsBrowserPanel {
         };
 
         // Use egui's drag-and-drop source
-        let response = ui
-            .dnd_drag_source(effect_id, effect.clone(), |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(icon);
-                    ui.label(&effect.name);
-                });
-            })
-            .response
-            .on_hover_text(effect.tooltip());
+        let drag_response = ui.dnd_drag_source(effect_id, effect.clone(), |ui| {
+            ui.horizontal(|ui| {
+                ui.label(icon);
+                ui.label(&effect.name);
+            });
+        });
+
+        // If this effect is being dragged, update cross-window state
+        // This enables drag-drop to work when panels are in separate OS windows
+        if drag_response.response.dragged() {
+            cross_window_drag.set_dragged_effect(effect.clone());
+        }
+
+        let response = drag_response.response.on_hover_text(effect.tooltip());
 
         // Context menu
         response.context_menu(|ui| {

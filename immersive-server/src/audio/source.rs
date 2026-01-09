@@ -2,7 +2,7 @@
 
 use super::types::{AudioBuffer, AudioSourceId};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// Trait for audio input sources
 pub trait AudioSource: Send + Sync {
@@ -24,6 +24,12 @@ pub trait AudioSource: Send + Sync {
     /// Get available audio samples (non-blocking)
     /// Returns None if no new samples available
     fn take_samples(&self) -> Option<AudioBuffer>;
+
+    /// Get current raw input peak level (0.0 - 1.0)
+    /// Returns 0.0 if not available
+    fn get_peak_level(&self) -> f32 {
+        0.0 // Default implementation
+    }
 
     /// Start capturing audio (if not auto-started)
     fn start(&self) -> Result<(), String>;
@@ -68,6 +74,89 @@ impl AudioSourceState {
     }
 }
 
+/// Base audio source providing common implementations for simple streaming sources.
+/// Use this for sources that receive audio data from external threads (OMT, NDI, etc.)
+pub struct BaseAudioSource {
+    pub id: AudioSourceId,
+    pub state: Arc<AudioSourceState>,
+}
+
+impl BaseAudioSource {
+    /// Create a new base audio source with standard buffer size (~100ms at 48kHz stereo)
+    pub fn new(id: AudioSourceId) -> Self {
+        const BUFFER_SIZE: usize = 48000 * 2 / 10;
+        Self {
+            id,
+            state: Arc::new(AudioSourceState::new(BUFFER_SIZE, 48000, 2)),
+        }
+    }
+
+    /// Get the shared state for passing to receiver threads
+    pub fn state(&self) -> Arc<AudioSourceState> {
+        Arc::clone(&self.state)
+    }
+
+    /// Get sample rate from the buffer
+    pub fn sample_rate(&self) -> u32 {
+        self.state
+            .buffer
+            .lock()
+            .map(|b| b.sample_rate())
+            .unwrap_or(48000)
+    }
+
+    /// Get channel count from the buffer
+    pub fn channels(&self) -> u32 {
+        self.state
+            .buffer
+            .lock()
+            .map(|b| b.channels())
+            .unwrap_or(2)
+    }
+
+    /// Check if source is actively receiving data
+    pub fn is_active(&self) -> bool {
+        self.state.is_active()
+    }
+
+    /// Take available samples for FFT analysis
+    /// Requires enough samples for stereo-to-mono conversion + FFT (2048 mono samples)
+    pub fn take_samples(&self) -> Option<AudioBuffer> {
+        let mut guard = self.state.buffer.lock().ok()?;
+        let available = guard.available();
+
+        // FFT needs 2048 mono samples. For stereo input, we need 2048 * 2 = 4096 interleaved samples
+        const FFT_MIN_SAMPLES: usize = 2048 * 2;
+        if available < FFT_MIN_SAMPLES {
+            return None;
+        }
+
+        let sample_rate = guard.sample_rate();
+        let channels = guard.channels();
+
+        let mut samples = Vec::new();
+        guard.read(&mut samples);
+
+        Some(AudioBuffer {
+            samples,
+            sample_rate,
+            channels,
+        })
+    }
+
+    /// Start the source (set running flag)
+    pub fn start(&self) -> Result<(), String> {
+        self.state.set_running(true);
+        Ok(())
+    }
+
+    /// Stop the source (clear running and active flags)
+    pub fn stop(&self) {
+        self.state.set_running(false);
+        self.state.set_active(false);
+    }
+}
+
 /// Simple ring buffer for audio samples
 pub struct AudioRingBuffer {
     data: Vec<f32>,
@@ -78,6 +167,8 @@ pub struct AudioRingBuffer {
     channels: u32,
     /// Track how many samples are available
     available: usize,
+    /// Peak level since last reset (0.0 - 1.0)
+    peak_level: f32,
 }
 
 impl AudioRingBuffer {
@@ -90,6 +181,7 @@ impl AudioRingBuffer {
             sample_rate,
             channels,
             available: 0,
+            peak_level: 0.0,
         }
     }
 
@@ -103,6 +195,12 @@ impl AudioRingBuffer {
         for &sample in samples {
             self.data[self.write_pos] = sample;
             self.write_pos = (self.write_pos + 1) % self.capacity;
+
+            // Track peak level (absolute value)
+            let abs = sample.abs();
+            if abs > self.peak_level {
+                self.peak_level = abs;
+            }
 
             // Track available samples, cap at capacity
             if self.available < self.capacity {
@@ -162,6 +260,21 @@ impl AudioRingBuffer {
 
     pub fn channels(&self) -> u32 {
         self.channels
+    }
+
+    /// Get the current peak level (0.0 - 1.0)
+    pub fn peak_level(&self) -> f32 {
+        self.peak_level.min(1.0)
+    }
+
+    /// Take the peak level (returns current value, decay is handled separately)
+    pub fn take_peak_level(&mut self) -> f32 {
+        self.peak_level.min(1.0)
+    }
+
+    /// Apply decay to peak level (call once per update frame)
+    pub fn decay_peak_level(&mut self) {
+        self.peak_level *= 0.85;
     }
 }
 
