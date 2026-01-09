@@ -12,6 +12,7 @@ use crate::compositor::Layer;
 use crate::effects::EffectStack;
 use crate::output::{OutputPresetReference, Screen, ScreenId, SliceId};
 use crate::previs::PrevisSettings;
+use crate::ui::tiled_layout::TiledLayout;
 
 /// Thumbnail display mode for clip grid cells
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -226,6 +227,11 @@ pub struct EnvironmentSettings {
     /// Higher values make the audio meter more sensitive
     #[serde(rename = "fftGain", default = "default_fft_gain")]
     pub fft_gain: f32,
+
+    /// Tiled layout configuration (UI panel arrangement)
+    /// Optional - if not present, uses app preferences or default layout
+    #[serde(rename = "tiledLayout", default, skip_serializing_if = "Option::is_none")]
+    pub tiled_layout: Option<TiledLayout>,
 }
 
 /// Default show BPM setting
@@ -308,6 +314,7 @@ impl Default for EnvironmentSettings {
             bgra_pipeline_enabled: false, // Default to RGBA for compatibility
             audio_source: AudioSourceType::default(),
             fft_gain: default_fft_gain(),
+            tiled_layout: None,
         }
     }
 }
@@ -369,12 +376,20 @@ impl EnvironmentSettings {
 #[serde(rename = "ImmersivePreferences")]
 pub struct AppPreferences {
     /// Path to the last opened .immersive file
-    #[serde(rename = "lastOpenedFile")]
+    #[serde(rename = "lastOpenedFile", default, skip_serializing_if = "Option::is_none")]
     pub last_opened_file: Option<String>,
-    
+
     /// Last output folder used by HAP Converter
-    #[serde(rename = "converterOutputDir", default)]
+    #[serde(rename = "converterOutputDir", default, skip_serializing_if = "Option::is_none")]
     pub converter_output_dir: Option<String>,
+
+    /// Whether tiled layout mode is enabled
+    #[serde(rename = "useTiledLayout", default)]
+    pub use_tiled_layout: bool,
+
+    /// Saved tiled layout configuration
+    #[serde(rename = "tiledLayout", default, skip_serializing_if = "Option::is_none")]
+    pub tiled_layout: Option<TiledLayout>,
 }
 
 impl AppPreferences {
@@ -414,28 +429,21 @@ impl AppPreferences {
             fs::create_dir_all(parent).map_err(SettingsError::Io)?;
         }
 
-        let last_file = self
-            .last_opened_file
-            .as_deref()
-            .unwrap_or("");
-        
-        let converter_dir = self
-            .converter_output_dir
-            .as_deref()
-            .unwrap_or("");
-
-        let formatted = format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>
-<ImmersivePreferences>
-    <lastOpenedFile>{}</lastOpenedFile>
-    <converterOutputDir>{}</converterOutputDir>
-</ImmersivePreferences>
-"#,
-            last_file, converter_dir
-        );
+        // Use proper XML serialization to handle complex nested structures
+        let xml = to_string(self).map_err(SettingsError::XmlWrite)?;
+        let formatted = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{}", xml);
 
         fs::write(&path, formatted).map_err(SettingsError::Io)?;
         Ok(())
+    }
+
+    /// Save the tiled layout to preferences
+    pub fn save_tiled_layout(&mut self, layout: &TiledLayout, enabled: bool) {
+        self.tiled_layout = Some(layout.clone());
+        self.use_tiled_layout = enabled;
+        if let Err(e) = self.save() {
+            tracing::warn!("Failed to save tiled layout preferences: {:?}", e);
+        }
     }
 
     /// Set the last opened file and save

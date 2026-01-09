@@ -45,6 +45,8 @@ pub enum PrevisAction {
 
 /// State for the previs panel
 pub struct PrevisPanel {
+    /// Whether the panel is open (for floating window mode)
+    pub open: bool,
     /// egui texture ID for the rendered 3D view
     pub texture_id: Option<egui::TextureId>,
     /// Size of the 3D viewport in the panel (in logical pixels)
@@ -63,6 +65,7 @@ impl PrevisPanel {
     /// Create a new previs panel
     pub fn new() -> Self {
         Self {
+            open: false,
             texture_id: None,
             viewport_size: (320.0, 240.0),
             is_dragging: false,
@@ -406,5 +409,36 @@ impl PrevisPanel {
     /// Check if currently dragging
     pub fn is_dragging(&self) -> bool {
         self.is_dragging
+    }
+
+    /// Render as a floating window (like Performance panel)
+    ///
+    /// Returns a list of actions to be handled by the app.
+    pub fn render_floating(
+        &mut self,
+        ctx: &egui::Context,
+        settings: &PrevisSettings,
+        renderer: &mut PrevisRenderer,
+    ) -> Vec<PrevisAction> {
+        let mut all_actions = Vec::new();
+
+        if !self.open {
+            return all_actions;
+        }
+
+        let mut open = self.open;
+        egui::Window::new("3D Previs")
+            .id(egui::Id::new("previs_floating_window"))
+            .default_size([400.0, 450.0])
+            .resizable(true)
+            .collapsible(true)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                let actions = self.render(ui, settings, renderer);
+                all_actions.extend(actions);
+            });
+
+        self.open = open;
+        all_actions
     }
 }

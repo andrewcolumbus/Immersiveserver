@@ -5,7 +5,7 @@
 
 use std::time::Instant;
 
-use super::types::{AutomationSource, BeatSource, BeatTrigger, FftSource, LfoShape, LfoSource, Parameter, TimelineSource, TimelineMode, TimelineDirection};
+use super::types::{AutomationRange, AutomationSource, BeatSource, BeatTrigger, FftSource, LfoShape, LfoSource, Parameter, TimelineSource, TimelineMode, TimelineDirection};
 use crate::audio::AudioManager;
 
 /// Global BPM clock for synchronizing automation
@@ -639,6 +639,7 @@ mod tests {
             offset: 0.0,
             sync_to_bpm: false,
             beats: 4.0,
+            range: AutomationRange::default(),
         };
 
         let clock = BpmClock::new(120.0);
@@ -662,6 +663,7 @@ mod tests {
             offset: 0.5,
             sync_to_bpm: false,
             beats: 4.0,
+            range: AutomationRange::default(),
         };
 
         let clock = BpmClock::new(120.0);
@@ -683,6 +685,7 @@ mod tests {
             decay_ms: 50.0,
             sustain: 0.5,
             release_ms: 100.0,
+            range: AutomationRange::default(),
         };
 
         let mut state = BeatEnvelopeState::default();

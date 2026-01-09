@@ -86,6 +86,8 @@ pub struct App {
     viewport: Viewport,
     /// Separate viewport for floating environment window (avoids coordinate conflict with main window)
     floating_env_viewport: Viewport,
+    /// Separate viewport for tiled layout environment (avoids coordinate conflict with main viewport)
+    tiled_env_viewport: Viewport,
     /// Current mouse position in window pixels
     cursor_position: (f32, f32),
     /// Last frame time for viewport animation
@@ -150,8 +152,19 @@ pub struct App {
     pub use_native_menu: bool,
     /// Clip grid panel for triggering clips
     pub clip_grid_panel: crate::ui::ClipGridPanel,
-    /// Docking manager for detachable/resizable panels
+    /// Docking manager for detachable/resizable panels (legacy)
     pub dock_manager: crate::ui::DockManager,
+    /// Tiled layout manager for new grid-based panel layout
+    pub tiled_layout: crate::ui::TiledLayout,
+    /// Divider drag state for tiled layout
+    pub divider_drag_state: crate::ui::DividerDragState,
+    /// Panel drag state for moving panels between cells
+    pub panel_drag_state: crate::ui::PanelDragState,
+    /// Whether to use the new tiled layout (vs legacy dock manager)
+    pub use_tiled_layout: bool,
+    /// Pending layout choice when opening a file with different layout than preferences
+    /// Contains (project_layout, project_enabled) - shown in dialog
+    pub pending_layout_choice: Option<(crate::ui::TiledLayout, bool)>,
     /// Properties panel (Environment/Layer/Clip tabs)
     pub properties_panel: crate::ui::PropertiesPanel,
     /// Sources panel for drag-and-drop of OMT/NDI sources
@@ -205,6 +218,7 @@ pub struct App {
 
     // Settings
     pub settings: EnvironmentSettings,
+    pub app_preferences: crate::settings::AppPreferences,
     pub current_file: Option<std::path::PathBuf>,
 
     // Layer rendering
@@ -312,6 +326,9 @@ impl App {
     /// Create a new App instance with initialized wgpu context
     pub async fn new(window: Arc<Window>, settings: EnvironmentSettings) -> Self {
         let size = window.inner_size();
+
+        // Load app preferences (for tiled layout, etc.)
+        let app_preferences = crate::settings::AppPreferences::load();
 
         // Create wgpu instance
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
@@ -570,6 +587,7 @@ impl App {
             environment,
             viewport: Viewport::new(),
             floating_env_viewport: Viewport::new(),
+            tiled_env_viewport: Viewport::new(),
             cursor_position: (0.0, 0.0),
             last_frame_time: now,
             environment_broken_out: false,
@@ -660,6 +678,12 @@ impl App {
                 ));
                 dm
             },
+            tiled_layout: app_preferences.tiled_layout.clone()
+                .unwrap_or_else(crate::ui::TiledLayout::default_layout),
+            divider_drag_state: crate::ui::DividerDragState::default(),
+            panel_drag_state: crate::ui::PanelDragState::default(),
+            use_tiled_layout: app_preferences.use_tiled_layout,
+            pending_layout_choice: None,
             properties_panel: crate::ui::PropertiesPanel::new(),
             sources_panel: crate::ui::SourcesPanel::new(),
             effects_browser_panel: crate::ui::EffectsBrowserPanel::new(),
@@ -690,6 +714,7 @@ impl App {
                 manager
             },
             settings,
+            app_preferences,
             current_file: None,
             video_renderer,
             layer_runtimes: HashMap::new(),
@@ -1676,7 +1701,7 @@ impl App {
         }
     }
 
-    /// Sync layers, effects, and screens from environment to settings (for saving)
+    /// Sync layers, effects, screens, and layout from environment to settings (for saving)
     pub fn sync_layers_to_settings(&mut self) {
         let layers: Vec<_> = self.environment.layers().to_vec();
         self.settings.set_layers(&layers);
@@ -1685,6 +1710,12 @@ impl App {
         // Also sync screens from output manager
         if let Some(manager) = &self.output_manager {
             self.settings.screens = manager.export_screens();
+        }
+        // Sync tiled layout if in tiled mode
+        if self.use_tiled_layout {
+            self.settings.tiled_layout = Some(self.tiled_layout.clone());
+        } else {
+            self.settings.tiled_layout = None;
         }
     }
 
@@ -1746,6 +1777,91 @@ impl App {
         *self.environment.effects_mut() = self.settings.effects.clone();
         if !self.settings.effects.is_empty() {
             tracing::info!("Restored {} master effects from settings", self.settings.effects.len());
+        }
+    }
+
+    /// Check if loaded settings have a different layout than app preferences
+    /// Returns true if there's a mismatch that needs user decision
+    pub fn check_layout_mismatch(&mut self) -> bool {
+        // Only check if the project has a saved layout
+        let Some(project_layout) = &self.settings.tiled_layout else {
+            return false;
+        };
+
+        // Check if we have a preference layout to compare against
+        let pref_layout = &self.app_preferences.tiled_layout;
+
+        // Simple mismatch detection: different panel counts or layouts differ
+        // For a more thorough check, we'd compare the entire tree structure
+        let has_mismatch = match pref_layout {
+            Some(pref) => {
+                let project_panels = project_layout.all_panel_ids();
+                let pref_panels = pref.all_panel_ids();
+                project_panels != pref_panels
+            }
+            None => true, // No preference layout means project has one but we don't
+        };
+
+        if has_mismatch {
+            // Store the project layout for the dialog
+            self.pending_layout_choice = Some((project_layout.clone(), true));
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Apply the user's layout choice (from project or keep preferences)
+    pub fn apply_layout_choice(&mut self, use_project_layout: bool) {
+        if let Some((project_layout, project_enabled)) = self.pending_layout_choice.take() {
+            if use_project_layout {
+                // Apply project layout
+                self.tiled_layout = project_layout;
+                self.use_tiled_layout = project_enabled;
+                self.menu_bar.set_status("Applied project layout");
+            } else {
+                // Keep preferences layout (already loaded at startup)
+                self.menu_bar.set_status("Kept preferences layout");
+            }
+        }
+    }
+
+    /// Render the layout choice dialog if there's a pending choice
+    pub fn render_layout_choice_dialog(&mut self, ctx: &egui::Context) {
+        if self.pending_layout_choice.is_none() {
+            return;
+        }
+
+        let mut choice: Option<bool> = None;
+
+        egui::Window::new("Layout Difference Detected")
+            .id(egui::Id::new("layout_choice_dialog"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(10.0);
+                    ui.label("This project has a saved panel layout that differs from your preferences.");
+                    ui.add_space(10.0);
+                    ui.label("Which layout would you like to use?");
+                    ui.add_space(15.0);
+
+                    ui.horizontal(|ui| {
+                        if ui.button("📁 Use Project Layout").clicked() {
+                            choice = Some(true);
+                        }
+                        ui.add_space(10.0);
+                        if ui.button("⚙ Keep My Preferences").clicked() {
+                            choice = Some(false);
+                        }
+                    });
+                    ui.add_space(10.0);
+                });
+            });
+
+        if let Some(use_project) = choice {
+            self.apply_layout_choice(use_project);
         }
     }
 
@@ -2294,8 +2410,7 @@ impl App {
             (
                 crate::ui::dock::panel_ids::PREVIS,
                 "3D Previs",
-                self.dock_manager.get_panel(crate::ui::dock::panel_ids::PREVIS)
-                    .map(|p| p.open).unwrap_or(false),
+                self.previs_panel.open,
             ),
             (
                 crate::ui::dock::panel_ids::PERFORMANCE,
@@ -2339,10 +2454,16 @@ impl App {
         if let Some(action) = self.menu_bar.take_menu_action() {
             match action {
                 crate::ui::menu_bar::MenuAction::TogglePanel { panel_id } => {
-                    // Performance panel is a floating window, not a dockable panel
+                    // Floating-only panels (Performance, Previs) have their own open state
                     if panel_id == crate::ui::dock::panel_ids::PERFORMANCE {
                         self.performance_panel.open = !self.performance_panel.open;
+                    } else if panel_id == crate::ui::dock::panel_ids::PREVIS {
+                        self.previs_panel.open = !self.previs_panel.open;
+                    } else if self.use_tiled_layout {
+                        // In tiled mode, use TiledLayout's toggle
+                        self.tiled_layout.toggle_panel(&panel_id);
                     } else {
+                        // In legacy mode, use DockManager's toggle
                         self.dock_manager.toggle_panel(&panel_id);
                     }
                 }
@@ -2412,6 +2533,31 @@ impl App {
                     self.dock_manager.request_environment_redock();
                     self.menu_bar.set_status("Environment viewport returned to main window");
                 }
+                crate::ui::menu_bar::MenuAction::ToggleTiledLayout => {
+                    self.use_tiled_layout = !self.use_tiled_layout;
+                    let status = if self.use_tiled_layout {
+                        "Switched to tiled layout"
+                    } else {
+                        "Switched to legacy dock layout"
+                    };
+                    self.menu_bar.set_status(status);
+                    tracing::info!("Tiled layout: {}", self.use_tiled_layout);
+
+                    // Save layout preference
+                    self.app_preferences.save_tiled_layout(&self.tiled_layout, self.use_tiled_layout);
+                }
+                crate::ui::menu_bar::MenuAction::SplitPanel { direction, panel_id, new_first } => {
+                    // Split the focused cell (or environment if no focus) with a new panel
+                    if let Some(focused_cell) = self.tiled_layout.focused_cell_id() {
+                        self.tiled_layout.split_cell(focused_cell, direction, panel_id.clone(), new_first);
+                        self.menu_bar.set_status(&format!("Split panel with {}", panel_id));
+                    } else {
+                        // Default to splitting the environment cell
+                        let env_cell = self.tiled_layout.get_environment_cell_id();
+                        self.tiled_layout.split_cell(env_cell, direction, panel_id.clone(), new_first);
+                        self.menu_bar.set_status(&format!("Split environment with {}", panel_id));
+                    }
+                }
             }
         }
 
@@ -2457,10 +2603,79 @@ impl App {
             self.handle_advanced_output_action(action);
         }
 
+        // Render layout choice dialog (if a project with different layout was loaded)
+        self.render_layout_choice_dialog(&self.egui_ctx.clone());
+
+        // =====================================================================
+        // TILED LAYOUT vs LEGACY DOCK MANAGER
+        // =====================================================================
+        // When use_tiled_layout is true, render panels in the new grid-based layout.
+        // Otherwise, use the legacy dock manager with floating/docked panels.
+
+        // Action vectors - these will be populated by panel rendering
+        let mut clip_actions: Vec<crate::ui::ClipGridAction> = Vec::new();
+        let mut sources_actions: Vec<crate::ui::SourcesAction> = Vec::new();
+        let mut preview_actions: Vec<crate::ui::PreviewMonitorAction> = Vec::new();
+        let mut previs_actions: Vec<crate::ui::PrevisAction> = Vec::new();
+
+        if self.use_tiled_layout {
+            // Compute available rect (screen minus menu bar area)
+            let screen_rect = self.egui_ctx.screen_rect();
+            let menu_height = if self.use_native_menu { 24.0 } else { 28.0 }; // Approximate menu/status bar height
+            let available_rect = egui::Rect::from_min_max(
+                egui::pos2(screen_rect.left(), screen_rect.top() + menu_height),
+                screen_rect.max,
+            );
+
+            // Render the tiled layout - actions are handled inline in render_panel_content
+            self.render_tiled_ui(&self.egui_ctx.clone(), available_rect);
+
+            // Render undocked panels as floating egui windows
+            let undocked = self.tiled_layout.undocked_panels().to_vec();
+            let ctx = self.egui_ctx.clone();
+            let mut panels_to_redock: Vec<String> = Vec::new();
+            for panel_id in undocked {
+                let title = self.get_panel_title(&panel_id);
+                let mut open = true;
+                egui::Window::new(&title)
+                    .id(egui::Id::new(format!("undocked_{}", panel_id)))
+                    .open(&mut open)
+                    .default_size([350.0, 400.0])
+                    .show(&ctx, |ui| {
+                        self.render_panel_content(ui, &panel_id);
+                    });
+                if !open {
+                    // User closed the floating window - schedule for redock
+                    panels_to_redock.push(panel_id);
+                }
+            }
+            // Redock panels after the loop to avoid borrow conflicts
+            for panel_id in panels_to_redock {
+                self.tiled_layout.redock_panel(&panel_id, None);
+            }
+
+            // Performance panel is always floating (not part of tiled layout)
+            let perf_metrics = self.performance_metrics();
+            self.performance_panel.render(&self.egui_ctx, &perf_metrics);
+
+            // Previs panel is always floating (not part of tiled layout)
+            if let Some(renderer) = &mut self.previs_renderer {
+                let actions = self.previs_panel.render_floating(
+                    &self.egui_ctx,
+                    &self.settings.previs_settings,
+                    renderer,
+                );
+                for action in actions {
+                    self.handle_previs_action(action);
+                }
+            }
+        } else {
+        // Legacy dock manager rendering follows...
+
         // Render Performance panel
         let perf_metrics = self.performance_metrics();
         self.performance_panel.render(&self.egui_ctx, &perf_metrics);
-        
+
         // Get layer list for property panels
         let layers: Vec<_> = self.environment.layers().to_vec();
         let omt_broadcasting = self.is_omt_broadcasting();
@@ -2593,7 +2808,7 @@ impl App {
         }
         
         // Render clip grid panel (right panel or floating) - skip if undocked
-        let clip_actions = if let Some(panel) = self.dock_manager.get_panel(crate::ui::dock::panel_ids::CLIP_GRID) {
+        clip_actions = if let Some(panel) = self.dock_manager.get_panel(crate::ui::dock::panel_ids::CLIP_GRID) {
             if panel.open && !panel.is_undocked() {
                 let zone = panel.zone;
                 let floating_pos = panel.floating_pos;
@@ -2713,7 +2928,7 @@ impl App {
         };
 
         // Render sources panel (floating window for now) - skip if undocked
-        let sources_actions = if let Some(panel) = self.dock_manager.get_panel(crate::ui::dock::panel_ids::SOURCES) {
+        sources_actions = if let Some(panel) = self.dock_manager.get_panel(crate::ui::dock::panel_ids::SOURCES) {
             if panel.open && !panel.is_undocked() {
                 let floating_pos = panel.floating_pos;
                 let floating_size = panel.floating_size;
@@ -2873,7 +3088,7 @@ impl App {
         }
 
         // Render preview monitor panel (floating window) - skip if undocked
-        let preview_actions = if let Some(panel) = self.dock_manager.get_panel(crate::ui::dock::panel_ids::PREVIEW_MONITOR) {
+        preview_actions = if let Some(panel) = self.dock_manager.get_panel(crate::ui::dock::panel_ids::PREVIEW_MONITOR) {
             if panel.open && !panel.is_undocked() {
                 let floating_pos = panel.floating_pos;
                 let floating_size = panel.floating_size;
@@ -2998,7 +3213,7 @@ impl App {
         };
 
         // Render 3D previs panel (floating window) - skip if undocked
-        let previs_actions = if let Some(panel) = self.dock_manager.get_panel(crate::ui::dock::panel_ids::PREVIS) {
+        previs_actions = if let Some(panel) = self.dock_manager.get_panel(crate::ui::dock::panel_ids::PREVIS) {
             if panel.open && !panel.is_undocked() {
                 let floating_pos = panel.floating_pos;
                 let floating_size = panel.floating_size;
@@ -3226,6 +3441,8 @@ impl App {
                     );
                 });
         }
+
+        } // End of else block (legacy dock manager rendering)
 
         let full_output = self.egui_ctx.end_pass();
 
@@ -7953,6 +8170,471 @@ impl App {
 
         // Submit GPU work
         self.queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    // ========================================================================
+    // Tiled Layout Rendering
+    // ========================================================================
+
+    /// Render the tiled layout UI.
+    ///
+    /// This is the new grid-based panel layout system that replaces the legacy
+    /// dock manager. Panels fill 100% of available space in a binary split tree.
+    pub fn render_tiled_ui(&mut self, ctx: &egui::Context, available_rect: egui::Rect) {
+        use crate::ui::dock::panel_ids;
+        use crate::ui::tiled_layout::{SplitDirection, DropTarget, can_panel_undock};
+
+        // Compute layout rectangles from the tree
+        let layout = self.tiled_layout.compute_layout(available_rect);
+
+        // Handle divider hover - change cursor when over a divider
+        let hover_pos = ctx.input(|i| i.pointer.hover_pos());
+        let mut hovered_divider: Option<usize> = None;
+
+        if let Some(pos) = hover_pos {
+            for (idx, divider) in layout.dividers.iter().enumerate() {
+                if divider.rect.contains(pos) {
+                    hovered_divider = Some(idx);
+                    let cursor = match divider.direction {
+                        SplitDirection::Horizontal => egui::CursorIcon::ResizeHorizontal,
+                        SplitDirection::Vertical => egui::CursorIcon::ResizeVertical,
+                    };
+                    ctx.set_cursor_icon(cursor);
+                    break;
+                }
+            }
+        }
+
+        // Handle divider dragging
+        let pointer_pressed = ctx.input(|i| i.pointer.primary_pressed());
+        let pointer_released = ctx.input(|i| i.pointer.primary_released());
+        let pointer_pos = ctx.input(|i| i.pointer.hover_pos().unwrap_or_default());
+
+        if pointer_pressed && !self.divider_drag_state.is_dragging() {
+            if let Some(idx) = hovered_divider {
+                let divider = &layout.dividers[idx];
+                self.divider_drag_state.dragging_path = Some(divider.tree_path.clone());
+                self.divider_drag_state.drag_direction = Some(divider.direction);
+                self.divider_drag_state.drag_start_pos = Some(pointer_pos);
+                self.divider_drag_state.start_ratio = divider.ratio;
+                // Use the divider's parent_rect (local coordinate space), NOT available_rect
+                self.divider_drag_state.parent_rect = Some(divider.parent_rect);
+            }
+        }
+
+        if self.divider_drag_state.is_dragging() {
+            if let Some(new_ratio) = self.tiled_layout.calculate_drag_ratio(&self.divider_drag_state, pointer_pos) {
+                if let Some(path) = &self.divider_drag_state.dragging_path {
+                    self.tiled_layout.set_ratio_at_path(path, new_ratio);
+                }
+            }
+
+            if pointer_released {
+                self.divider_drag_state.clear();
+            }
+        }
+
+        // Render each cell
+        for (cell_id, rect) in &layout.cell_rects {
+            if let Some(cell) = self.tiled_layout.find_cell(*cell_id) {
+                let panel_ids_in_cell = cell.panel_ids.clone();
+                let active_tab = cell.active_tab;
+                let has_tabs = panel_ids_in_cell.len() > 1;
+                let cell_id_copy = *cell_id;
+
+                egui::Area::new(egui::Id::new(format!("tiled_cell_{}", cell_id)))
+                    .fixed_pos(rect.min)
+                    .order(egui::Order::Background)
+                    .show(ctx, |ui| {
+                        ui.set_clip_rect(*rect);
+                        let inner_rect = rect.shrink(1.0); // Small margin
+                        ui.allocate_ui_at_rect(inner_rect, |ui| {
+                            // Draw cell background
+                            ui.painter().rect_filled(
+                                inner_rect,
+                                0.0,
+                                egui::Color32::from_gray(30),
+                            );
+
+                            // Render tab bar if multiple panels (or single panel header for drag handle)
+                            ui.horizontal(|ui| {
+                                for (idx, panel_id) in panel_ids_in_cell.iter().enumerate() {
+                                    let is_active = idx == active_tab || !has_tabs;
+                                    let title = self.get_panel_title(panel_id);
+
+                                    // Use Button with drag sensing (selectable_label doesn't support drag)
+                                    let response = ui.add(
+                                        egui::Button::new(&title)
+                                            .selected(is_active)
+                                            .sense(egui::Sense::click_and_drag())
+                                    );
+
+                                    // Handle tab click
+                                    if response.clicked() && has_tabs {
+                                        if let Some(c) = self.tiled_layout.find_cell_mut(cell_id_copy) {
+                                            c.active_tab = idx;
+                                        }
+                                    }
+
+                                    // Handle drag start (except for environment which can't be moved)
+                                    if response.drag_started() && panel_id != panel_ids::ENVIRONMENT {
+                                        self.panel_drag_state.start(
+                                            panel_id.clone(),
+                                            cell_id_copy,
+                                            response.rect.center(),
+                                        );
+                                    }
+
+                                    // Right-click context menu for panel operations
+                                    let panel_id_clone = panel_id.clone();
+                                    response.context_menu(|ui| {
+                                        if panel_id_clone != panel_ids::ENVIRONMENT {
+                                            // Only show undock option for panels without drag-drop
+                                            // (egui's DragAndDrop uses context-local payloads)
+                                            if can_panel_undock(&panel_id_clone) {
+                                                if ui.button("🗗 Float as Window").clicked() {
+                                                    self.tiled_layout.undock_panel(&panel_id_clone);
+                                                    ui.close_menu();
+                                                }
+                                                ui.separator();
+                                            }
+                                            if ui.button("✕ Close Panel").clicked() {
+                                                self.tiled_layout.close_panel(&panel_id_clone);
+                                                ui.close_menu();
+                                            }
+                                        } else {
+                                            ui.label("(Environment cannot be closed)");
+                                        }
+                                    });
+                                }
+                            });
+                            ui.separator();
+
+                            // Render active panel content
+                            if let Some(panel_id) = panel_ids_in_cell.get(active_tab) {
+                                self.render_panel_content(ui, panel_id);
+                            }
+                        });
+                    });
+            }
+        }
+
+        // Handle panel drag-and-drop
+        if self.panel_drag_state.is_dragging() {
+            // Update current position
+            self.panel_drag_state.current_pos = hover_pos;
+
+            // Determine drop target based on cursor position
+            let mut current_drop_target: Option<DropTarget> = None;
+            let edge_zone_size = 40.0; // Pixels from edge for split zones
+
+            if let Some(pos) = hover_pos {
+                for (cell_id, rect) in &layout.cell_rects {
+                    if rect.contains(pos) {
+                        // Check edge zones for splits
+                        let left_zone = egui::Rect::from_min_max(
+                            rect.min,
+                            egui::pos2(rect.min.x + edge_zone_size, rect.max.y),
+                        );
+                        let right_zone = egui::Rect::from_min_max(
+                            egui::pos2(rect.max.x - edge_zone_size, rect.min.y),
+                            rect.max,
+                        );
+                        let top_zone = egui::Rect::from_min_max(
+                            rect.min,
+                            egui::pos2(rect.max.x, rect.min.y + edge_zone_size),
+                        );
+                        let bottom_zone = egui::Rect::from_min_max(
+                            egui::pos2(rect.min.x, rect.max.y - edge_zone_size),
+                            rect.max,
+                        );
+
+                        if left_zone.contains(pos) {
+                            current_drop_target = Some(DropTarget::Split {
+                                cell_id: *cell_id,
+                                direction: SplitDirection::Horizontal,
+                                new_first: true,
+                            });
+                        } else if right_zone.contains(pos) {
+                            current_drop_target = Some(DropTarget::Split {
+                                cell_id: *cell_id,
+                                direction: SplitDirection::Horizontal,
+                                new_first: false,
+                            });
+                        } else if top_zone.contains(pos) {
+                            current_drop_target = Some(DropTarget::Split {
+                                cell_id: *cell_id,
+                                direction: SplitDirection::Vertical,
+                                new_first: true,
+                            });
+                        } else if bottom_zone.contains(pos) {
+                            current_drop_target = Some(DropTarget::Split {
+                                cell_id: *cell_id,
+                                direction: SplitDirection::Vertical,
+                                new_first: false,
+                            });
+                        } else {
+                            // Center zone - add as tab
+                            current_drop_target = Some(DropTarget::Tab { cell_id: *cell_id });
+                        }
+                        break;
+                    }
+                }
+            }
+
+            // Render drop zone highlights
+            egui::Area::new(egui::Id::new("panel_drop_zones"))
+                .fixed_pos(available_rect.min)
+                .order(egui::Order::Foreground)
+                .interactable(false)
+                .show(ctx, |ui| {
+                    if let Some(pos) = hover_pos {
+                        for (cell_id, rect) in &layout.cell_rects {
+                            if rect.contains(pos) {
+                                // Highlight drop zones
+                                let edge_color = egui::Color32::from_rgba_unmultiplied(100, 150, 255, 100);
+                                let center_color = egui::Color32::from_rgba_unmultiplied(100, 255, 150, 60);
+
+                                let left_zone = egui::Rect::from_min_max(
+                                    rect.min,
+                                    egui::pos2(rect.min.x + edge_zone_size, rect.max.y),
+                                );
+                                let right_zone = egui::Rect::from_min_max(
+                                    egui::pos2(rect.max.x - edge_zone_size, rect.min.y),
+                                    rect.max,
+                                );
+                                let top_zone = egui::Rect::from_min_max(
+                                    rect.min,
+                                    egui::pos2(rect.max.x, rect.min.y + edge_zone_size),
+                                );
+                                let bottom_zone = egui::Rect::from_min_max(
+                                    egui::pos2(rect.min.x, rect.max.y - edge_zone_size),
+                                    rect.max,
+                                );
+                                let center_zone = rect.shrink(edge_zone_size);
+
+                                // Highlight hovered zone
+                                if left_zone.contains(pos) {
+                                    ui.painter().rect_filled(left_zone, 4.0, edge_color);
+                                } else if right_zone.contains(pos) {
+                                    ui.painter().rect_filled(right_zone, 4.0, edge_color);
+                                } else if top_zone.contains(pos) {
+                                    ui.painter().rect_filled(top_zone, 4.0, edge_color);
+                                } else if bottom_zone.contains(pos) {
+                                    ui.painter().rect_filled(bottom_zone, 4.0, edge_color);
+                                } else {
+                                    ui.painter().rect_filled(center_zone, 4.0, center_color);
+                                }
+
+                                // Draw border around target cell
+                                ui.painter().rect_stroke(
+                                    *rect,
+                                    2.0,
+                                    egui::Stroke::new(2.0, egui::Color32::from_rgb(100, 150, 255)),
+                                    egui::epaint::StrokeKind::Outside,
+                                );
+                                break;
+                            }
+                        }
+                    }
+
+                    // Draw dragged panel indicator near cursor
+                    if let (Some(panel_id), Some(pos)) = (&self.panel_drag_state.dragged_panel, hover_pos) {
+                        let title = self.get_panel_title(panel_id);
+                        let label_rect = egui::Rect::from_min_size(
+                            egui::pos2(pos.x + 10.0, pos.y + 10.0),
+                            egui::vec2(100.0, 24.0),
+                        );
+                        ui.painter().rect_filled(label_rect, 4.0, egui::Color32::from_rgba_unmultiplied(60, 60, 80, 220));
+                        ui.painter().text(
+                            label_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            &title,
+                            egui::FontId::default(),
+                            egui::Color32::WHITE,
+                        );
+                    }
+                });
+
+            // Handle drop on mouse release
+            if pointer_released {
+                if let Some(panel_id) = self.panel_drag_state.dragged_panel.clone() {
+                    if let Some(target) = current_drop_target {
+                        self.tiled_layout.handle_drop(&panel_id, target);
+                    }
+                }
+                self.panel_drag_state.clear();
+            }
+        }
+
+        // Render dividers on top
+        egui::Area::new(egui::Id::new("tiled_dividers"))
+            .fixed_pos(available_rect.min)
+            .order(egui::Order::Middle)
+            .interactable(false)
+            .show(ctx, |ui| {
+                for (idx, divider) in layout.dividers.iter().enumerate() {
+                    let is_dragging = self.divider_drag_state.dragging_path
+                        .as_ref()
+                        .map(|p| p == &divider.tree_path)
+                        .unwrap_or(false);
+                    let is_hovered = hovered_divider == Some(idx);
+
+                    let color = if is_dragging {
+                        egui::Color32::from_rgb(100, 150, 255)
+                    } else if is_hovered {
+                        egui::Color32::from_rgb(80, 80, 100)
+                    } else {
+                        egui::Color32::from_rgb(50, 50, 60)
+                    };
+
+                    ui.painter().rect_filled(divider.rect, 0.0, color);
+                }
+            });
+    }
+
+    /// Get the display title for a panel ID.
+    fn get_panel_title(&self, panel_id: &str) -> String {
+        use crate::ui::dock::panel_ids;
+        match panel_id {
+            panel_ids::ENVIRONMENT => "Environment".to_string(),
+            panel_ids::PROPERTIES => "Properties".to_string(),
+            panel_ids::CLIP_GRID => "Clip Grid".to_string(),
+            panel_ids::SOURCES => "Sources".to_string(),
+            panel_ids::EFFECTS_BROWSER => "Effects".to_string(),
+            panel_ids::FILES => "Files".to_string(),
+            panel_ids::PREVIEW_MONITOR => "Preview Monitor".to_string(),
+            panel_ids::PREVIS => "3D Previs".to_string(),
+            panel_ids::PERFORMANCE => "Performance".to_string(),
+            _ => panel_id.to_string(),
+        }
+    }
+
+    /// Render the content of a specific panel into the given UI area.
+    ///
+    /// Note: This is a simplified version for the tiled layout. Full integration
+    /// with action handling will be added incrementally.
+    fn render_panel_content(&mut self, ui: &mut egui::Ui, panel_id: &str) {
+        use crate::ui::dock::panel_ids;
+
+        match panel_id {
+            panel_ids::ENVIRONMENT => {
+                // Environment viewport - render the composition canvas with pan/zoom support
+                if let Some(tex_id) = self.environment_egui_texture_id {
+                    let available = ui.available_size();
+                    let env_width = self.environment.width() as f32;
+                    let env_height = self.environment.height() as f32;
+                    let content_size = (env_width, env_height);
+
+                    // Allocate rect with click_and_drag for viewport input
+                    let (full_rect, response) = ui.allocate_exact_size(available, egui::Sense::click_and_drag());
+
+                    // Handle viewport interactions (right-drag pan, scroll zoom)
+                    let viewport_response = crate::ui::viewport_widget::handle_viewport_input(
+                        ui,
+                        &response,
+                        full_rect,
+                        &mut self.tiled_env_viewport,
+                        content_size,
+                        &crate::ui::ViewportConfig::default(),
+                        "tiled_env",
+                    );
+
+                    if viewport_response.changed {
+                        ui.ctx().request_repaint();
+                    }
+
+                    // Compute UV and dest rect with viewport transform
+                    let render_info = crate::ui::viewport_widget::compute_uv_and_dest_rect(
+                        &self.tiled_env_viewport,
+                        full_rect,
+                        content_size,
+                    );
+
+                    // Fill background with black for letterboxing
+                    ui.painter().rect_filled(full_rect, 0.0, egui::Color32::BLACK);
+
+                    // Draw environment texture with computed UV rect
+                    ui.painter().image(tex_id, render_info.dest_rect, render_info.uv_rect, egui::Color32::WHITE);
+
+                    // Draw zoom indicator (shows percentage in bottom-right)
+                    crate::ui::viewport_widget::draw_zoom_indicator(ui, full_rect, &self.tiled_env_viewport);
+                } else {
+                    // Show placeholder on first frame before texture is registered
+                    ui.centered_and_justified(|ui| {
+                        ui.label("Loading environment...");
+                    });
+                }
+            }
+            panel_ids::PROPERTIES => {
+                // Properties panel - simplified for now (full integration needs action handling)
+                let layers = self.environment.layers().to_vec();
+                let layer_video_info = self.layer_video_info();
+                let _actions = self.properties_panel.render(
+                    ui,
+                    &self.environment,
+                    &layers,
+                    &self.settings,
+                    self.omt_broadcast_enabled,
+                    self.ndi_sender.is_some(),
+                    self.texture_share_enabled,
+                    self.api_server_running,
+                    self.effect_manager.registry(),
+                    self.effect_manager.bpm_clock(),
+                    self.effect_manager.time(),
+                    Some(&self.audio_manager),
+                    &self.effect_manager,
+                    &layer_video_info,
+                    &mut self.cross_window_drag,
+                );
+                // TODO: Handle _actions
+            }
+            panel_ids::CLIP_GRID => {
+                let layers = self.environment.layers().to_vec();
+                let actions = self.clip_grid_panel.render_contents(ui, &layers, &mut self.thumbnail_cache);
+                for action in actions {
+                    self.handle_clip_action(action);
+                }
+            }
+            panel_ids::SOURCES => {
+                let _actions = self.sources_panel.render_contents(ui);
+                // TODO: Handle _actions
+            }
+            panel_ids::EFFECTS_BROWSER => {
+                let _actions = self.effects_browser_panel.render_contents(
+                    ui,
+                    self.effect_manager.registry(),
+                    &mut self.cross_window_drag,
+                );
+                // TODO: Handle _actions
+            }
+            panel_ids::FILES => {
+                let _actions = self.file_browser_panel.render_contents(ui);
+                // TODO: Handle _actions
+            }
+            panel_ids::PREVIEW_MONITOR => {
+                // Preview monitor panel - placeholder
+                ui.centered_and_justified(|ui| {
+                    ui.label("Preview Monitor\n(Not yet integrated)");
+                });
+            }
+            panel_ids::PREVIS => {
+                // 3D Previs panel - placeholder
+                ui.centered_and_justified(|ui| {
+                    ui.label("3D Previs\n(Not yet integrated)");
+                });
+            }
+            panel_ids::PERFORMANCE => {
+                // Performance panel needs PerformanceMetrics, use a basic render
+                ui.vertical(|ui| {
+                    ui.label(format!("FPS: {:.1}", self.ui_fps));
+                    ui.label(format!("Frame time: {:.2} ms", self.ui_frame_time_ms));
+                });
+            }
+            _ => {
+                ui.label(format!("Unknown panel: {}", panel_id));
+            }
+        }
     }
 
     /// Shutdown the application gracefully

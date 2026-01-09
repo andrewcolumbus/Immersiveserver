@@ -62,6 +62,13 @@ pub enum MenuItemId {
 
     // Environment viewport
     BreakoutEnvironment,
+
+    // Tiled layout
+    ToggleTiledLayout,
+    SplitLeft,
+    SplitRight,
+    SplitUp,
+    SplitDown,
 }
 
 impl MenuItemId {
@@ -88,6 +95,11 @@ impl MenuItemId {
             Self::HapConverter => "tools_hap_converter".into(),
             Self::AdvancedOutput => "view_advanced_output".into(),
             Self::BreakoutEnvironment => "view_breakout_environment".into(),
+            Self::ToggleTiledLayout => "view_toggle_tiled_layout".into(),
+            Self::SplitLeft => "view_split_left".into(),
+            Self::SplitRight => "view_split_right".into(),
+            Self::SplitUp => "view_split_up".into(),
+            Self::SplitDown => "view_split_down".into(),
         }
     }
 
@@ -113,6 +125,11 @@ impl MenuItemId {
             "tools_hap_converter" => Some(Self::HapConverter),
             "view_advanced_output" => Some(Self::AdvancedOutput),
             "view_breakout_environment" => Some(Self::BreakoutEnvironment),
+            "view_toggle_tiled_layout" => Some(Self::ToggleTiledLayout),
+            "view_split_left" => Some(Self::SplitLeft),
+            "view_split_right" => Some(Self::SplitRight),
+            "view_split_up" => Some(Self::SplitUp),
+            "view_split_down" => Some(Self::SplitDown),
             _ if s.starts_with("layout_preset_") => s
                 .strip_prefix("layout_preset_")
                 .and_then(|n| n.parse().ok())
@@ -172,6 +189,27 @@ impl MenuItemId {
             Self::HapConverter => MenuItemAction::Menu(MenuAction::OpenHAPConverter),
             Self::AdvancedOutput => MenuItemAction::Menu(MenuAction::OpenAdvancedOutput),
             Self::BreakoutEnvironment => MenuItemAction::Menu(MenuAction::BreakoutEnvironment),
+            Self::ToggleTiledLayout => MenuItemAction::Menu(MenuAction::ToggleTiledLayout),
+            Self::SplitLeft => MenuItemAction::Menu(MenuAction::SplitPanel {
+                direction: crate::ui::SplitDirection::Horizontal,
+                panel_id: String::new(), // Will be filled based on current panel selection
+                new_first: true,
+            }),
+            Self::SplitRight => MenuItemAction::Menu(MenuAction::SplitPanel {
+                direction: crate::ui::SplitDirection::Horizontal,
+                panel_id: String::new(),
+                new_first: false,
+            }),
+            Self::SplitUp => MenuItemAction::Menu(MenuAction::SplitPanel {
+                direction: crate::ui::SplitDirection::Vertical,
+                panel_id: String::new(),
+                new_first: true,
+            }),
+            Self::SplitDown => MenuItemAction::Menu(MenuAction::SplitPanel {
+                direction: crate::ui::SplitDirection::Vertical,
+                panel_id: String::new(),
+                new_first: false,
+            }),
         }
     }
 }
@@ -522,6 +560,43 @@ impl MenuBarDefinition {
                         MenuItem::Action {
                             id: MenuItemId::LayoutReset,
                             label: "Reset Layout".into(),
+                            shortcut: None,
+                            enabled: true,
+                        },
+                    ],
+                },
+                MenuItem::Separator,
+                // Tiled layout section
+                MenuItem::Check {
+                    id: MenuItemId::ToggleTiledLayout,
+                    label: "Tiled Layout".into(),
+                    shortcut: None,
+                    default_checked: false,
+                },
+                MenuItem::Submenu {
+                    label: "Split Panel".into(),
+                    items: vec![
+                        MenuItem::Action {
+                            id: MenuItemId::SplitLeft,
+                            label: "Split Left".into(),
+                            shortcut: None,
+                            enabled: true,
+                        },
+                        MenuItem::Action {
+                            id: MenuItemId::SplitRight,
+                            label: "Split Right".into(),
+                            shortcut: None,
+                            enabled: true,
+                        },
+                        MenuItem::Action {
+                            id: MenuItemId::SplitUp,
+                            label: "Split Up".into(),
+                            shortcut: None,
+                            enabled: true,
+                        },
+                        MenuItem::Action {
+                            id: MenuItemId::SplitDown,
+                            label: "Split Down".into(),
                             shortcut: None,
                             enabled: true,
                         },

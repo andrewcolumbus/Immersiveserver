@@ -19,6 +19,7 @@ pub mod preview_monitor_panel;
 pub mod properties_panel;
 pub mod sources_panel;
 pub mod thumbnail_cache;
+pub mod tiled_layout;
 pub mod viewport_widget;
 pub mod widgets;
 pub mod window_registry;
@@ -27,6 +28,10 @@ pub use advanced_output_window::{AdvancedOutputAction, AdvancedOutputWindow};
 pub use clip_grid_panel::{ClipGridAction, ClipGridPanel};
 pub use dock::{DockAction, DockManager, DockZone, DockablePanel};
 pub use effects_browser_panel::{DraggableEffect, EffectsBrowserAction, EffectsBrowserPanel, DRAG_EFFECT_PAYLOAD};
+pub use tiled_layout::{
+    ComputedLayout, DividerDragState, DividerInfo, DropTarget, PanelDragState,
+    SplitDirection, TabbedCell, TileNode, TiledLayout,
+};
 pub use file_browser_panel::{FileBrowserAction, FileBrowserPanel};
 pub use layout_preset::{LayoutPreset, LayoutPresetManager};
 pub use menu_bar::MenuBar;

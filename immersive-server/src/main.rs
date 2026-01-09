@@ -1484,6 +1484,8 @@ impl ApplicationHandler for ImmersiveApp {
                                         app.restore_layers_from_settings();
                                         app.sync_output_manager_from_settings();
                                         app.sync_omt_broadcast_from_settings();
+                                        // Check for layout mismatch (will show dialog if different)
+                                        app.check_layout_mismatch();
                                         preferences.set_last_opened(&path);
                                         app.menu_bar.set_status(format!(
                                             "Opened: {}",

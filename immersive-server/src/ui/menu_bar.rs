@@ -65,6 +65,17 @@ pub enum MenuAction {
     BreakoutEnvironment,
     /// Redock environment viewport back to main window
     RedockEnvironment,
+    /// Toggle between tiled layout and legacy dock manager
+    ToggleTiledLayout,
+    /// Split the focused cell to add a new panel
+    SplitPanel {
+        /// Direction of the split
+        direction: crate::ui::SplitDirection,
+        /// Panel ID to add in the new split
+        panel_id: String,
+        /// Whether the new panel should be first (left/top)
+        new_first: bool,
+    },
 }
 
 /// BPM clock info for display
